@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SessionRecall: find the AI coding session you remember</title>
+<meta name="description" content="SessionRecall is a free Mac app that puts your Codex, Claude Code, Cursor and other coding-agent sessions in one list, with a search that finds the chat you remember.">
+<link rel="canonical" href="https://autonomath.github.io/SessionRecall/">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#EBEFF3">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Autonomath">
+<meta property="og:title" content="SessionRecall: find the AI coding session you remember">
+<meta property="og:description" content="Codex, Claude Code, Cursor and 13 other coding agents in one Mac app, with a search that puts the chat you meant first. Free, open source, and everything stays on your Mac.">
+<meta property="og:url" content="https://autonomath.github.io/SessionRecall/">
+<meta property="og:image" content="https://autonomath.github.io/SessionRecall/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="SessionRecall. Right chat first in 17 everyday searches: Agent Sessions 6.6, 4. Codex app, 5. SessionRecall, 16.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hedvig+Letters+Sans&family=Hedvig+Letters+Serif:opsz@12..24&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ground: #EBEFF3;
+    --panel: #FFFFFF;
+    --ink: #16202A;
+    --muted: #586573;
+    --old: #8996A3;
+    --rule: #C7D0D9;
+    --faint: #DCE2E8;
+    --mark: #FFD54A;
+    --soft: #FFF6CF;
+    --link: #1F55A8;
+    --sans: "Hedvig Letters Sans", "Avenir Next", system-ui, sans-serif;
+    --serif: "Hedvig Letters Serif", "Iowan Old Style", Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); font-size: 17px; line-height: 1.55; }
+  a { color: var(--link); text-underline-offset: 0.18em; }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--link); outline-offset: 2px; }
+  mark { background: var(--mark); color: inherit; padding: 0 0.08em; border-radius: 2px; }
+  code { font-family: var(--sans); background: var(--panel); border: 1px solid var(--faint); border-radius: 6px; padding: 2px 7px; overflow-wrap: anywhere; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+
+  /* Hero */
+  header.hero { padding: 72px 0 56px; }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 7fr); gap: 48px; align-items: start; }
+  h1 { font-family: var(--serif); font-weight: 400; font-size: clamp(44px, 6.2vw, 76px); line-height: 0.98; letter-spacing: -0.02em; margin: 0 0 28px; }
+  h1 span { display: block; }
+  .lede { font-size: 21px; line-height: 1.45; margin: 0 0 20px; max-width: 30em; }
+  .get { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 0 0 22px; font-size: 14px; color: var(--muted); }
+  .dl { display: inline-block; background: var(--ink); color: var(--panel); border-radius: 999px; padding: 10px 18px; font-size: 16px; text-decoration: none; }
+  .dl:hover { background: #2A3A4A; }
+  .note { color: var(--muted); font-size: 15px; margin: 0; max-width: 34em; }
+  .demo { background: var(--panel); border-radius: 14px; padding: 22px 22px 18px; box-shadow: 0 1px 0 var(--rule), 0 18px 40px -28px rgba(22, 32, 42, 0.45); }
+  .demo h2 { font-size: 15px; font-weight: 400; color: var(--muted); margin: 0 0 10px; }
+  .picker { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .picker button { font: inherit; font-size: 15px; color: var(--ink); background: var(--ground); border: 1px solid var(--rule); border-radius: 999px; padding: 6px 14px; cursor: pointer; }
+  .picker button[aria-pressed="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  .query { font-size: 15px; margin: 0 0 14px; }
+  .query code { background: var(--ground); }
+  .lists { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 1.25fr); gap: 14px; }
+  .list h3 { font-size: 15px; font-weight: 400; margin: 0 0 8px; line-height: 1.3; }
+  .list h3 small { display: block; color: var(--muted); font-size: 13px; }
+  .list ol { list-style: none; margin: 0; padding: 0; }
+  .list li { display: grid; grid-template-columns: 30px 1fr; gap: 6px; align-items: start; min-height: 30px; padding: 5px 0; border-top: 1px solid var(--faint); }
+  .list li .n { font-family: var(--serif); color: var(--muted); font-size: 15px; text-align: right; padding-right: 4px; }
+  .bar { height: 9px; border-radius: 5px; background: var(--faint); margin-top: 7px; }
+  .gap { color: var(--muted); font-size: 13px; padding: 6px 0 6px 36px; border-top: 1px solid var(--faint); }
+  .hit { background: var(--soft); border-radius: 8px; border-top-color: transparent !important; padding: 7px 6px !important; }
+  .hit .n { color: var(--ink); font-size: 17px; }
+  .hit .title { font-size: 14px; line-height: 1.3; }
+  .hit .why { font-size: 13px; color: var(--muted); line-height: 1.35; margin-top: 2px; overflow-wrap: break-word; }
+  .empty { font-size: 14px; color: var(--muted); padding: 10px 0 0; border-top: 1px solid var(--faint); }
+  .verdict { margin: 14px 0 0; font-size: 15px; }
+  @keyframes rise { from { transform: translateY(46px); opacity: 0.2; } to { transform: none; opacity: 1; } }
+  .rise { animation: rise 700ms cubic-bezier(.2,.8,.2,1) both; }
+  @media (prefers-reduced-motion: reduce) { .rise { animation: none; } }
+
+  section { padding: 64px 0; border-top: 1px solid var(--rule); }
+  h2.big { font-family: var(--serif); font-weight: 400; font-size: clamp(30px, 3.6vw, 42px); line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.01em; }
+  .intro { max-width: 44em; margin: 0 0 28px; color: var(--muted); }
+
+  /* Results */
+  .top { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 48px; align-items: start; margin-bottom: 28px; }
+  .top .intro { margin: 0; }
+  table.score { width: 100%; border-collapse: collapse; font-size: 15px; }
+  table.score th, table.score td { text-align: left; padding: 8px 0; border-bottom: 1px solid var(--rule); vertical-align: baseline; }
+  table.score th[scope="col"] { font-weight: 400; color: var(--muted); font-size: 13px; }
+  table.score th[scope="col"] + th[scope="col"] { padding-left: 14px; }
+  table.score td.v { font-family: var(--serif); font-size: 24px; text-align: right; width: 64px; }
+  table.score td.old { color: var(--old); }
+  table.res { width: 100%; border-collapse: collapse; font-size: 15px; }
+  table.res th, table.res td { text-align: left; padding: 7px 12px 7px 0; border-bottom: 1px solid var(--faint); vertical-align: middle; }
+  table.res thead th { font-weight: 400; color: var(--muted); font-size: 13px; border-bottom: 1px solid var(--rule); vertical-align: bottom; }
+  table.res td.typed { width: 34%; overflow-wrap: anywhere; }
+  table.res td.o6, table.res td.cx { color: var(--muted); width: 22%; }
+  table.res td.rc { width: 22%; }
+  table.res td.top3 span { background: var(--soft); color: var(--ink); border-radius: 5px; padding: 1px 7px; margin-left: -7px; }
+  table.res td.arch { font-style: italic; }
+  table.cmp { width: 100%; border-collapse: collapse; font-size: 15px; }
+  table.cmp th, table.cmp td { text-align: left; vertical-align: top; padding: 12px 16px 12px 0; border-bottom: 1px solid var(--rule); }
+  table.cmp thead th { font-weight: 400; color: var(--muted); font-size: 13px; }
+  table.cmp tbody th { font-weight: 400; width: 16%; }
+  table.cmp td { width: 28%; }
+  table.cmp td.us { background: var(--panel); padding-left: 14px; }
+  table.cmp thead th.us { padding-left: 14px; }
+  table.res tr.grp th { font-weight: 400; font-size: 13px; color: var(--muted); padding: 22px 0 6px; border-bottom: 1px solid var(--rule); }
+  table.res tbody tr.grp:first-child th { padding-top: 10px; }
+  .private { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 48px; align-items: start; background: var(--panel); border-radius: 14px; padding: 26px 28px; margin-top: 36px; }
+  .private h3 { font-family: var(--serif); font-weight: 400; font-size: 26px; line-height: 1.2; margin: 0 0 8px; }
+  .private p { margin: 0 0 10px; color: var(--muted); max-width: 34em; }
+  .method { font-size: 14px; color: var(--muted); margin: 14px 0 0; }
+
+  /* How it works */
+  ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+  ol.steps > li { counter-increment: step; display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px 24px; padding: 30px 0; border-top: 1px solid var(--rule); }
+  ol.steps > li::before { content: counter(step); font-family: var(--serif); font-size: 40px; line-height: 1; color: var(--muted); }
+  .step h3 { font-family: var(--serif); font-weight: 400; font-size: 26px; line-height: 1.2; margin: 0 0 8px; }
+  .step p { margin: 0 0 14px; max-width: 46em; }
+  .vs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 4px 0 0; }
+  .vs > div { background: var(--panel); border-radius: 10px; padding: 14px 16px; font-size: 15px; }
+  .vs > div.was { background: transparent; border: 1px solid var(--rule); color: var(--muted); }
+  .vs h4 { font-size: 13px; font-weight: 400; color: var(--muted); margin: 0 0 6px; }
+  .vs code { display: inline; line-height: 1.9; word-break: break-word; }
+  .hbars { display: grid; grid-template-columns: max-content 1fr max-content; gap: 6px 12px; align-items: center; font-size: 15px; }
+  .hbars .b { height: 12px; border-radius: 6px; background: var(--ink); }
+  .hbars .b.light { background: var(--old); }
+  .hbars .b.mk { background: var(--mark); }
+  .hbars .n { font-family: var(--serif); text-align: right; }
+  .row-demo { background: var(--panel); border-radius: 10px; padding: 12px 16px; font-size: 15px; max-width: 34em; }
+  .row-demo .why { color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+  .footer-demo { display: inline-block; background: var(--panel); border-radius: 8px; padding: 6px 12px; font-size: 14px; color: var(--muted); }
+
+  .feats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; }
+  .feats > div { background: var(--panel); border-radius: 12px; padding: 18px 18px 16px; }
+  .feats h3 { font-family: var(--serif); font-weight: 400; font-size: 21px; line-height: 1.2; margin: 0 0 8px; }
+  .feats p { margin: 0; font-size: 15px; color: var(--muted); }
+  .two .dl { margin: 4px 0 10px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; }
+  .two ul { margin: 0; padding-left: 1.1em; }
+  .two li { margin: 0 0 10px; }
+  .prs { list-style: none; padding: 0 !important; }
+  .prs li { display: grid; grid-template-columns: 52px 1fr; gap: 6px; }
+  .prs a { font-family: var(--serif); }
+  footer { padding: 40px 0 64px; border-top: 1px solid var(--rule); font-size: 14px; color: var(--muted); }
+  footer p { margin: 0 0 8px; max-width: 60em; }
+
+  @media (max-width: 900px) {
+    .hero-grid, .top, .two, .private { grid-template-columns: 1fr; gap: 32px; }
+    .feats { grid-template-columns: 1fr 1fr; }
+    header.hero { padding: 48px 0 40px; }
+    table.res td.typed { width: auto; }
+    .vs { grid-template-columns: 1fr; }
+    table.cmp thead { display: none; }
+    table.cmp, table.cmp tbody, table.cmp tr, table.cmp th, table.cmp td { display: block; width: auto; }
+    table.cmp tr { padding: 10px 0; border-bottom: 1px solid var(--rule); }
+    table.cmp th, table.cmp td { border: 0; padding: 4px 0; }
+    table.cmp tbody th { font-family: var(--serif); font-size: 19px; width: auto; }
+    table.cmp td::before { content: attr(data-app); display: block; font-size: 13px; color: var(--muted); }
+    table.cmp td.us { padding: 8px 10px; border-radius: 8px; }
+  }
+  @media (max-width: 560px) {
+    .wrap { padding: 0 18px; }
+    .private { padding: 20px 18px; }
+    .lists, .vs, .feats { grid-template-columns: 1fr; }
+    table.res { font-size: 13px; }
+    table.res th, table.res td { padding-right: 8px; }
+    table.res td.o6, table.res td.cx, table.res td.rc { width: 22%; }
+    table.score { font-size: 14px; }
+    table.score td.v { font-size: 21px; width: 52px; }
+    ol.steps > li { grid-template-columns: 1fr; }
+    ol.steps > li::before { font-size: 30px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <h1>Session<span>Recall</span></h1>
+      <p class="lede">Your AI coding agents save every session on your Mac. SessionRecall puts Codex, Claude Code, Cursor and 13 other agents in one list, and its search finds the chat you remember, shows the passage that matched, and opens the chat there.</p>
+      <p class="get"><a class="dl" href="https://github.com/autonomath/SessionRecall/releases/latest">Download SessionRecall 1.0</a><span>Signed and notarized · macOS 14 or later · <a href="https://github.com/autonomath/SessionRecall">source</a></span></p>
+      <p class="note">Compared with Agent Sessions 6.6 and with the search built into the Codex app, on one Mac with about 6,300 agent sessions: 17 everyday searches anyone might type, and 28 private ones. Everything stays on your Mac.</p>
+    </div>
+    <div class="demo" aria-labelledby="demo-title">
+      <h2 id="demo-title">The same search in three apps</h2>
+      <div class="picker" role="group" aria-label="Example search">
+        <button type="button" data-ex="0" aria-pressed="true">A rough description</button>
+        <button type="button" data-ex="1" aria-pressed="false">An error from tool output</button>
+        <button type="button" data-ex="2" aria-pressed="false">A word in the title</button>
+      </div>
+      <p class="query">Typed: <code id="q"></code></p>
+      <div class="lists">
+        <div class="list"><h3>Agent Sessions 6.6 <small id="old-count"></small></h3><ol id="old-list"></ol></div>
+        <div class="list"><h3>Codex app <small id="cx-count"></small></h3><ol id="cx-list"></ol></div>
+        <div class="list"><h3>SessionRecall <small>best match first</small></h3><ol id="new-list"></ol></div>
+      </div>
+      <p class="verdict" id="verdict" aria-live="polite"></p>
+    </div>
+  </div>
+</header>
+
+<section aria-labelledby="what-title">
+  <div class="wrap">
+    <h2 class="big" id="what-title">One app for every agent's history</h2>
+    <p class="intro">Codex, Claude Code, Cursor and the other coding agents each save their sessions as files on your Mac, in their own formats and folders. SessionRecall reads them where they are and shows them side by side. Nothing is uploaded.</p>
+    <div class="feats">
+      <div><h3>Every agent in one list</h3><p>Codex, Claude Code, Cursor, GitHub Copilot CLI, OpenCode, Cline and ten more, read from the files they already write.</p></div>
+      <div><h3>Search that ranks</h3><p>Every word of every session is indexed, tool output included. The chat you meant comes first, with the passage that matched.</p></div>
+      <div><h3>Read and resume</h3><p>Each turn shows the prompt and the answer, with tool calls a click away. Resume supported sessions in Terminal, iTerm2, Warp, Ghostty or Macterm.</p></div>
+      <div><h3>See what it costs</h3><p>The Quota Meter shows which Codex or Claude session is using up your limits. Session Info lists models, tokens and API-equivalent cost.</p></div>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="real-title">
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h2 class="big" id="real-title">17 searches anyone might type</h2>
+        <p class="intro">Each search looks for one chat on the test Mac the way you might remember it: a few everyday words, a single word, or an error message. The page shows the searches and where each app placed the chat, never the chats themselves.</p>
+      </div>
+      <table class="score">
+        <thead><tr><th scope="col">Out of 17</th><th scope="col" style="text-align:right">6.6</th><th scope="col" style="text-align:right">Codex</th><th scope="col" style="text-align:right">SessionRecall</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Right chat first</th><td class="v old">4</td><td class="v old">5</td><td class="v">16</td></tr>
+          <tr><th scope="row">In the top three</th><td class="v old">5</td><td class="v old">5</td><td class="v">17</td></tr>
+          <tr><th scope="row">Found at all</th><td class="v old">8</td><td class="v old">5</td><td class="v">17</td></tr>
+          <tr><th scope="row">No results at all</th><td class="v old">9</td><td class="v old">2</td><td class="v">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <table class="res">
+      <thead><tr>
+        <th scope="col">What you type</th>
+        <th scope="col">Agent Sessions 6.6</th>
+        <th scope="col">Codex app</th>
+        <th scope="col">SessionRecall</th>
+      </tr></thead>
+      <tbody id="res"></tbody>
+    </table>
+    <p class="method">Eight of these searches look for a chat that is archived in Codex, and the Codex search box skips archived chats. Unarchived, Codex would put five of those eight first, for 10 out of 17. 6.6 does well when the words appear in the chat in exactly that order, as in four of these. Several searches share words with the chat's title, which Codex and SessionRecall both favour, so the private searches below, typed from memory, are the harder test.</p>
+    <p class="method">6.6 ran on its copy of the index from 21 November, SessionRecall on its copy from 22 November. Codex was measured the same evening: its own app server, the one inside the Codex app, received the same requests its search box sends, and the answers were put in order with the matching code copied from the app. Every unarchived chat counted as loaded for title matching, which can only help Codex. The chat used to run this measurement, which quotes every search, was left out.</p>
+    <div class="private" aria-labelledby="private-title">
+      <div>
+        <h3 id="private-title">And 28 private searches</h3>
+        <p>The same test ran on 28 searches from the test Mac's own history, typed from memory to find chats that had gone missing. Their words name people, companies and projects, so they stay private and only the totals are shown.</p>
+      </div>
+      <table class="score">
+        <thead><tr><th scope="col">Out of 28</th><th scope="col" style="text-align:right">6.6</th><th scope="col" style="text-align:right">Codex</th><th scope="col" style="text-align:right">SessionRecall</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Right chat first</th><td class="v old">1</td><td class="v old">2</td><td class="v">15</td></tr>
+          <tr><th scope="row">In the top three</th><td class="v old">1</td><td class="v old">2</td><td class="v">20</td></tr>
+          <tr><th scope="row">Found at all</th><td class="v old">2</td><td class="v old">2</td><td class="v">27</td></tr>
+          <tr><th scope="row">No results at all</th><td class="v old">21</td><td class="v old">16</td><td class="v">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="ways-title">
+  <div class="wrap">
+    <h2 class="big" id="ways-title">Three ways to search the same chats</h2>
+    <p class="intro">The three apps read the same chat files but ask different questions of them. This is what each one does with what you type, taken from its source code.</p>
+    <table class="cmp">
+      <thead><tr><th scope="col"></th><th scope="col">Agent Sessions 6.6</th><th scope="col">Codex app</th><th scope="col" class="us">SessionRecall</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">What it reads</th><td data-app="Agent Sessions 6.6">A sample of each chat, up to 48,000 characters</td><td data-app="Codex app">Titles, your prompts and the replies, in full. Never tool calls or tool output.</td><td class="us" data-app="SessionRecall">Everything: titles, prompts, replies, tool calls and tool output</td></tr>
+        <tr><th scope="row">How your words must match</th><td data-app="Agent Sessions 6.6">All of them, as one exact phrase</td><td data-app="Codex app">The exact text somewhere in a prompt or reply, or every word in the title in the same order</td><td class="us" data-app="SessionRecall">The phrase or any one of the words. The last word also matches longer words. Accents are ignored.</td></tr>
+        <tr><th scope="row">Order of results</th><td data-app="Agent Sessions 6.6">Newest first</td><td data-app="Codex app">Title matches first, then text matches, each by how closely the words fit, then newest first</td><td class="us" data-app="SessionRecall">Best match first: rare words count more, and a match in the title or your prompts counts more than one in tool output</td></tr>
+        <tr><th scope="row">Archived chats</th><td data-app="Agent Sessions 6.6">Searched</td><td data-app="Codex app">Skipped</td><td class="us" data-app="SessionRecall">Searched</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section aria-labelledby="how-title">
+  <div class="wrap">
+    <h2 class="big" id="how-title">How SessionRecall finds a chat</h2>
+    <p class="intro">Follow one search from the table, <code>sqlite database backups</code>, through each step. The numbers come from the index on the test Mac.</p>
+    <ol class="steps">
+      <li class="step">
+        <div>
+          <h3>Your words become a looser question</h3>
+          <p>6.6 asks its index for the three words as one exact phrase, in that order. Codex scans the chat files for that exact text in a prompt or reply, and checks the titles for all three words in the same order. SessionRecall asks its index for the phrase or any one of the words, and lets the last word also match longer words that start with it, so results appear while you type. Accents are ignored, so cafe also finds café.</p>
+          <div class="vs">
+            <div class="was"><h4>6.6 asks</h4><code>"sqlite database backups"</code><p style="margin:8px 0 0">No chat contains that exact phrase, so 6.6 shows nothing.</p></div>
+            <div class="was"><h4>Codex asks</h4><code>"sqlite database backups"</code> in a prompt or reply, or a title with <code>sqlite … database … backups</code><p style="margin:8px 0 0">No prompt or reply contains that text, and one other chat's title fits, so Codex shows that one.</p></div>
+            <div><h4>SessionRecall asks</h4><code>"sqlite database backups" OR "sqlite" OR "database" OR "backups" OR backups*</code></div>
+          </div>
+        </div>
+      </li>
+      <li class="step">
+        <div>
+          <h3>It reads the whole chat, one part at a time</h3>
+          <p>6.6 keeps a sample of each chat, up to 48,000 characters with all parts mixed together. A long chat loses most of its text, and tool output loses the most. Codex reads prompts and replies in full but never looks at tool calls or tool output. SessionRecall indexes everything, with a separate index for each part of a chat. Tool output is indexed without keeping a second copy of the text.</p>
+          <div class="hbars" role="img" aria-label="Text searched: 6.6, 272 megabytes. SessionRecall, 2.9 gigabytes.">
+            <span>Text 6.6 searches</span><span class="b light" style="width:9.4%"></span><span class="n">272 MB</span>
+            <span>Text SessionRecall searches</span><span class="b" style="width:100%"></span><span class="n">2.9 GB</span>
+          </div>
+          <p style="margin-top:14px;color:var(--muted);font-size:15px">SessionRecall's index on the test Mac, by part: tool output 604 MB, replies 120 MB, tool calls 119 MB, your prompts 75 MB. Titles are matched from the list in memory, so a renamed chat is found under its new name right away.</p>
+        </div>
+      </li>
+      <li class="step">
+        <div>
+          <h3>Rare words count more</h3>
+          <p>Each match is scored with BM25, the standard scoring formula of search engines. A word found in few chats says more about a chat than a word found in hundreds, and a word counts more in a short prompt than lost in a long one. Here is how many of the 4,390 chats with prompts use each word in their prompts:</p>
+          <div class="hbars" role="img" aria-label="Chats whose prompts contain the word: backups 77, sqlite 150, database 277.">
+            <span>backups</span><span class="b mk" style="width:28%"></span><span class="n">77</span>
+            <span>sqlite</span><span class="b mk" style="width:54%"></span><span class="n">150</span>
+            <span>database</span><span class="b mk" style="width:100%"></span><span class="n">277</span>
+          </div>
+          <p style="margin-top:14px;color:var(--muted);font-size:15px">So "backups" in a prompt counts for much more than "database". In tool output, "database" appears in 3,119 chats, so a match there counts for little.</p>
+        </div>
+      </li>
+      <li class="step">
+        <div>
+          <h3>Where it matched matters</h3>
+          <p>Each score is then multiplied by the weight of the part it came from, and a chat's scores are added up. What you typed yourself is the best clue to what a chat was about; tool output is mostly logs and file contents. Because rarity is counted first, an exact rare phrase in tool output can still beat a common word in a title. 6.6 ranks nothing: it lists every match newest first. Codex puts title matches before text matches and orders each group by how closely the words fit.</p>
+          <div class="hbars" role="img" aria-label="Weights: title 4, your prompts 3, replies 2, tool calls 1, tool output 0.6.">
+            <span>Title</span><span class="b" style="width:100%"></span><span class="n">×4</span>
+            <span>Your prompts</span><span class="b" style="width:75%"></span><span class="n">×3</span>
+            <span>Replies</span><span class="b" style="width:50%"></span><span class="n">×2</span>
+            <span>Tool calls</span><span class="b" style="width:25%"></span><span class="n">×1</span>
+            <span>Tool output</span><span class="b" style="width:15%"></span><span class="n">×0.6</span>
+          </div>
+          <p style="margin-top:14px;color:var(--muted);font-size:15px">The backups chat comes first: its title and its prompts have "database" and "backups", and "sqlite" turns up in its tool output. Chats that match only "database", or match only in tool output, score lower.</p>
+        </div>
+      </li>
+      <li class="step">
+        <div>
+          <h3>One row per chat, with the reason</h3>
+          <p>Codex Desktop writes a long chat as several files sharing one id; 12 of the last 326 chats on the test Mac are split that way. SessionRecall merges them into one row at the file that matched best. A sub-agent chat counts toward the chat that started it, at half weight. Each row shows which part matched and the passage around the words: prompts and replies come straight from the index, and tool output is read from the chat file for the top 30 results.</p>
+          <div class="row-demo"><div>The chat you meant</div><div class="why">Tool output · …Error Domain=<wbr><mark>AVFoundationErrorDomain</mark> Code=-11800 "The operation could not be completed"…</div></div>
+        </div>
+      </li>
+      <li class="step">
+        <div>
+          <h3>It opens on the match and says what it can't see</h3>
+          <p>Opening a result waits until the whole chat is loaded, turns on Tools when the word is in tool output, and scrolls to the word. 6.6 could jump while only the end of a long chat was loaded and stop short. A chat you are still writing is read from its file at search time, so new text is found about 20 seconds after it is saved; 6.6 waited until the chat had been quiet for two minutes, and up to 45 minutes for large files. Chats SessionRecall cannot read yet are counted, never dropped silently:</p>
+          <span class="footer-demo">4 not fully indexed yet | 4 updating | 150 with parts too large to index</span>
+        </div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section aria-labelledby="cost-title">
+  <div class="wrap two">
+    <div>
+      <h2 class="big" id="cost-title">What it costs</h2>
+      <ul>
+        <li>A larger index: 1.11 GB on the test Mac, up from 431 MB. Tool output is 604 MB of it, and Settings can leave tool output out.</li>
+        <li>One reindex after installing, in the background. Search keeps answering from the old index meanwhile, and memory held at about 2.5 GB.</li>
+        <li>Sub-agent chats fold into the chat that started them, which moves three of the 28 private searches down one or two places. Settings can list them as separate rows instead.</li>
+      </ul>
+    </div>
+    <div>
+      <h2 class="big" id="up-title">Install</h2>
+      <p><a class="dl" href="https://github.com/autonomath/SessionRecall/releases/latest">Download SessionRecall 1.0</a></p>
+      <ul>
+        <li>Open the disk image and drag SessionRecall to Applications. It is signed with a Developer ID and notarized by Apple.</li>
+        <li>It needs macOS 14 or later, on Apple silicon or Intel.</li>
+        <li>Updates arrive inside the app, from the project's releases on GitHub.</li>
+        <li>Coming from Agent Sessions? Quit it first. Both apps keep their index in the same folder, so run one at a time. Settings start fresh.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>SessionRecall is made by <a href="https://autonomath.github.io/">Autonomath</a>. It is a fork of <a href="https://github.com/jazzyalex/agent-sessions">Agent Sessions</a> by Alexander Malakhov, released under the MIT license, and its <a href="https://github.com/autonomath/SessionRecall">source is on GitHub</a>.</p>
+    <p>Figures measured on 22 November 2026 on one Mac: about 6,300 sessions, 32 GB of Codex files plus Claude and others. Codex app 26.1117 with its app server 0.171.0-alpha.13.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  // Positions are where each app placed the chat you meant (0 = not shown); count is how many results it listed.
+  var EX = [
+    { q: "sqlite database backups",
+      old: { count: 0, rank: 0 },
+      cx: { count: 1, rank: 0 },
+      neu: { rank: 1, why: "Title · Your prompts · <mark>database</mark>, <mark>backups</mark>" },
+      verdict: "6.6 wants the three words as one phrase and finds nothing. Codex wants that exact text in a prompt or reply, or all three words in a title, and shows one other chat. SessionRecall puts the chat first: its title and prompts have database and backups." },
+    { q: "AVFoundationErrorDomain",
+      old: { count: 0, rank: 0 },
+      cx: { count: 0, rank: 0 },
+      neu: { rank: 1, why: "Tool output · …Error Domain=<wbr><mark>AVFoundationErrorDomain</mark> Code=-11800…" },
+      verdict: "The error appears only in tool output, 44% of the way into a 227 MB chat file. 6.6 keeps 48,000 characters of each chat and Codex never searches tool output, so neither finds it. SessionRecall puts the chat first and opens it on the error." },
+    { q: "prores",
+      old: { count: 26, rank: 14 },
+      cx: { count: 15, rank: 1, why: "Title" },
+      neu: { rank: 1, why: "Title · Replies" },
+      verdict: "The word is in the chat's title, so Codex puts it first too. 6.6 lists 26 chats newest first, and the one you meant is 14th." }
+  ];
+  var W = [72, 58, 84, 66, 50, 78, 62];
+  function bars(from, to, list) {
+    for (var i = from; i <= to; i++) {
+      var li = document.createElement("li");
+      li.innerHTML = '<span class="n">' + i + '</span><span class="bar" style="width:' + W[i % W.length] + '%"></span>';
+      li.setAttribute("aria-label", "Another chat");
+      list.appendChild(li);
+    }
+  }
+  function note(list, text) {
+    var li = document.createElement("li"); li.className = "empty"; li.style.display = "block";
+    li.textContent = text; list.appendChild(li);
+  }
+  function gapRow(list, n) {
+    var li = document.createElement("li"); li.className = "gap"; li.style.display = "block";
+    li.textContent = n + (n === 1 ? " more chat" : " more chats"); list.appendChild(li);
+  }
+  function hitRow(list, rank, why, animate) {
+    var li = document.createElement("li"); li.className = "hit" + (animate ? " rise" : "");
+    li.innerHTML = '<span class="n">' + rank + '</span><span><span class="title">The chat you meant</span>' +
+      (why ? '<span class="why" style="display:block">' + why + '</span>' : "") + '</span>';
+    list.appendChild(li);
+  }
+  function fill(list, info, animate) {
+    list.innerHTML = "";
+    var r = info.rank;
+    if (!r) {
+      bars(1, Math.min(info.count || 0, 4), list);
+      note(list, info.count ? "The chat you meant is not among them." : "No results.");
+      return;
+    }
+    if (r <= 4) bars(1, r - 1, list); else { bars(1, 2, list); gapRow(list, r - 3); }
+    hitRow(list, r, info.why, animate);
+  }
+  function show(k) {
+    var ex = EX[k];
+    document.getElementById("q").textContent = ex.q;
+    document.getElementById("old-count").textContent = ex.old.count ? ex.old.count + " results, newest first" : "matches newest first";
+    document.getElementById("cx-count").textContent = ex.cx.count ? ex.cx.count + (ex.cx.count === 1 ? " result" : " results") + ", titles first" : "titles first, then text";
+    fill(document.getElementById("old-list"), ex.old, false);
+    fill(document.getElementById("cx-list"), ex.cx, false);
+    fill(document.getElementById("new-list"), ex.neu, true);
+    document.getElementById("verdict").textContent = ex.verdict;
+    var b = document.querySelectorAll(".picker button");
+    for (var i = 0; i < b.length; i++) b[i].setAttribute("aria-pressed", String(i === k));
+  }
+  var picker = document.querySelectorAll(".picker button");
+  for (var i = 0; i < picker.length; i++) picker[i].addEventListener("click", function (ev) { show(Number(ev.currentTarget.getAttribute("data-ex"))); });
+  show(0);
+
+  // The 17 everyday searches. old/cx/new are where 6.6, Codex and SessionRecall placed the chat (0 = not shown);
+  // oldCount/cxCount are how many results 6.6 and Codex listed; arch marks chats archived in Codex.
+  var GROUPS = [
+    { name: "A few words", rows: [
+      { q: "install canon printer", old: 1, oldCount: 1, cx: 0, cxCount: 2, arch: true, "new": 1 },
+      { q: "prores video crash", old: 1, oldCount: 1, cx: 1, cxCount: 2, "new": 1 },
+      { q: "activity monitor memory", old: 1, oldCount: 1, cx: 0, cxCount: 1, arch: true, "new": 1 },
+      { q: "dji d-log playback", old: 1, oldCount: 3, cx: 1, cxCount: 3, "new": 1 },
+      { q: "group chrome tabs", old: 2, oldCount: 3, cx: 1, cxCount: 3, "new": 1 },
+      { q: "merge drone videos ffmpeg", old: 0, oldCount: 0, cx: 1, cxCount: 2, "new": 1 },
+      { q: "cloudflare tunnel subdomain", old: 0, oldCount: 0, cx: 0, cxCount: 1, "new": 1 },
+      { q: "mailto links chrome", old: 0, oldCount: 0, cx: 0, cxCount: 1, arch: true, "new": 1 },
+      { q: "export payments to csv", old: 0, oldCount: 0, cx: 0, cxCount: 1, arch: true, "new": 1 },
+      { q: "desktop icons too big", old: 0, oldCount: 0, cx: 0, cxCount: 2, arch: true, "new": 1 },
+      { q: "zoom high cpu", old: 0, oldCount: 0, cx: 0, cxCount: 0, arch: true, "new": 1 },
+      { q: "deploy to server over ssh", old: 0, oldCount: 0, cx: 0, cxCount: 1, "new": 1 },
+      { q: "sqlite database backups", old: 0, oldCount: 0, cx: 0, cxCount: 1, "new": 1 }
+    ] },
+    { name: "One word", rows: [
+      { q: "prores", old: 14, oldCount: 26, cx: 1, cxCount: 15, "new": 1 },
+      { q: "mailto", old: 37, oldCount: 70, cx: 0, cxCount: 8, arch: true, "new": 1 },
+      { q: "printer", old: 148, oldCount: 303, cx: 0, cxCount: 26, arch: true, "new": 2 }
+    ] },
+    { name: "An error message", rows: [
+      { q: "AVFoundationErrorDomain", old: 0, oldCount: 0, cx: 0, cxCount: 0, "new": 1 }
+    ] }
+  ];
+  function ordinal(n) { var s = ["th", "st", "nd", "rd"], v = n % 100; return n + (s[(v - 20) % 10] || s[v] || s[0]); }
+  function esc(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+  function place(rank, count) { return rank ? ordinal(rank) + " of " + count : (count ? "Not among its " + count : "No results"); }
+  function cell(cls, rank, text) { return '<td class="' + cls + (rank && rank <= 3 ? " top3" : "") + '"><span>' + text + '</span></td>'; }
+  var body = document.getElementById("res");
+  GROUPS.forEach(function (group) {
+    var gr = document.createElement("tr"); gr.className = "grp";
+    gr.innerHTML = '<th scope="rowgroup" colspan="4">' + esc(group.name) + '</th>';
+    body.appendChild(gr);
+    group.rows.forEach(function (row) {
+      var cx = row.cx ? place(row.cx, row.cxCount) : (row.arch ? "Skipped: archived" : place(0, row.cxCount));
+      var tr = document.createElement("tr");
+      tr.innerHTML = '<td class="typed">' + esc(row.q) + '</td>' +
+        cell("o6", row.old, place(row.old, row.oldCount)) +
+        cell("cx" + (!row.cx && row.arch ? " arch" : ""), row.cx, cx) +
+        cell("rc", row.new, row.new ? ordinal(row.new) : "Not found");
+      body.appendChild(tr);
+    });
+  });
+})();
+</script>
+</body>
+</html>
+

@@ -1967,7 +1967,8 @@ final class TranscriptToolCellsTests: XCTestCase {
         h.controller.onRequestToolsShown = {}
         h.activeRoleFilters = Self.toolsOff
         h.reapply()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        // A slow machine (CI) needs more than one pass to settle at the end, so wait for it.
+        Self.runLoop(until: { h.isAtBottom })
         XCTAssertTrue(h.isAtBottom)
 
         h.controller.applyFind(source: .local, query: "needle", matches: [needleMatch(block: 2)], token: 1,
@@ -1976,11 +1977,23 @@ final class TranscriptToolCellsTests: XCTestCase {
         // Tools on: the new rows queue a follow-tail scroll, then the waiting jump lands.
         h.activeRoleFilters = Set(TranscriptRoleFilter.allCases)
         h.reapply()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: {
+            h.layout()
+            guard let row = h.rowIndex(id: 1) else { return false }
+            return h.scroll.contentView.bounds.intersects(h.table.rect(ofRow: row))
+        })
         h.layout()
         guard let row = h.rowIndex(id: 1) else { return XCTFail("the invocation row shows") }
         XCTAssertTrue(h.scroll.contentView.bounds.intersects(h.table.rect(ofRow: row)), "the jump stays on the match")
         XCTAssertFalse(h.isAtBottom)
+    }
+
+    /// Runs the main run loop in short passes until the condition holds or two seconds pass.
+    private static func runLoop(until condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        } while !condition() && Date() < deadline
     }
 
     func testListJumpWaitsForMatchesTheTranscriptHasNotLoadedYet() {
