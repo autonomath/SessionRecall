@@ -805,9 +805,30 @@ final class SearchCoordinator: ObservableObject, @unchecked Sendable {
         let prefix = SearchPreferences.prefixWhileTyping
         var indexQuery = SearchTextMatcher.rankedQuery(freeText, forIndex: true, prefix: prefix)
         var parts = SearchTextMatcher.rankedQueryParts(freeText, prefix: prefix)
+        // The last word is also looked up as a prefix while it is being typed. Counted in full it
+        // weighed twice as much as any other word, so the prefix form is scored apart: it adds only
+        // what it finds beyond the whole word, at half weight.
+        let prefixPart = parts.count > 1 ? parts.last.flatMap { $0.hasSuffix("\"*") ? $0 : nil } : nil
+        let wholePart = prefixPart.map { String($0.dropLast()) }
+        let scoredParts = prefixPart == nil ? parts : Array(parts.dropLast())
+        /// What the prefix form adds to one score of the whole last word.
+        func prefixExtra(_ prefixScore: Double, whole: Double?) -> Double { max(0, prefixScore - (whole ?? 0)) / 2 }
         var matches: [IndexDB.FieldMatch]
         do {
-            matches = try await db.searchFields(query: indexQuery, fields: tables, sources: sources)
+            matches = try await db.searchFields(query: scoredParts.joined(separator: " OR "), fields: tables, sources: sources)
+            if let prefixPart, let wholePart {
+                struct Place: Hashable { let id: String; let source: String; let field: TranscriptField }
+                var whole: [Place: Double] = [:]
+                for m in try await db.searchFields(query: wholePart, fields: tables, sources: sources) {
+                    whole[Place(id: m.sessionID, source: m.source, field: m.field)] = m.score
+                }
+                for m in try await db.searchFields(query: prefixPart, fields: tables, sources: sources) {
+                    let extra = prefixExtra(m.score, whole: whole[Place(id: m.sessionID, source: m.source, field: m.field)])
+                    if extra > 0 {
+                        matches.append(IndexDB.FieldMatch(sessionID: m.sessionID, source: m.source, field: m.field, score: extra))
+                    }
+                }
+            }
         } catch {
             // FTS5 rejected hand-written syntax such as a stray colon: search for the words as typed.
             parts = freeText.split(whereSeparator: \.isWhitespace)
@@ -861,7 +882,15 @@ final class SearchCoordinator: ObservableObject, @unchecked Sendable {
             let titles = candidates.map {
                 (key: SessionKey($0), title: titleOverrides[SessionKey($0)] ?? $0.customTitle ?? "")
             }
-            for (from, score) in RankedSearch.titleScores(titles: titles, parts: parts) {
+            var titleScores = RankedSearch.titleScores(titles: titles, parts: prefixPart == nil ? parts : scoredParts)
+            if let prefixPart, let wholePart {
+                let whole = RankedSearch.titleScores(titles: titles, parts: [wholePart])
+                for (key, score) in RankedSearch.titleScores(titles: titles, parts: [prefixPart]) {
+                    let extra = prefixExtra(score, whole: whole[key])
+                    if extra > 0 { titleScores[key, default: 0] += extra }
+                }
+            }
+            for (from, score) in titleScores {
                 guard let session = byKey[from], let key = owner(session) else { continue }
                 add(key, .title, .title, score, from: from)
             }

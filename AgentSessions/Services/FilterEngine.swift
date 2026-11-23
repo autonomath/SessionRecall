@@ -107,8 +107,21 @@ enum SearchTextMatcher {
         return lower.utf8.allSatisfy { $0 < 128 } ? lower : lower.folding(options: .diacriticInsensitive, locale: nil)
     }
 
+    /// Words that say nothing about a chat, in English and French. French ones look rare, and so
+    /// important, in a mostly English history.
+    private static let fillerWords: Set<String> = Set(
+        ("a an and are as at be by for from how i in is it my of on or our that the this to was we what with you "
+            + "au aux avec ce ces dans de des du en et il je la le les ma mes mon ne notre nous ou par pas pour que qui "
+            + "sa ses son sur un une vers d l qu").split(separator: " ").map(String.init))
+
+    /// "the", "de la", "l'": made only of filler words.
+    static func isFiller(_ word: String) -> Bool {
+        let pieces = fold(word).split { !($0.isLetter || $0.isNumber) }
+        return !pieces.isEmpty && pieces.allSatisfy { fillerWords.contains(String($0)) }
+    }
+
     /// The alternatives ranked search looks for when given plain words: the exact phrase,
-    /// each word, and the last word as a prefix while it is being typed. Any one is enough
+    /// each word that is not filler, and the last word as a prefix while it is being typed. Any one is enough
     /// to match, and a chat matching more of them, or rarer ones, ranks higher. A query
     /// that already uses quotes or operators is a single part, unchanged. Words are quoted
     /// because FTS5 needs that for text such as "UTF-8"; the in-app matcher reads the same form.
@@ -117,7 +130,8 @@ enum SearchTextMatcher {
         guard !q.isEmpty else { return [] }
         guard !hasExplicitFTSSyntax(q) else { return [q] }
         let words = q.split(whereSeparator: \.isWhitespace).map(String.init)
-        var parts = words.map { "\"\($0)\"" }
+        let telling = words.filter { !isFiller($0) }
+        var parts = (telling.isEmpty ? words : telling).map { "\"\($0)\"" }
         if words.count > 1 { parts.insert("\"\(words.joined(separator: " "))\"", at: 0) }
         if prefix, let last = words.last, last.count >= 3, isSimpleASCII(last) { parts.append("\"\(last)\"*") }
         return parts

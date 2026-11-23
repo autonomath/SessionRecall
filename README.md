@@ -97,7 +97,7 @@ Cline CLI and Cline Desktop support comes from Agent Sessions 5.4. DeepSeek Harn
 
 ## Install
 
-1. Download **SessionRecall-1.0.dmg** from the [latest release](https://github.com/autonomath/SessionRecall/releases/latest).
+1. Download **SessionRecall-1.0.1.dmg** from the [latest release](https://github.com/autonomath/SessionRecall/releases/latest).
 2. Open it and drag SessionRecall to Applications. The app is signed with a Developer ID and notarized by Apple.
 3. Open SessionRecall. It finds your agents' session folders and builds its search index in the background. You can browse and search while it works.
 

@@ -696,6 +696,31 @@ final class SearchIngestTests: XCTestCase {
         XCTAssertEqual(hitsAfterSecond, 0, "a newly added file must bust the early-out even though the old file's FileRef alone is unchanged")
     }
 
+    /// A pass must not pause after a file that needed nothing: with thousands of unchanged
+    /// files the pauses alone took minutes before a changed file was reached.
+    func testSkippedFilesDoNotPause() async throws {
+        let (db, cleanup) = try makeTestIndexDB()
+        defer { cleanup() }
+        let old = Date().addingTimeInterval(-3 * 3600)
+        var refs: [SearchIngestService.FileRef] = []
+        for i in 0..<12 {
+            let url = try makeCodexFixture(named: "skip\(i).jsonl", userText: "unchanged file \(i) ospreyteal", assistantText: "ack", in: ingestTempDir)
+            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+            refs.append(try fileRef(for: url))
+        }
+        let service = SearchIngestService(db: db)
+        _ = try await service.ingest(source: .codex, files: refs, toolIOEnabled: false,
+                                     yieldNanoseconds: 0, quietSeconds: 0, reingestCooldownOverride: 0)
+        let added = try makeCodexFixture(named: "skip-new.jsonl", userText: "new file kestrelplum", assistantText: "ack", in: ingestTempDir)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: added.path)
+        let start = Date()
+        let second = try await service.ingest(source: .codex, files: refs + [try fileRef(for: added)], toolIOEnabled: false,
+                                              yieldNanoseconds: 200_000_000, quietSeconds: 0, reingestCooldownOverride: 0)
+        XCTAssertEqual(second.skipped, 12)
+        XCTAssertEqual(second.processed, 1)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5, "12 skipped files at 200 ms each would take 2.4 s")
+    }
+
     /// A file within any active gate window (quiet or cooldown) must never be covered
     /// by the early-out, even with an otherwise-identical aggregate: the safety valve
     /// exists precisely so a file that could flip from gated to eligible purely from

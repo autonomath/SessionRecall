@@ -3357,7 +3357,7 @@ final class SessionIndexer: ObservableObject {
     /// - `payload.encrypted_content` (reasoning) which can be very large
     /// - `payload.instructions` (session_meta) which can also be very large
     private static func sanitizeCodexHugeFields(_ line: String) -> String {
-        guard line.contains("\"encrypted_content\"") || line.contains("\"instructions\"") else { return line }
+        guard line.containsBytes("\"encrypted_content\"") || line.containsBytes("\"instructions\"") else { return line }
         var s = line
         s = sanitizeJSONStringValue(in: s, key: "\"encrypted_content\"", placeholder: "[ENCRYPTED_OMITTED]")
         s = sanitizeJSONStringValue(in: s, key: "\"instructions\"", placeholder: "[INSTRUCTIONS_OMITTED]")
@@ -3479,7 +3479,7 @@ final class SessionIndexer: ObservableObject {
     /// Replace any inline base64 image data URLs with a short placeholder to avoid huge allocations and slow JSON parsing.
     private static func sanitizeImagePayload(_ line: String) -> String {
         // Fast path: nothing to do
-        guard line.contains("data:image") || line.contains("\"input_image\"") else { return line }
+        guard line.containsBytes("data:image") || line.containsBytes("\"input_image\"") else { return line }
         var s = line
         // Replace data:image..." up to the closing quote with a compact token
         // This is a simple, robust scan that avoids heavy regex backtracking on very long lines.
@@ -3497,7 +3497,7 @@ final class SessionIndexer: ObservableObject {
     /// Aggressively strip ALL embedded images from a line (for lazy load performance).
     /// Uses regex for 50-100x speedup vs string manipulation.
     private static func sanitizeAllImages(_ line: String) -> String {
-        guard line.contains("data:image") else { return line }
+        guard line.containsBytes("data:image") else { return line }
 
         // Fast byte-level check before expensive string operations
         // For extremely long lines (>5MB UTF-8 bytes), skip entirely
@@ -3507,11 +3507,12 @@ final class SessionIndexer: ObservableObject {
             let megabytes = utf8Count / 1_000_000
             // A tool output keeps its type, `call_id` and time, so the call still shows a result
             // (spec §9: "Large event (N MB) not loaded").
-            if let callID = rawCallID(in: line), let outputType = rawOutputType(in: line) {
+            let callID = rawCallID(in: line)
+            if let callID, let outputType = rawOutputType(in: line) {
                 let time = rawTopLevelTimestamp(in: line).map { #","timestamp":"\#($0)""# } ?? ""
                 return #"{"type":"\#(outputType)","call_id":"\#(callID)"\#(time),"output":"Large event (\#(megabytes) MB) not loaded"}"#
             }
-            if let callID = rawCallID(in: line) {
+            if let callID {
                 return #"{"type":"omitted","call_id":"\#(callID)","text":"[Large event omitted - \#(megabytes)MB]"}"#
             }
             return #"{"type":"omitted","text":"[Large event omitted - \#(megabytes)MB]"}"#
@@ -3560,14 +3561,20 @@ final class SessionIndexer: ObservableObject {
     /// Returns nil when the key is missing or the value is empty, longer than 256 bytes,
     /// or holds an escape or control byte (the value is embedded in a stub unescaped).
     static func rawCallID(in line: String) -> String? {
-        let utf8 = line.utf8
-        guard let key = utf8.firstRange(of: rawCallIDKey) else { return nil }
-        let tail = utf8[key.upperBound...].prefix(257)
-        guard let end = tail.firstIndex(of: UInt8(ascii: "\"")) else { return nil }
-        let value = utf8[key.upperBound..<end]
-        guard !value.isEmpty,
-              !value.contains(where: { $0 == UInt8(ascii: "\\") || $0 < 0x20 }) else { return nil }
-        return String(decoding: value, as: UTF8.self)
+        // A byte search over the line's storage. The generic collection search took seconds on a
+        // line of several megabytes, and this runs only on such lines.
+        var line = line
+        return line.withUTF8 { bytes -> String? in
+            guard let base = bytes.baseAddress,
+                  let hit = memmem(base, bytes.count, rawCallIDKey, rawCallIDKey.count) else { return nil }
+            let start = base.distance(to: hit.assumingMemoryBound(to: UInt8.self)) + rawCallIDKey.count
+            let tail = bytes[start..<min(start + 257, bytes.count)]
+            guard let end = tail.firstIndex(of: UInt8(ascii: "\"")) else { return nil }
+            let value = bytes[start..<end]
+            guard !value.isEmpty,
+                  !value.contains(where: { $0 == UInt8(ascii: "\\") || $0 < 0x20 }) else { return nil }
+            return String(decoding: value, as: UTF8.self)
+        }
     }
 
     private static let rawOutputTypes = ["function_call_output", "custom_tool_call_output"]
@@ -3639,6 +3646,7 @@ final class SessionIndexer: ObservableObject {
             if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: s)) {
                 if let val = Double(s) { return Date(timeIntervalSince1970: normalizeEpochSeconds(val)) }
             }
+            if let d = fastISODate(s) { return d }
             // ISO8601 with or without fractional seconds (cached, lock-protected)
             Self.dateFormatterLock.lock()
             defer { Self.dateFormatterLock.unlock() }
@@ -3652,6 +3660,46 @@ final class SessionIndexer: ObservableObject {
     }
 
     private static let dateFormatterLock = NSLock()
+
+    /// "2026-11-18T03:27:37Z" and "2026-11-18T03:27:37.123Z", the forms Codex and Claude write on every
+    /// event, read by hand: the formatter took a sixth of indexing time. Any other form returns nil
+    /// and goes through the formatters below.
+    static func fastISODate(_ string: String) -> Date? {
+        var copy = string
+        return copy.withUTF8 { b -> Date? in
+            guard b.count == 20 || b.count == 24,
+                  b[4] == 45, b[7] == 45, b[10] == 84, b[13] == 58, b[16] == 58, b[b.count - 1] == 90 else { return nil }
+            func number(_ from: Int, _ length: Int) -> Int? {
+                var value = 0
+                for i in from..<(from + length) {
+                    let digit = Int(b[i]) - 48
+                    guard digit >= 0, digit <= 9 else { return nil }
+                    value = value * 10 + digit
+                }
+                return value
+            }
+            guard let year = number(0, 4), let month = number(5, 2), let day = number(8, 2),
+                  let hour = number(11, 2), let minute = number(14, 2), let second = number(17, 2),
+                  year >= 1970, month >= 1, month <= 12, hour < 24, minute < 60, second < 60 else { return nil }
+            var millis = 0
+            if b.count == 24 {
+                guard b[19] == 46, let fraction = number(20, 3) else { return nil }
+                millis = fraction
+            }
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+            let monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            guard day >= 1, day <= monthDays[month - 1] else { return nil }
+            // Days since 1970-01-01 in the proleptic Gregorian calendar.
+            let y = month <= 2 ? year - 1 : year
+            let era = y / 400
+            let yearOfEra = y - era * 400
+            let dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1
+            let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+            let days = era * 146_097 + dayOfEra - 719_468
+            let wholeMillis = (days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000 + millis
+            return Date(timeIntervalSince1970: Double(wholeMillis) / 1_000)
+        }
+    }
 
     // Cached date formatters — allocation is expensive, reuse across all parse calls
     private static let isoFracFormatter: ISO8601DateFormatter = {

@@ -1,5 +1,17 @@
 import Foundation
 
+extension String {
+    /// Whether the ASCII marker occurs, found by a byte search. String.contains on these guards,
+    /// which almost never match, took a third of indexing time.
+    func containsBytes(_ marker: StaticString) -> Bool {
+        var copy = self
+        return copy.withUTF8 { bytes in
+            guard let base = bytes.baseAddress else { return false }
+            return memmem(base, bytes.count, marker.utf8Start, marker.utf8CodeUnitCount) != nil
+        }
+    }
+}
+
 enum SessionSearchTextBuilder {
     // Redact embedded binary-ish blobs (base64, data: URLs) from search corpora.
     // This protects Instant search and Tool I/O FTS from ballooning DB size and from
@@ -9,7 +21,7 @@ enum SessionSearchTextBuilder {
 
     private static func sanitizeForIndexing(_ text: String) -> String {
         // Fast path: avoid scanning small strings.
-        if text.count < 512 { return text }
+        if text.utf8.count < 512 || text.count < 512 { return text }
 
         var out = text
         out = redactDataURLs(in: out)
@@ -20,11 +32,11 @@ enum SessionSearchTextBuilder {
 
     private static func redactCommonSecrets(in text: String) -> String {
         // Only bother if we see suspicious keys or token markers.
-        if !(text.contains("botToken")
-             || text.contains("apiKey")
-             || text.contains("\"token\"")
-             || text.contains("accessToken")
-             || text.contains("refreshToken")) { return text }
+        if !(text.containsBytes("botToken")
+             || text.containsBytes("apiKey")
+             || text.containsBytes("\"token\"")
+             || text.containsBytes("accessToken")
+             || text.containsBytes("refreshToken")) { return text }
 
         var out = text
         for rx in secretRegexes {
@@ -49,7 +61,7 @@ enum SessionSearchTextBuilder {
 
     private static func redactDataURLs(in text: String) -> String {
         // Only bother if we see obvious markers.
-        if !(text.contains("data:") && text.contains(";base64,")) { return text }
+        if !(text.containsBytes("data:") && text.containsBytes(";base64,")) { return text }
 
         var out = ""
         out.reserveCapacity(min(text.utf16.count, 32_768))
@@ -101,8 +113,20 @@ enum SessionSearchTextBuilder {
     }
 
     private static func redactLongBase64Runs(in text: String) -> String {
-        // If there are no base64-ish characters, bail quickly.
-        if text.count < base64RunMinChars { return text }
+        // Only a run of base64RunMinChars base64 characters is ever replaced. Look for one in the
+        // bytes first: the character scan below is slow and almost never finds any.
+        var copy = text
+        let hasLongRun = copy.withUTF8 { bytes -> Bool in
+            var run = 0
+            for b in bytes {
+                let base64 = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57)
+                    || b == 43 || b == 47 || b == 61 || b == 45 || b == 95
+                run = base64 ? run + 1 : 0
+                if run >= base64RunMinChars { return true }
+            }
+            return false
+        }
+        if !hasLongRun { return text }
 
         func isBase64Char(_ ch: Character) -> Bool {
             switch ch {

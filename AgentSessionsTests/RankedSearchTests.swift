@@ -53,6 +53,15 @@ final class RankedSearchTests: XCTestCase {
         XCTAssertEqual(SearchTextMatcher.rankedQuery("tee", forIndex: true), "\"tee\" OR \"tee\"*")
     }
 
+    func testFillerWordsAreNotLookedUpOnTheirOwn() {
+        XCTAssertEqual(SearchTextMatcher.rankedQueryParts("lettre pour les fournisseurs"),
+                       ["\"lettre pour les fournisseurs\"", "\"lettre\"", "\"fournisseurs\"", "\"fournisseurs\"*"])
+        XCTAssertEqual(SearchTextMatcher.rankedQueryParts("to be"), ["\"to be\"", "\"to\"", "\"be\""],
+                       "a query of filler words alone keeps them")
+        XCTAssertTrue(SearchTextMatcher.rankedQueryParts("inférence d'IA confidentielle").contains("\"d'IA\""),
+                      "a word that only starts with filler is kept")
+    }
+
     func testHighlightMatchesAnyWordAndIgnoresAccents() {
         let text = "Déjeuner au Café Olimpico hier"
         let query = SearchTextMatcher.rankedQuery("cafe receipt")
@@ -121,6 +130,32 @@ final class RankedSearchTests: XCTestCase {
     }
 
     // MARK: - The ranked path, end to end through SearchCoordinator
+
+    func testFillerAndTheLastWordDoNotOutweighTheOtherWords() async throws {
+        let (db, cleanup) = try makeDB()
+        defer { cleanup() }
+        let both = session("both"), last = session("last"), french = session("french"), heron = session("heron")
+        try await db.begin()
+        for i in 0..<30 { try await index(db, session("other-\(i)"), [.user: "plan the release number \(i) today"]) }
+        try await index(db, both, [.user: "the egret nests by the lagoon today"])
+        try await index(db, last, [.user: "quota check and quota reset today"])
+        try await index(db, french, [.user: "pour les notes pour les amis"])
+        try await index(db, heron, [.user: "one heron on the shore today"])
+        let longer = session("longer")
+        try await index(db, longer, [.user: "quotas quotas quotas quotas today"])
+        try await db.commit()
+        let all = [both, last, french, heron, longer] + (0..<30).map { session("other-\($0)") }
+
+        // Counted as a word and again as a prefix, "quota" twice in one chat outweighed two matching words.
+        let lastWord = try await search("egret lagoon quota", in: all, db: db)
+        XCTAssertEqual(lastWord.results.prefix(2).map(\.id), ["both", "last"])
+        // "pour" and "les" are rare here, so they outweighed the one word that says something.
+        let filler = try await search("heron pour les", in: all, db: db)
+        XCTAssertEqual(filler.results.first?.id, "heron")
+        // A whole word still beats a longer word that only starts with it.
+        let exact = try await search("quota", in: all, db: db)
+        XCTAssertEqual(exact.results.map(\.id), ["last", "longer"])
+    }
 
     private func session(_ id: String, lastEvent: TimeInterval = 100, chat: String? = nil, file: String? = nil,
                          subagent: Bool = false, said: String? = nil, title: String? = nil) -> Session {

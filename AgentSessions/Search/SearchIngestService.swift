@@ -450,10 +450,9 @@ actor SearchIngestService {
                     }
                 } ?? toolIOReadyPaths.contains(file.path)
                 if !toolIOEnabled || toolIOIsReady || outsideToolIOWindow {
+                    // No pause after a file that needed nothing: at 40 ms each, a pass over
+                    // 5,000 unchanged files slept for minutes before reaching a changed one.
                     skipped += 1
-                    if idx < files.count - 1 {
-                        try? await Task.sleep(nanoseconds: yieldNanoseconds)
-                    }
                     continue
                 }
             }
@@ -493,9 +492,6 @@ actor SearchIngestService {
                 let age = max(0, nowTS - file.activityTimestamp)
                 if age < quietSeconds {
                     skipped += 1
-                    if idx < files.count - 1 {
-                        try? await Task.sleep(nanoseconds: yieldNanoseconds)
-                    }
                     continue
                 }
 
@@ -513,9 +509,6 @@ actor SearchIngestService {
                     ?? updatedAtByPath[file.path]
                 if cooldown > 0, let lastTS, nowTS - Double(lastTS) < cooldown {
                     skipped += 1
-                    if idx < files.count - 1 {
-                        try? await Task.sleep(nanoseconds: yieldNanoseconds)
-                    }
                     continue
                 }
             }
