@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Mock claude -p for the tool-less contract: consumes the prompt on stdin,
+# records its argv (and the prompt) for assertions, and prints a valid
+# delimited reply on stdout. CLAUDE_STUB_GARBAGE=1 prints junk instead,
+# exercising run-agent.sh's parse-failure exit.
+set -euo pipefail
+if [ -n "${CLAUDE_LOG:-}" ]; then echo "claude $*" >> "$CLAUDE_LOG"; fi
+cat > "${CLAUDE_PROMPT_LOG:-/dev/null}"   # consume stdin (the prompt)
+if [ -n "${CLAUDE_STUB_GARBAGE:-}" ]; then echo "no markers here"; exit 0; fi
+cat <<'EOF'
+<<<DIGEST>>>
+# Triage digest (stub)
+- see replies.json
+<<<REPLIES>>>
+[]
+<<<END>>>
+EOF

@@ -1,0 +1,289 @@
+import Foundation
+
+/// Row metadata for hierarchical session display.
+struct SubagentRowMeta: Equatable {
+    let depth: Int            // 0 = top-level, 1 = subagent child, 2+ = nested subagent
+    let hasChildren: Bool     // true if this session has resolved subagent children
+    let childCount: Int       // number of resolved subagent children (0 for non-parents)
+    let hasWorkflowChildren: Bool  // true when ≥1 resolved child is a Claude workflow agent
+
+    // Explicit init so `hasWorkflowChildren` has a default: a `let` with an inline
+    // default value is omitted from the synthesized memberwise initializer, which
+    // would make it impossible to pass at the parent-row callsite.
+    init(depth: Int, hasChildren: Bool, childCount: Int, hasWorkflowChildren: Bool = false) {
+        self.depth = depth
+        self.hasChildren = hasChildren
+        self.childCount = childCount
+        self.hasWorkflowChildren = hasWorkflowChildren
+    }
+}
+
+/// Builds a parent-first flattened session list from a flat `[Session]` array,
+/// grouping subagent sessions beneath their resolved parent.
+///
+/// The builder resolves parent references by matching `child.parentSessionID`
+/// against both `session.id` and `session.codexInternalSessionIDHint` (needed
+/// because Claude session IDs are SHA256 hashes, not raw UUIDs).
+enum SubagentHierarchyBuilder {
+
+    struct Result {
+        /// Flattened session list with parents followed by their expanded children.
+        let sessions: [Session]
+        /// Per-session row metadata keyed by `session.id`.
+        let rowMeta: [String: SubagentRowMeta]
+    }
+
+    /// URL-free equivalent of URL(fileURLWithPath:).deletingPathExtension()
+    /// .lastPathComponent for plain file paths — build() calls this once per
+    /// top-level session per sort, where URL construction dominated.
+    static func fileBaseName(ofPath path: String) -> String {
+        let name: Substring
+        if let slash = path.lastIndex(of: "/") {
+            name = path[path.index(after: slash)...]
+        } else {
+            name = path[...]
+        }
+        if let dot = name.lastIndex(of: "."), dot != name.startIndex {
+            return String(name[..<dot])
+        }
+        return String(name)
+    }
+
+    /// Build a hierarchical session list.
+    ///
+    /// - Parameters:
+    ///   - sessions: Pre-sorted flat session list (parents sorted by active sort).
+    ///   - collapsedParents: Set of session IDs whose children should be hidden.
+    ///     When empty (the default), all parents are expanded so children are visible.
+    ///   - hierarchyEnabled: When false, returns all sessions flat at depth 0 (no hierarchy nesting).
+    static func build(
+        sessions: [Session],
+        collapsedParents: Set<String> = [],
+        hierarchyEnabled: Bool
+    ) -> Result {
+        guard hierarchyEnabled else {
+            return flatResult(sessions: sessions)
+        }
+
+        let parents = parentIDs(of: sessions)
+        var childrenByParentID: [String: [Session]] = [:]
+        var childIDs: Set<String> = []
+        for s in sessions {
+            guard let resolvedParentID = parents[s.id] else { continue }
+            childrenByParentID[resolvedParentID, default: []].append(s)
+            childIDs.insert(s.id)
+        }
+
+        // 2. Sort children within each parent by descending modifiedAt
+        for (key, children) in childrenByParentID {
+            childrenByParentID[key] = children.sorted { $0.modifiedAt > $1.modifiedAt }
+        }
+
+        // 3. Flatten: roots in original order, each followed by its expanded
+        //    subtree in depth-first order. The walk must recurse rather than emit
+        //    a single child level: a session can be *both* a child and a parent
+        //    (e.g. a `review` subagent with an inferred role-only parent that
+        //    itself spawned thread children). Emitting only one level dropped
+        //    those grandchildren from the list entirely.
+        var flatSessions: [Session] = []
+        var rowMeta: [String: SubagentRowMeta] = [:]
+        flatSessions.reserveCapacity(sessions.count)
+        rowMeta.reserveCapacity(sessions.count)
+
+        // Iterative DFS: bounds stack growth by the session count regardless of
+        // how deep (or cyclic) a resolved parent chain turns out to be.
+        var emitted: Set<String> = []
+        var stack: [(session: Session, depth: Int)] = []
+
+        for s in sessions {
+            // Skip children — they're emitted as part of their ancestor's subtree
+            if childIDs.contains(s.id) { continue }
+
+            stack.append((s, 0))
+            while let (node, depth) = stack.popLast() {
+                // Guards against a cycle in the resolved parent chain revisiting
+                // a row (which would otherwise loop forever).
+                guard emitted.insert(node.id).inserted else { continue }
+
+                let children = childrenByParentID[node.id] ?? []
+                flatSessions.append(node)
+                rowMeta[node.id] = SubagentRowMeta(
+                    depth: depth,
+                    hasChildren: !children.isEmpty,
+                    childCount: children.count,
+                    hasWorkflowChildren: children.contains { $0.isClaudeWorkflowSubagent }
+                )
+
+                guard !children.isEmpty, !collapsedParents.contains(node.id) else { continue }
+                // Reversed: popLast() then yields children in sorted order.
+                for child in children.reversed() {
+                    stack.append((child, depth + 1))
+                }
+            }
+        }
+
+        return Result(sessions: flatSessions, rowMeta: rowMeta)
+    }
+
+    /// Returns a flat result with all sessions at depth 0 (no hierarchy nesting).
+    /// Each subagent's resolved parent in sessions: child session.id → parent session.id.
+    /// Search folds a sub-agent's matches into its parent with the same rules as the list tree.
+    static func parentIDs(of sessions: [Session]) -> [String: String] {
+        // 1. Build parent lookup: parentKey → [child Session]
+        //    Also build a reverse lookup to resolve parentSessionID → session.id
+        var parentKeyToID: [String: String] = [:]  // raw UUID/parentID → session.id
+        var needsRoleOnlyParentIndex = false
+        for s in sessions {
+            if s.source == .codex,
+               s.parentSessionID == nil,
+               s.subagentType != nil {
+                needsRoleOnlyParentIndex = true
+            }
+
+            // Only register hints for non-subagent sessions: subagent events
+            // carry the *parent's* sessionId, so allowing them to register would
+            // overwrite the real parent mapping and break resolution.
+            if s.parentSessionID == nil {
+                // Map codexInternalSessionIDHint (raw UUID) to session.id
+                if let hint = s.codexInternalSessionIDHint, !hint.isEmpty {
+                    parentKeyToID[hint] = s.id
+                }
+                // Derive UUID from file path for Claude sessions whose
+                // codexInternalSessionIDHint may not be persisted in the DB yet.
+                // Claude session files are named <UUID>.jsonl.
+                let fileName = fileBaseName(ofPath: s.filePath)
+                if fileName.count == 36, fileName.contains("-"),
+                   parentKeyToID[fileName] == nil {
+                    parentKeyToID[fileName] = s.id
+                }
+            }
+            // Also map session.id directly
+            parentKeyToID[s.id] = s.id
+        }
+
+        let roleOnlyParentIndex = needsRoleOnlyParentIndex
+            ? RoleOnlyParentIndex(sessions: sessions)
+            : nil
+
+        var parents: [String: String] = [:]
+        for s in sessions {
+            guard let resolvedParentID = resolvedParentID(
+                for: s,
+                parentKeyToID: parentKeyToID,
+                roleOnlyParentIndex: roleOnlyParentIndex
+            ) else { continue }
+            // Don't attach to self
+            guard resolvedParentID != s.id else { continue }
+            parents[s.id] = resolvedParentID
+        }
+        return parents
+    }
+
+    private static func flatResult(sessions: [Session]) -> Result {
+        var rowMeta: [String: SubagentRowMeta] = [:]
+        rowMeta.reserveCapacity(sessions.count)
+        for s in sessions {
+            rowMeta[s.id] = SubagentRowMeta(depth: 0, hasChildren: false, childCount: 0)
+        }
+        return Result(sessions: sessions, rowMeta: rowMeta)
+    }
+
+    private static func resolvedParentID(
+        for session: Session,
+        parentKeyToID: [String: String],
+        roleOnlyParentIndex: RoleOnlyParentIndex?
+    ) -> String? {
+        if let rawParentKey = session.parentSessionID {
+            return parentKeyToID[rawParentKey]
+        }
+        return inferredRoleOnlyCodexParentID(for: session, roleOnlyParentIndex: roleOnlyParentIndex)
+    }
+
+    /// Older Codex role subagents record only `source.subagent = "<role>"`,
+    /// with no `parent_thread_id`. Keep the fallback narrow so unrelated
+    /// review/memory subagents are not grouped across projects or old sessions.
+    private static func inferredRoleOnlyCodexParentID(
+        for child: Session,
+        roleOnlyParentIndex: RoleOnlyParentIndex?
+    ) -> String? {
+        guard child.source == .codex,
+              child.parentSessionID == nil,
+              child.subagentType != nil,
+              let childCwd = normalizedCwd(child.cwd),
+              let roleOnlyParentIndex else {
+            return nil
+        }
+
+        return roleOnlyParentIndex.nearestParentID(
+            cwd: childCwd,
+            before: child.modifiedAt,
+            maxAge: Self.maxRoleOnlyParentInferenceAge
+        )
+    }
+
+    private static let maxRoleOnlyParentInferenceAge: TimeInterval = 6 * 60 * 60
+
+    private struct RoleOnlyParentCandidate {
+        let id: String
+        let startedAt: Date
+    }
+
+    private struct RoleOnlyParentIndex {
+        private var candidatesByCwd: [String: [RoleOnlyParentCandidate]] = [:]
+
+        init(sessions: [Session]) {
+            candidatesByCwd.reserveCapacity(sessions.count)
+
+            for session in sessions {
+                guard session.source == .codex,
+                      !session.isSubagent,
+                      !session.isSideChat,
+                      let cwd = SubagentHierarchyBuilder.normalizedCwd(session.cwd) else {
+                    continue
+                }
+                candidatesByCwd[cwd, default: []].append(
+                    RoleOnlyParentCandidate(id: session.id, startedAt: session.modifiedAt)
+                )
+            }
+
+            for cwd in candidatesByCwd.keys {
+                candidatesByCwd[cwd]?.sort { lhs, rhs in
+                    if lhs.startedAt == rhs.startedAt { return lhs.id < rhs.id }
+                    return lhs.startedAt < rhs.startedAt
+                }
+            }
+        }
+
+        func nearestParentID(cwd: String, before childStartedAt: Date, maxAge: TimeInterval) -> String? {
+            guard let candidates = candidatesByCwd[cwd], !candidates.isEmpty else {
+                return nil
+            }
+
+            var low = 0
+            var high = candidates.count
+            while low < high {
+                let mid = (low + high) / 2
+                if candidates[mid].startedAt <= childStartedAt {
+                    low = mid + 1
+                } else {
+                    high = mid
+                }
+            }
+
+            guard low > 0 else { return nil }
+            let nearest = candidates[low - 1]
+            guard childStartedAt.timeIntervalSince(nearest.startedAt) <= maxAge else {
+                return nil
+            }
+            return nearest.id
+        }
+    }
+
+    private static func normalizedCwd(_ cwd: String?) -> String? {
+        guard let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !cwd.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: cwd).standardizedFileURL.path
+    }
+}

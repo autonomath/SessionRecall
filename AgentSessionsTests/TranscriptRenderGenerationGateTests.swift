@@ -1,0 +1,789 @@
+import XCTest
+@testable import AgentSessions
+
+final class TranscriptRenderGenerationGateTests: XCTestCase {
+    func testGateAllowsCurrentGenerationAndSession() {
+        var gate = TranscriptRenderGenerationGate()
+        let generation = gate.begin()
+
+        XCTAssertTrue(gate.allowsApply(candidateGeneration: generation,
+                                       activeSessionID: "session-1",
+                                       expectedSessionID: "session-1"))
+    }
+
+    func testGateRejectsStaleGeneration() {
+        var gate = TranscriptRenderGenerationGate()
+        let staleGeneration = gate.begin()
+        _ = gate.begin()
+
+        XCTAssertFalse(gate.allowsApply(candidateGeneration: staleGeneration,
+                                        activeSessionID: "session-1",
+                                        expectedSessionID: "session-1"))
+    }
+
+    func testGateRejectsSessionMismatch() {
+        var gate = TranscriptRenderGenerationGate()
+        let generation = gate.begin()
+
+        XCTAssertFalse(gate.allowsApply(candidateGeneration: generation,
+                                        activeSessionID: "session-2",
+                                        expectedSessionID: "session-1"))
+    }
+
+    func testGateRejectsWhenActiveSessionIsNil() {
+        var gate = TranscriptRenderGenerationGate()
+        let generation = gate.begin()
+
+        XCTAssertFalse(gate.allowsApply(candidateGeneration: generation,
+                                        activeSessionID: nil,
+                                        expectedSessionID: "session-1"))
+    }
+
+    func testGateRejectsPreviousGenerationAfterNewBegin() {
+        var gate = TranscriptRenderGenerationGate()
+        let firstGeneration = gate.begin()
+        let secondGeneration = gate.begin()
+
+        XCTAssertFalse(gate.allowsApply(candidateGeneration: firstGeneration,
+                                        activeSessionID: "session-1",
+                                        expectedSessionID: "session-1"))
+        XCTAssertTrue(gate.allowsApply(candidateGeneration: secondGeneration,
+                                       activeSessionID: "session-1",
+                                       expectedSessionID: "session-1"))
+    }
+}
+
+final class UnifiedTableSelectionPolicyTests: XCTestCase {
+    func testTableIdentityIgnoresActiveMembershipVersion() {
+        let layoutID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+
+        let beforeLivePoll = UnifiedTableIdentityPolicy.tableIdentity(columnLayoutID: layoutID, reorderGeneration: 0)
+        let afterLivePoll = UnifiedTableIdentityPolicy.tableIdentity(columnLayoutID: layoutID, reorderGeneration: 0)
+
+        XCTAssertEqual(beforeLivePoll, afterLivePoll)
+        XCTAssertFalse(beforeLivePoll.contains("activeMembership"))
+    }
+
+    func testCollapseAllPreservesOffScopeCollapsedParents() {
+        let result = UnifiedHierarchyCommandPolicy.collapsedParentsAfterCollapseAll(
+            existing: ["off-scope-parent"],
+            visibleParentIDs: ["visible-parent"]
+        )
+
+        XCTAssertEqual(result, ["off-scope-parent", "visible-parent"])
+    }
+
+    func testExpandAllOnlyClearsVisibleCollapsedParents() {
+        let result = UnifiedHierarchyCommandPolicy.collapsedParentsAfterExpandAll(
+            existing: ["off-scope-parent", "visible-parent"],
+            visibleParentIDs: ["visible-parent"]
+        )
+
+        XCTAssertEqual(result, ["off-scope-parent"])
+    }
+
+    func testCollapseAllPromotesSelectedChildToVisibleParent() {
+        let rowMeta = [
+            "parent": SubagentRowMeta(depth: 0, hasChildren: true, childCount: 1),
+            "child": SubagentRowMeta(depth: 1, hasChildren: false, childCount: 0)
+        ]
+
+        let parentID = UnifiedHierarchyCommandPolicy.parentIDForSelectedHierarchyChild(
+            rowIDs: ["parent", "child"],
+            rowMeta: rowMeta,
+            selectedID: "child"
+        )
+
+        XCTAssertEqual(parentID, "parent")
+    }
+
+    func testCollapseAllDoesNotPromoteTopLevelSelection() {
+        let rowMeta = [
+            "parent": SubagentRowMeta(depth: 0, hasChildren: true, childCount: 1),
+            "child": SubagentRowMeta(depth: 1, hasChildren: false, childCount: 0)
+        ]
+
+        let parentID = UnifiedHierarchyCommandPolicy.parentIDForSelectedHierarchyChild(
+            rowIDs: ["parent", "child"],
+            rowMeta: rowMeta,
+            selectedID: "parent"
+        )
+
+        XCTAssertNil(parentID)
+    }
+
+    func testDoesNotClearSelectionWhileDatasetIsChurning() {
+        XCTAssertFalse(
+            UnifiedTableSelectionPolicy.shouldClearCanonicalSelectionOnTableDeselection(
+                isDatasetChurning: true,
+                currentSelectionID: "session-1",
+                visibleRowIDs: []
+            )
+        )
+    }
+
+    func testDoesNotClearSelectionWhenRowIsNotVisible() {
+        XCTAssertFalse(
+            UnifiedTableSelectionPolicy.shouldClearCanonicalSelectionOnTableDeselection(
+                isDatasetChurning: false,
+                currentSelectionID: "session-1",
+                visibleRowIDs: ["session-2"]
+            )
+        )
+    }
+
+    func testClearsSelectionWhenDatasetStableAndRowStillVisible() {
+        XCTAssertTrue(
+            UnifiedTableSelectionPolicy.shouldClearCanonicalSelectionOnTableDeselection(
+                isDatasetChurning: false,
+                currentSelectionID: "session-1",
+                visibleRowIDs: ["session-1", "session-2"]
+            )
+        )
+    }
+
+    func testHidesTableSelectionWhenIDAbsentFromCurrentRows() {
+        XCTAssertFalse(
+            UnifiedTableSelectionPolicy.shouldExposeCanonicalSelectionToTable(
+                selectionPresentInRows: false
+            )
+        )
+    }
+
+    func testIndexingCompletionReconcilesMissingSelection() {
+        XCTAssertTrue(
+            UnifiedTableSelectionPolicy.shouldReconcileIndexingCompletion(
+                selectionID: "session-1",
+                visibleRowIDs: ["session-2"],
+                sourceSessionsEmpty: false,
+                cachedRowsEmpty: false
+            )
+        )
+    }
+
+    func testIndexingCompletionReconcilesHeldEmptyRows() {
+        XCTAssertTrue(
+            UnifiedTableSelectionPolicy.shouldReconcileIndexingCompletion(
+                selectionID: nil,
+                visibleRowIDs: [],
+                sourceSessionsEmpty: true,
+                cachedRowsEmpty: false
+            )
+        )
+    }
+
+    func testIndexingCompletionSkipsRebuildWhenRowsAreCurrent() {
+        XCTAssertFalse(
+            UnifiedTableSelectionPolicy.shouldReconcileIndexingCompletion(
+                selectionID: "session-1",
+                visibleRowIDs: ["session-1", "session-2"],
+                sourceSessionsEmpty: false,
+                cachedRowsEmpty: false
+            )
+        )
+    }
+
+    func testExposesTableSelectionWhenIDPresentInCurrentRowsEvenIfBusy() {
+        // Even mid-churn/indexing/search, if the id is genuinely still in the
+        // row set, the Table must keep showing the highlight — busy state
+        // alone must not hide a present selection.
+        XCTAssertTrue(
+            UnifiedTableSelectionPolicy.shouldExposeCanonicalSelectionToTable(
+                selectionPresentInRows: true
+            )
+        )
+    }
+
+    func testDoesNotReplaceManualSelectionDuringHierarchicalRefresh() {
+        XCTAssertFalse(
+            UnifiedTableSelectionPolicy.shouldReplaceMissingSelection(
+                hierarchyBrowsing: true,
+                refreshBusy: true,
+                hasUserManuallySelected: true,
+                datasetChurning: false
+            )
+        )
+    }
+
+    func testCanReplaceMissingAutomaticSelectionOutsideHierarchicalRefresh() {
+        XCTAssertTrue(
+            UnifiedTableSelectionPolicy.shouldReplaceMissingSelection(
+                hierarchyBrowsing: true,
+                refreshBusy: false,
+                hasUserManuallySelected: true,
+                datasetChurning: false
+            )
+        )
+    }
+
+    func testDefersMissingSelectionReplacementWhileDatasetIsChurning() {
+        XCTAssertFalse(
+            UnifiedTableSelectionPolicy.shouldReplaceMissingSelection(
+                hierarchyBrowsing: false,
+                refreshBusy: false,
+                hasUserManuallySelected: false,
+                datasetChurning: true
+            )
+        )
+    }
+
+    func testReplacesMissingSelectionAfterChurnClears() {
+        XCTAssertTrue(
+            UnifiedTableSelectionPolicy.shouldReplaceMissingSelection(
+                hierarchyBrowsing: false,
+                refreshBusy: false,
+                hasUserManuallySelected: false,
+                datasetChurning: false
+            )
+        )
+    }
+}
+
+final class UnifiedRowsStabilityPolicyTests: XCTestCase {
+    func testHoldsRowsDuringRunningSearchWhenResultsTransientlyEmpty() {
+        XCTAssertTrue(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringRunningSearch(
+                isSearchRunning: true,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false
+            )
+        )
+    }
+
+    func testDoesNotHoldRowsDuringRunningSearchWhenCacheIsEmpty() {
+        XCTAssertFalse(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringRunningSearch(
+                isSearchRunning: true,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: true
+            )
+        )
+    }
+
+    func testHoldsRowsDuringTransientBusyRefreshWhenSelectionExists() {
+        XCTAssertTrue(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: "",
+                isSearchRunning: false,
+                isDatasetChurning: true,
+                isIndexing: false,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false,
+                hasSelection: true
+            )
+        )
+    }
+
+    func testHoldsRowsDuringIndexingWhenSelectionExists() {
+        XCTAssertTrue(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: "",
+                isSearchRunning: false,
+                isDatasetChurning: false,
+                isIndexing: true,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false,
+                hasSelection: true
+            )
+        )
+    }
+
+    func testDoesNotHoldRowsForStableTrueEmptyDataset() {
+        XCTAssertFalse(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: "",
+                isSearchRunning: false,
+                isDatasetChurning: false,
+                isIndexing: false,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false,
+                hasSelection: true
+            )
+        )
+    }
+}
+
+final class UnifiedSessionListEmptyStatePolicyTests: XCTestCase {
+    func testIndexingDetailDoesNotClaimReadyWhileRowsArePending() {
+        XCTAssertNil(UnifiedSessionListEmptyStatePolicy.indexingDetail(launchPhase: .ready))
+        XCTAssertNil(UnifiedSessionListEmptyStatePolicy.indexingDetail(launchPhase: .error))
+        for phase: LaunchPhase in [.idle, .hydrating, .scanning, .transcripts] {
+            let detail = UnifiedSessionListEmptyStatePolicy.indexingDetail(launchPhase: phase)
+            XCTAssertEqual(detail.map { String(localized: $0) }, String(localized: phase.statusDescription))
+        }
+    }
+
+    func testShowsIndexingBeforeTheFirstPublishedResult() {
+        XCTAssertEqual(
+            UnifiedSessionListEmptyStatePolicy.state(
+                hasRows: false,
+                isIndexing: false,
+                launchPhase: .ready,
+                hasDisplayedSessions: false,
+                indexingError: nil,
+                isDatasetChurning: false,
+                isSearchRunning: false,
+                isFiltered: false
+            ),
+            .indexing
+        )
+    }
+
+    func testShowsFailureInsteadOfAFalseEmptyLibrary() {
+        XCTAssertEqual(
+            UnifiedSessionListEmptyStatePolicy.state(
+                hasRows: false,
+                isIndexing: false,
+                launchPhase: .error,
+                hasDisplayedSessions: true,
+                indexingError: "provider failed",
+                isDatasetChurning: false,
+                isSearchRunning: false,
+                isFiltered: false
+            ),
+            .failed
+        )
+    }
+
+    func testShowsUpdatingDuringTransientEmptyRefresh() {
+        XCTAssertEqual(
+            UnifiedSessionListEmptyStatePolicy.state(
+                hasRows: false,
+                isIndexing: false,
+                launchPhase: .ready,
+                hasDisplayedSessions: true,
+                indexingError: nil,
+                isDatasetChurning: true,
+                isSearchRunning: false,
+                isFiltered: false
+            ),
+            .updating
+        )
+    }
+
+    func testShowsNoMatchesOnlyAfterIndexingHasSettled() {
+        XCTAssertEqual(
+            UnifiedSessionListEmptyStatePolicy.state(
+                hasRows: false,
+                isIndexing: false,
+                launchPhase: .ready,
+                hasDisplayedSessions: true,
+                indexingError: nil,
+                isDatasetChurning: false,
+                isSearchRunning: false,
+                isFiltered: true
+            ),
+            .filtered
+        )
+    }
+
+    func testRowsSuppressTheEmptyState() {
+        XCTAssertNil(
+            UnifiedSessionListEmptyStatePolicy.state(
+                hasRows: true,
+                isIndexing: true,
+                launchPhase: .scanning,
+                hasDisplayedSessions: true,
+                indexingError: nil,
+                isDatasetChurning: true,
+                isSearchRunning: false,
+                isFiltered: false
+            )
+        )
+    }
+}
+
+final class TranscriptSessionRenderKeyTests: XCTestCase {
+    func testRenderKeyChangesWhenEventCountChanges() {
+        let base = makeSession(eventCount: 10, events: [makeEvent(id: "e1")], isFavorite: false)
+        let updated = makeSession(eventCount: 11, events: [makeEvent(id: "e1")], isFavorite: false)
+
+        XCTAssertNotEqual(
+            TranscriptSessionRenderKey.build(for: base),
+            TranscriptSessionRenderKey.build(for: updated)
+        )
+    }
+
+    func testRenderKeyChangesWhenEventsArrayChanges() {
+        let base = makeSession(eventCount: 10, events: [makeEvent(id: "e1")], isFavorite: false)
+        let updated = makeSession(eventCount: 10, events: [makeEvent(id: "e1"), makeEvent(id: "e2")], isFavorite: false)
+
+        XCTAssertNotEqual(
+            TranscriptSessionRenderKey.build(for: base),
+            TranscriptSessionRenderKey.build(for: updated)
+        )
+    }
+
+    func testRenderKeyChangesWhenFavoriteToggles() {
+        let unstarred = makeSession(eventCount: 10, events: [makeEvent(id: "e1")], isFavorite: false)
+        let starred = makeSession(eventCount: 10, events: [makeEvent(id: "e1")], isFavorite: true)
+
+        XCTAssertNotEqual(
+            TranscriptSessionRenderKey.build(for: unstarred),
+            TranscriptSessionRenderKey.build(for: starred)
+        )
+    }
+
+    private func makeSession(eventCount: Int, events: [SessionEvent], isFavorite: Bool) -> Session {
+        var session = Session(
+            id: "session-1",
+            source: .codex,
+            startTime: Date(timeIntervalSince1970: 0),
+            endTime: Date(timeIntervalSince1970: 100),
+            model: "gpt-test",
+            filePath: "/tmp/session-1.jsonl",
+            fileSizeBytes: 1024,
+            eventCount: eventCount,
+            events: events
+        )
+        session.isFavorite = isFavorite
+        return session
+    }
+
+    private func makeEvent(id: String) -> SessionEvent {
+        SessionEvent(
+            id: id,
+            timestamp: Date(timeIntervalSince1970: 1),
+            kind: .assistant,
+            role: "assistant",
+            text: "hello",
+            toolName: nil,
+            toolInput: nil,
+            toolOutput: nil,
+            messageID: nil,
+            parentID: nil,
+            isDelta: false,
+            rawJSON: "{}"
+        )
+    }
+}
+
+final class SessionEquatablePayloadTests: XCTestCase {
+    func testSessionEqualityUsesLightweightEventEdgesNotTranscriptText() {
+        let base = makeSession(text: String(repeating: "a", count: 120_000))
+        let updatedText = makeSession(text: String(repeating: "b", count: 120_000))
+
+        XCTAssertEqual(base, updatedText)
+    }
+
+    func testSessionEqualityChangesWhenEventEdgesChange() {
+        let base = makeSession(text: "same", lastEventID: "event-2")
+        let updatedEdge = makeSession(text: "same", lastEventID: "event-3")
+
+        XCTAssertNotEqual(base, updatedEdge)
+    }
+
+    private func makeSession(text: String, lastEventID: String = "event-2") -> Session {
+        Session(
+            id: "session-1",
+            source: .codex,
+            startTime: Date(timeIntervalSince1970: 0),
+            endTime: Date(timeIntervalSince1970: 100),
+            model: "gpt-test",
+            filePath: "/tmp/session-1.jsonl",
+            fileSizeBytes: 1024,
+            eventCount: 2,
+            events: [
+                makeEvent(id: "event-1", text: "prompt", kind: .user),
+                makeEvent(id: lastEventID, text: text, kind: .assistant)
+            ]
+        )
+    }
+
+    private func makeEvent(id: String, text: String, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent(
+            id: id,
+            timestamp: Date(timeIntervalSince1970: id == "event-1" ? 1 : 2),
+            kind: kind,
+            role: kind == .user ? "user" : "assistant",
+            text: text,
+            toolName: nil,
+            toolInput: nil,
+            toolOutput: nil,
+            messageID: nil,
+            parentID: nil,
+            isDelta: false,
+            rawJSON: String(repeating: "x", count: 120_000)
+        )
+    }
+}
+
+final class SessionRowProjectDisplayTests: XCTestCase {
+    func testRowProjectDisplayDoesNotReadRawJSONCwd() {
+        let session = Session(
+            id: "session-raw-cwd",
+            source: .codex,
+            startTime: Date(timeIntervalSince1970: 0),
+            endTime: nil,
+            model: nil,
+            filePath: "/tmp/session-raw-cwd.jsonl",
+            eventCount: 1,
+            events: [
+                SessionEvent(id: "event-1",
+                             timestamp: nil,
+                             kind: .meta,
+                             role: nil,
+                             text: nil,
+                             toolName: nil,
+                             toolInput: nil,
+                             toolOutput: nil,
+                             messageID: nil,
+                             parentID: nil,
+                             isDelta: false,
+                             rawJSON: #"{"cwd":"/tmp/raw-json-only-project"}"#)
+            ]
+        )
+
+        XCTAssertEqual(session.repoName, "raw-json-only-project")
+        XCTAssertNil(session.rowRepoName)
+        XCTAssertNil(session.rowProjectWorktreeDisplayName)
+        XCTAssertEqual(session.rowRepoDisplay, "—")
+    }
+}
+
+final class TranscriptSessionResolutionPolicyTests: XCTestCase {
+    func testPrefersCachedWhenLiveSessionIsTransientlyEmpty() {
+        let live = makeSession(id: "session-1", events: [])
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: true,
+            loadingSessionID: "session-1"
+        )
+
+        XCTAssertEqual(preferred?.events.count, 1)
+        XCTAssertEqual(preferred?.id, "session-1")
+    }
+
+    func testPrefersLiveEmptyWhenNotLoading() {
+        let live = makeSession(id: "session-1", events: [], eventCount: 0, fileSizeBytes: 0)
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: false,
+            loadingSessionID: nil
+        )
+
+        XCTAssertEqual(preferred?.events.count, 0)
+        XCTAssertEqual(preferred?.id, "session-1")
+    }
+
+    func testPrefersLiveEmptyWhenDifferentSessionIsLoading() {
+        let live = makeSession(id: "session-1", events: [], eventCount: 0, fileSizeBytes: 0)
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: true,
+            loadingSessionID: "session-2"
+        )
+
+        XCTAssertEqual(preferred?.events.count, 0)
+        XCTAssertEqual(preferred?.id, "session-1")
+    }
+
+    func testPrefersLiveWhenLiveHasEvents() {
+        let live = makeSession(id: "session-1", events: [makeEvent(id: "e-live")])
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e-cached")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: true,
+            loadingSessionID: "session-1"
+        )
+
+        XCTAssertEqual(preferred?.events.first?.id, "e-live")
+    }
+
+    func testPrefersCachedWhenLiveLooksTransientlyLightweightOutsideLoading() {
+        let live = makeSession(id: "session-1", events: [], eventCount: 4)
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: false,
+            loadingSessionID: nil
+        )
+
+        XCTAssertEqual(preferred?.events.count, 1)
+        XCTAssertEqual(preferred?.id, "session-1")
+    }
+
+    func testUsesCachedWhenLiveMissing() {
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: nil,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: false,
+            loadingSessionID: nil
+        )
+
+        XCTAssertEqual(preferred?.events.count, 1)
+        XCTAssertEqual(preferred?.id, "session-1")
+    }
+
+    private func makeSession(id: String,
+                             events: [SessionEvent],
+                             eventCount: Int? = nil,
+                             fileSizeBytes: Int? = 1024) -> Session {
+        Session(
+            id: id,
+            source: .claude,
+            startTime: Date(timeIntervalSince1970: 0),
+            endTime: Date(timeIntervalSince1970: 100),
+            model: "claude-test",
+            filePath: "/tmp/\(id).jsonl",
+            fileSizeBytes: fileSizeBytes,
+            eventCount: eventCount ?? max(events.count, 1),
+            events: events
+        )
+    }
+
+    private func makeEvent(id: String) -> SessionEvent {
+        SessionEvent(
+            id: id,
+            timestamp: Date(timeIntervalSince1970: 1),
+            kind: .assistant,
+            role: "assistant",
+            text: "hello",
+            toolName: nil,
+            toolInput: nil,
+            toolOutput: nil,
+            messageID: nil,
+            parentID: nil,
+            isDelta: false,
+            rawJSON: "{}"
+        )
+    }
+}
+
+final class TranscriptTailUpdateStateTests: XCTestCase {
+    func testJumpArrowVisibleBeforeViewportMeasurement() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+
+        XCTAssertTrue(state.shouldShowJumpToLatestButton)
+    }
+
+    func testJumpArrowHiddenAtBottom() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+
+        state.viewportChanged(isNearBottom: true)
+
+        XCTAssertFalse(state.shouldShowJumpToLatestButton)
+    }
+
+    func testJumpArrowVisibleAwayFromBottom() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+
+        state.viewportChanged(isNearBottom: false)
+
+        XCTAssertTrue(state.shouldShowJumpToLatestButton)
+    }
+
+    func testDetachedContentUpdateKeepsJumpArrowVisible() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+        state.viewportChanged(isNearBottom: false)
+
+        state.contentVersionChanged(sessionID: "s1", contentVersion: 11)
+
+        XCTAssertTrue(state.shouldShowJumpToLatestButton)
+    }
+
+    func testContentUpdateAtBottomRequestsAutoScroll() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+
+        state.contentVersionChanged(sessionID: "s1", contentVersion: 11)
+
+        XCTAssertEqual(state.scrollToBottomToken, 1)
+        XCTAssertFalse(state.hasUnseenUpdates)
+        XCTAssertTrue(state.stickyFollowEnabled)
+        XCTAssertTrue(state.shouldShowJumpToLatestButton,
+                      "an intent must not be treated as a confirmed bottom viewport")
+    }
+
+    func testJumpToLatestHidesOnlyAfterViewportReportsBottom() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+        state.viewportChanged(isNearBottom: false)
+
+        state.jumpToLatest()
+        XCTAssertTrue(state.shouldShowJumpToLatestButton)
+
+        state.viewportChanged(isNearBottom: true)
+        XCTAssertFalse(state.shouldShowJumpToLatestButton)
+    }
+
+    func testContentUpdateWhileDetachedShowsUnseenIndicator() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+        state.viewportChanged(isNearBottom: false)
+
+        state.contentVersionChanged(sessionID: "s1", contentVersion: 11)
+
+        XCTAssertEqual(state.scrollToBottomToken, 0)
+        XCTAssertTrue(state.hasUnseenUpdates)
+        XCTAssertFalse(state.stickyFollowEnabled)
+    }
+
+    func testJumpToLatestClearsUnseenAndRequestsScroll() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+        state.viewportChanged(isNearBottom: false)
+        state.contentVersionChanged(sessionID: "s1", contentVersion: 11)
+
+        state.jumpToLatest()
+
+        XCTAssertEqual(state.scrollToBottomToken, 1)
+        XCTAssertFalse(state.hasUnseenUpdates)
+        XCTAssertTrue(state.stickyFollowEnabled)
+    }
+
+    func testReturningToBottomClearsUnseenAndRestoresFollow() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+        state.viewportChanged(isNearBottom: false)
+        state.contentVersionChanged(sessionID: "s1", contentVersion: 11)
+
+        state.viewportChanged(isNearBottom: true)
+
+        XCTAssertFalse(state.hasUnseenUpdates)
+        XCTAssertTrue(state.stickyFollowEnabled)
+        XCTAssertTrue(state.isNearBottom)
+    }
+
+    func testDifferentSessionResetsWithoutScrollRequest() {
+        var state = TranscriptTailUpdateState()
+        state.reset(sessionID: "s1", contentVersion: 10)
+
+        state.contentVersionChanged(sessionID: "s2", contentVersion: 1)
+
+        XCTAssertEqual(state.sessionID, "s2")
+        XCTAssertEqual(state.lastContentVersion, 1)
+        XCTAssertEqual(state.scrollToBottomToken, 0)
+        XCTAssertFalse(state.hasUnseenUpdates)
+    }
+}

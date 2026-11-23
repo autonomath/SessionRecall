@@ -1,0 +1,8383 @@
+#!/usr/bin/env python3
+"""
+Daily/weekly agent monitoring for upstream version drift and schema-risk detection.
+
+Policy:
+- Daily mode is quiet when there is nothing actionable.
+- Weekly mode always emits a report (expected review).
+- This tool never edits parsers or fixtures. It only writes reports and optional probe outputs.
+
+Outputs:
+- Writes JSON report under scripts/probe_scan_output/agent_watch/<UTC timestamp>/report.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import fnmatch
+import io
+import json
+import math
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_CONFIG = "docs/agent-support/agent-watch-config.json"
+DEFAULT_TIMEOUT_SECONDS = 120
+
+
+def _now_utc_slug() -> str:
+    # Seconds alone let parallel agent-specific runs choose the same directory and
+    # overwrite report.json. Microseconds plus PID keep artifacts distinct across
+    # both rapid calls in one process and concurrent checker processes.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
+    return f"{stamp}-p{os.getpid()}"
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_json_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Read `path` as a JSON object, returning `(object, error_code)`.
+
+    The error CODE is the point. A caller that only learns "no object came back"
+    cannot tell an upstream rename from a truncated write from a file that now
+    holds an array, and those need three different triage paths. The single
+    `except (OSError, json.JSONDecodeError)` this replaces collapsed all of them
+    into a silent `None`.
+    """
+    if not path.exists():
+        return None, "missing"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        # Permissions, a directory where a file is expected, an unreadable mount.
+        return None, "unreadable"
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    if not isinstance(obj, dict):
+        return None, "not_json_object"
+    return obj, None
+
+
+def _expand_path(p: str) -> Path:
+    # Expand env vars and ~
+    expanded = os.path.expandvars(p)
+    return Path(expanded).expanduser()
+
+
+def _open_session_text(path: Path):
+    """Open a session file as text, decoding a `.jsonl.zst` (one zstd stream) transparently.
+
+    Codex compresses rollouts that have not changed for 7 days into
+    `rollout-*.jsonl.zst` and deletes the plain file (`local_thread_store_compression`).
+    """
+    if path.name.endswith(".jsonl.zst"):
+        try:
+            from compression import zstd as _zstd  # Python 3.14+
+        except ImportError as exc:
+            # An OSError, so callers that skip unreadable files skip this one too.
+            raise OSError(f"{path.name}: decoding .jsonl.zst needs Python 3.14+ (compression.zstd)") from exc
+
+        return _zstd.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
+try:
+    from compression.zstd import ZstdError as _ZstdError  # Python 3.14+
+except ImportError:  # pragma: no cover - older Python cannot open .zst at all
+
+    class _ZstdError(Exception):
+        pass
+
+
+# What reading a session file can raise: I/O errors, and for a `.jsonl.zst` a
+# truncated stream (EOFError) or corrupt data (ZstdError).
+_SESSION_READ_ERRORS: tuple[type[BaseException], ...] = (OSError, EOFError, _ZstdError)
+
+
+def _readable_fingerprints(candidates: list[Path], fingerprint: Any) -> list[dict[str, Any]]:
+    """`fingerprint(p)` for each candidate in order, skipping files that fail to read."""
+    out: list[dict[str, Any]] = []
+    for cand in candidates:
+        try:
+            out.append(fingerprint(cand))
+        except _SESSION_READ_ERRORS:
+            continue
+    return out
+
+
+def _is_session_candidate(path: Path) -> bool:
+    """False for a file that is not a separate session.
+
+    A `rollout-*.jsonl*` glob also matches `X.jsonl.zst` next to its own `X.jsonl`
+    while Codex restores a compressed rollout; that is one session and the plain file
+    wins, as in Codex and the app. Other `rollout-*.jsonl.<suffix>` files (Codex's
+    `.tmp` files) are not sessions. Other agents' names (DeepSeek's `.jsonl.zstd`)
+    are left alone.
+    """
+    name = path.name
+    if not name.startswith("rollout-"):
+        return True
+    if name.endswith(".jsonl.zst"):
+        return not path.with_name(name[: -len(".zst")]).exists()
+    return name.endswith(".jsonl")
+
+
+# Credentials that must never reach a monitored agent CLI. This tool shells out
+# to every agent binary on the machine; a GitHub token in their environment is
+# ambient authority none of them need.
+_TOKEN_ENV_KEYS = ("GITHUB_TOKEN", "GH_TOKEN")
+
+
+def _child_env() -> dict[str, str]:
+    """The environment for spawned commands, minus any GitHub credential."""
+    env = dict(os.environ)
+    for key in _TOKEN_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def _github_token() -> str | None:
+    for key in _TOKEN_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            return value
+    # Reuse the owner's existing gh login; never start a login or expose its token
+    # in argv/logs. Scheduled scans otherwise hit the anonymous GitHub API limit.
+    rc, output, _ = _run_cmd(["gh", "auth", "token"], timeout=5)
+    if rc == 0 and output.strip():
+        return output.strip()
+    return None
+
+
+def _http_get_text(url: str, timeout: int) -> str:
+    # Prefer curl to avoid Python SSL trust-store drift on some macOS setups.
+    curl_argv = ["curl", "-fsSL", "-H", "User-Agent: AgentSessions-AgentWatch/1.0"]
+    github_token = _github_token()
+    use_token = bool(github_token) and urllib.parse.urlparse(url).netloc == "api.github.com"
+
+    # The Authorization header goes through a 0600 curl config file, never argv:
+    # process arguments are world-readable in the process table, so `-H "Authorization:
+    # Bearer …"` would publish the token to every user on the machine for the life of
+    # the request.
+    config_path: str | None = None
+    # Seeded so a failure while writing the config file falls through to the
+    # urllib path below instead of raising UnboundLocalError on `rc`.
+    rc, out = 1, ""
+    try:
+        if use_token:
+            fd, config_path = tempfile.mkstemp(prefix="agent-watch-curl-", suffix=".conf")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(f'header = "Authorization: Bearer {github_token}"\n')
+            os.chmod(config_path, 0o600)
+            curl_argv.extend(["--config", config_path])
+        curl_argv.append(url)
+        rc, out, err = _run_cmd(curl_argv, timeout=timeout)
+    finally:
+        if config_path:
+            try:
+                os.unlink(config_path)
+            except OSError:
+                pass
+    if rc == 0 and out:
+        return out
+    # Fallback to urllib for environments without curl.
+    headers = {
+        "User-Agent": "AgentSessions-AgentWatch/1.0",
+        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    }
+    if use_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def _http_get_json(url: str, timeout: int) -> Any:
+    txt = _http_get_text(url, timeout=timeout)
+    return json.loads(txt)
+
+
+_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+_DSH_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?")
+
+
+@dataclass(frozen=True, order=True)
+class Semver:
+    major: int
+    minor: int
+    patch: int
+
+    @staticmethod
+    def parse(text: str) -> "Semver | None":
+        m = _SEMVER_RE.search(text)
+        if not m:
+            return None
+        return Semver(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    def __str__(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+
+def _extract_semver(text: str) -> str | None:
+    v = Semver.parse(text)
+    return str(v) if v else None
+
+
+def _extract_dsh_semver(text: str) -> str | None:
+    match = _DSH_SEMVER_RE.search(text)
+    return match.group(0) if match else None
+
+
+def _compare_dsh_semver(a: str | None, b: str | None) -> int | None:
+    """Compare DSH prereleases by SemVer precedence without changing other agents."""
+    if not a or not b:
+        return None
+    left = _DSH_SEMVER_RE.search(a)
+    right = _DSH_SEMVER_RE.search(b)
+    if not left or not right:
+        return None
+    base_a = tuple(int(left.group(i)) for i in range(1, 4))
+    base_b = tuple(int(right.group(i)) for i in range(1, 4))
+    if base_a != base_b:
+        return (base_a > base_b) - (base_a < base_b)
+    pre_a, pre_b = left.group(4), right.group(4)
+    if pre_a is None or pre_b is None:
+        return (pre_a is None) - (pre_b is None)
+    for item_a, item_b in zip(pre_a.split("."), pre_b.split(".")):
+        if item_a == item_b:
+            continue
+        numeric_a, numeric_b = item_a.isdigit(), item_b.isdigit()
+        if numeric_a and numeric_b:
+            return (int(item_a) > int(item_b)) - (int(item_a) < int(item_b))
+        if numeric_a != numeric_b:
+            return -1 if numeric_a else 1
+        return (item_a > item_b) - (item_a < item_b)
+    return (len(pre_a.split(".")) > len(pre_b.split("."))) - (
+        len(pre_a.split(".")) < len(pre_b.split("."))
+    )
+
+
+def _upstream_newer_than_verified(agent_name: str, upstream: str | None,
+                                   verified: str | None) -> bool:
+    compare = _compare_dsh_semver if agent_name == "deepseek_harness" else _compare_semver
+    return compare(upstream, verified) == 1
+
+
+def _run_cmd(argv: list[str], timeout: int) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+            # Single choke point for every spawned process, including the agent
+            # CLIs this tool probes. Any GitHub credential is stripped here so it
+            # cannot leak into a third-party binary's environment; the one caller
+            # that needs it (`_http_get_text`) passes it through a 0600 config
+            # file instead.
+            env=_child_env(),
+        )
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", f"Command not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"Timed out after {timeout}s"
+    except OSError as exc:
+        # A broken/unexecutable binary on PATH (e.g. an "Exec format error"
+        # from a shebang-less stub, or a permission error) must not abort the
+        # whole scan. Record it as a failed command for this one agent and let
+        # the caller continue with the rest. 126 is the conventional shell code
+        # for "command found but not executable".
+        return 126, "", f"Cannot execute {argv[0]}: {exc}"
+
+
+def _read_verified_versions_from_matrix(matrix_path: Path) -> dict[str, str]:
+    """
+    Minimal YAML reader for the specific support matrix shape.
+    Avoids external dependencies (PyYAML).
+    """
+    text = matrix_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    # We only need: agents.<key>.max_verified_version
+    in_agents = False
+    current_agent: str | None = None
+    versions: dict[str, str] = {}
+
+    for raw in text:
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith("agents:"):
+            in_agents = True
+            current_agent = None
+            continue
+        if not in_agents:
+            continue
+
+        # Top-level agent key (2-space indent): "  codex_cli:"
+        m_agent = re.match(r"^\s{2}([a-zA-Z0-9_]+):\s*$", line)
+        if m_agent:
+            current_agent = m_agent.group(1)
+            continue
+
+        if current_agent is None:
+            continue
+
+        # Field line (4-space indent): "    max_verified_version: "0.73.0""
+        m_ver = re.match(r'^\s{4}max_verified_version:\s*"?(.*?)"?\s*$', line)
+        if m_ver:
+            versions[current_agent] = m_ver.group(1).strip()
+
+    return versions
+
+
+def _keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    if not text:
+        return []
+    lower = text.lower()
+    hits: list[str] = []
+    for k in keywords:
+        if k.lower() in lower:
+            hits.append(k)
+    return hits
+
+
+def _resolve_cli_binary_mtime(installed_version_cmd: list[str] | None) -> tuple[str | None, float | None]:
+    """Resolve the CLI binary on PATH and return (abs_path, mtime_epoch).
+
+    Both elements are None if the command is empty, unresolvable, or the
+    resolved path cannot be stat'd. Used by sample_freshness to decide if
+    the newest local sample predates the installed binary.
+    """
+    if not isinstance(installed_version_cmd, list) or not installed_version_cmd:
+        return None, None
+    binary_name = installed_version_cmd[0]
+    if not isinstance(binary_name, str) or not binary_name:
+        return None, None
+    resolved = shutil.which(binary_name)
+    if not resolved:
+        return None, None
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return resolved, None
+    return resolved, float(st.st_mtime)
+
+
+def _expand_cmd_paths(argv: list[str]) -> list[str]:
+    if not argv:
+        return argv
+    first = argv[0]
+    if first.startswith("~") or first.startswith("$HOME"):
+        first = os.path.expandvars(os.path.expanduser(first))
+    return [first, *argv[1:]]
+
+
+def _installed_version_cmd_candidates(agent_cfg: dict[str, Any]) -> list[list[str]]:
+    candidates: list[list[str]] = []
+    primary = agent_cfg.get("installed_version_cmd")
+    if isinstance(primary, list) and all(isinstance(x, str) for x in primary):
+        candidates.append(_expand_cmd_paths(primary))
+    fallback_cfg = agent_cfg.get("installed_version_fallback_cmds")
+    if isinstance(fallback_cfg, list):
+        for fallback in fallback_cfg:
+            if isinstance(fallback, list) and all(isinstance(x, str) for x in fallback):
+                candidates.append(_expand_cmd_paths(fallback))
+    return candidates
+
+
+def _run_installed_version_cmds(agent_cfg: dict[str, Any]) -> tuple[list[str] | None, int, str, str, str | None]:
+    candidates = _installed_version_cmd_candidates(agent_cfg)
+    if not candidates:
+        return None, 127, "", "missing installed_version_cmd", None
+
+    first_result: tuple[list[str], int, str, str, str | None] | None = None
+    for argv in candidates:
+        rc, stdout, stderr = _run_cmd(argv, timeout=10)
+        text = "\n".join(part for part in (stdout, stderr) if part)
+        parsed = _extract_semver(text) or (stdout.split()[0] if stdout else None)
+        result = (argv, rc, stdout, stderr, parsed)
+        if first_result is None:
+            first_result = result
+        if rc == 0 and parsed:
+            return result
+
+    assert first_result is not None
+    return first_result
+
+
+def _epoch_to_utc_iso(epoch: float | None) -> str | None:
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _compute_sample_freshness(
+    *,
+    sample_mtime: float | None,
+    cli_binary_path: str | None,
+    cli_binary_mtime: float | None,
+    freshness_window_seconds: int,
+    now_epoch: float,
+    mode_context: str,
+    force_fresh: bool,
+) -> dict[str, Any]:
+    """Build the sample_freshness evidence block per spec §3.1/§3.2."""
+    block: dict[str, Any] = {
+        "sample_mtime_utc": _epoch_to_utc_iso(sample_mtime),
+        "cli_binary_mtime_utc": _epoch_to_utc_iso(cli_binary_mtime),
+        "cli_binary_path": cli_binary_path,
+        "freshness_window_seconds": int(freshness_window_seconds),
+        "sample_older_than_cli": None,
+        "sample_older_than_window": None,
+        "is_stale": False,
+        "stale_reason": None,
+        "mode_context": mode_context,
+    }
+
+    if force_fresh:
+        block["is_stale"] = False
+        block["stale_reason"] = "forced_fresh"
+        return block
+
+    if sample_mtime is None:
+        # No sample on disk — staleness is not meaningful; leave flags None.
+        return block
+
+    if cli_binary_mtime is not None:
+        older_cli = sample_mtime < cli_binary_mtime
+        block["sample_older_than_cli"] = bool(older_cli)
+    else:
+        block["sample_older_than_cli"] = None
+
+    older_window = (now_epoch - sample_mtime) > freshness_window_seconds
+    block["sample_older_than_window"] = bool(older_window)
+
+    if block["sample_older_than_cli"] is True:
+        block["is_stale"] = True
+        block["stale_reason"] = "sample_older_than_cli"
+    elif older_window:
+        block["is_stale"] = True
+        if cli_binary_path is None:
+            block["stale_reason"] = "cli_binary_unresolved"
+        else:
+            block["stale_reason"] = "sample_older_than_window"
+    else:
+        if cli_binary_path is None:
+            # Binary unresolved but window still fresh — record the cause so
+            # downstream readers know signal 1 was unavailable.
+            block["stale_reason"] = "cli_binary_unresolved"
+            block["is_stale"] = False
+
+    return block
+
+
+def _dsh_source_sample_freshness(
+    sample: dict[str, Any],
+    *,
+    cli_binary_path: str | None,
+    cli_binary_mtime: float | None,
+    freshness_window_seconds: int,
+    now_epoch: float,
+) -> dict[str, Any]:
+    source_created_at = sample.get("source_created_at_epoch")
+    source_time = (
+        float(source_created_at)
+        if isinstance(source_created_at, (int, float))
+        else None
+    )
+    block = _compute_sample_freshness(
+        sample_mtime=source_time,
+        cli_binary_path=cli_binary_path,
+        cli_binary_mtime=cli_binary_mtime,
+        freshness_window_seconds=freshness_window_seconds,
+        now_epoch=now_epoch,
+        mode_context="dsh_source_reported_created_at",
+        force_fresh=False,
+    )
+    block["evidence_basis"] = "source_reported_header_createdAt"
+    block["source_timestamp_authenticated"] = False
+    block["source_reported_created_at_utc"] = _epoch_to_utc_iso(source_time)
+    block["artifact_mtime_utc"] = sample.get("artifact_mtime_utc")
+    block["artifact_mtime_epoch"] = sample.get("artifact_mtime_epoch")
+    if source_time is not None and source_time > now_epoch + 300:
+        block["is_stale"] = True
+        block["stale_reason"] = "source_timestamp_in_future"
+    has_binary_identity = cli_binary_path is not None and cli_binary_mtime is not None
+    if not has_binary_identity and block.get("is_stale") is not True:
+        block["stale_reason"] = "cli_binary_unresolved"
+    block["fresh_for_compatibility"] = (
+        source_time is not None
+        and has_binary_identity
+        and block.get("is_stale") is False
+        and block.get("sample_older_than_cli") is False
+        and block.get("sample_older_than_window") is False
+    )
+    return block
+
+
+def _pick_severity(
+    *,
+    upstream_newer_than_verified: bool,
+    installed_newer_than_verified: bool,
+    monitoring_failed: bool,
+    schema_hits: list[str],
+    usage_hits: list[str],
+    probe_failed: bool,
+    probe_failed_but_upstream_degraded: bool,
+) -> tuple[str, str]:
+    if monitoring_failed:
+        return "high", "prepare_hotfix"
+    if probe_failed and not probe_failed_but_upstream_degraded:
+        return "high", "prepare_hotfix"
+    if probe_failed and probe_failed_but_upstream_degraded:
+        # Upstream issue: monitor rather than treat as an AS regression.
+        return "medium", "monitor"
+    if installed_newer_than_verified:
+        return "medium", "run_weekly_now"
+    if not upstream_newer_than_verified and not installed_newer_than_verified:
+        return "none", "ignore"
+    if schema_hits or usage_hits:
+        return "medium", "run_weekly_now"
+    return "low", "monitor"
+
+
+def _upstream_fetch_degraded(errors: list[dict[str, Any]]) -> bool:
+    if not errors:
+        return False
+    for err in errors:
+        detail = str(err.get("detail") or err.get("error") or "").lower()
+        if "rate limit" in detail or "too many requests" in detail or "http error 429" in detail:
+            continue
+        return False
+    return True
+
+
+def _latest_cached_upstream_evidence(
+    *,
+    agent_name: str,
+    reports_root: Path,
+) -> dict[str, Any] | None:
+    def _report_sort_time(report_path: Path, report: dict[str, Any]) -> float:
+        ts = report.get("timestamp_utc")
+        if isinstance(ts, str) and ts:
+            try:
+                return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        slug = report_path.parent.name.removesuffix("-prebump")
+        try:
+            return datetime.strptime(slug, "%Y%m%d-%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return -1.0
+
+    candidates: list[tuple[float, Path, dict[str, Any], dict[str, Any]]] = []
+    for report_path in reports_root.glob("*/report.json"):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        report_sort_time = _report_sort_time(report_path, report)
+        if report_sort_time < 0:
+            continue
+        results = report.get("results")
+        if not isinstance(results, dict):
+            continue
+        entry = results.get(agent_name)
+        if not isinstance(entry, dict):
+            continue
+        upstream = entry.get("upstream")
+        if not isinstance(upstream, dict):
+            continue
+        version = upstream.get("parsed_version")
+        if not isinstance(version, str) or not version:
+            continue
+        source_used = upstream.get("source_used")
+        if not isinstance(source_used, dict) or source_used.get("ok") is not True:
+            continue
+        if source_used.get("kind") == "cached_prior_report":
+            continue
+        candidates.append((report_sort_time, report_path, report, source_used))
+
+    if not candidates:
+        return None
+
+    _, report_path, report, source_used = max(candidates, key=lambda item: item[0])
+    entry = (report.get("results") or {}).get(agent_name) if isinstance(report.get("results"), dict) else None
+    upstream = entry.get("upstream") if isinstance(entry, dict) else None
+    version = upstream.get("parsed_version") if isinstance(upstream, dict) else None
+    return {
+        "ok": True,
+        "kind": "cached_prior_report",
+        "version": version,
+        "report": _safe_relpath(report_path),
+        "report_timestamp_utc": report.get("timestamp_utc"),
+        "cached_source_used": source_used,
+    }
+
+
+def _compare_semver(a: str | None, b: str | None) -> int | None:
+    """
+    Returns -1/0/1 for a<b, a==b, a>b. None if either is not semver.
+    """
+    if not a or not b:
+        return None
+    va = Semver.parse(a)
+    vb = Semver.parse(b)
+    if not va or not vb:
+        return None
+    if va < vb:
+        return -1
+    if va > vb:
+        return 1
+    return 0
+
+
+def _safe_relpath(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except Exception:
+        return str(path)
+
+
+def _path_matches_any_exclude(path: Path, exclude_globs: list[str] | None) -> bool:
+    """Return True if *path* matches any of the provided fnmatch-style globs.
+
+    Matching is performed against both the full POSIX path and against each
+    individual path component so patterns like ``backup`` or ``**/backup/**``
+    both work. This is used by the weekly local-schema selector to skip
+    backup/reset snapshots that the Swift-side discovery does not surface.
+    """
+    if not exclude_globs:
+        return False
+    import fnmatch
+    posix = path.as_posix()
+    for pattern in exclude_globs:
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        if fnmatch.fnmatch(posix, pattern):
+            return True
+        for part in path.parts:
+            if fnmatch.fnmatch(part, pattern):
+                return True
+    return False
+
+
+def _newest_file(roots: list[str], glob: str, exclude_globs: list[str] | None = None) -> Path | None:
+    candidates: list[Path] = []
+    for r in roots:
+        root = _expand_path(r)
+        if not root.exists():
+            continue
+        candidates.extend(root.glob(glob) if "*" in glob and "/" not in glob else root.rglob(glob))
+    newest: Path | None = None
+    newest_mtime = -1.0
+    for p in candidates:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if not p.is_file():
+            continue
+        if _path_matches_any_exclude(p, exclude_globs):
+            continue
+        if st.st_mtime > newest_mtime:
+            newest = p
+            newest_mtime = st.st_mtime
+    return newest
+
+
+# How many recent sessions the weekly scan fingerprints together. One is not enough:
+# whichever session happens to be newest decides the whole verdict, so a single thin
+# session — including the one a prebump run leaves in the real store — can hide drift
+# that a rich session two files back plainly shows.
+_LOCAL_SCHEMA_SAMPLE_COUNT = 5
+
+# How deep the weekly looks past prebump sessions for real ones (sessions, not files read:
+# classification stops as soon as the sample is full).
+_PREBUMP_CANDIDATE_POOL = _LOCAL_SCHEMA_SAMPLE_COUNT * 10
+
+# Signals that a real-home prebump run wrote a session. Drivers put a fresh
+# `AGENT_WATCH_PREBUMP_<uuid hex>` marker in the prompt (antigravity, copilot, hermes,
+# openclaw), or run the CLI in a `make_sandbox()` directory named
+# `agent-watch-prebump-<agent>-XXXXXXXX` (cline, cursor, deepseek_harness), which some
+# stores also encode into the session's directory name. claude_print has neither: its
+# configured prompt is the first queued record, so `_prebump_prompt_needles` covers it.
+_PREBUMP_MARKER_RE = re.compile(r"AGENT_WATCH_PREBUMP_[0-9a-f]{32}")
+_PREBUMP_SANDBOX_RE = re.compile(r"agent-watch-prebump-[a-z][a-z0-9_]*-")
+_PREBUMP_SANDBOX_CWD_RE = re.compile(r'"cwd"\s*:\s*"[^"]*agent-watch-prebump-[a-z][a-z0-9_]*-')
+# Only the head of a session is searched: the prompt and cwd come first, and a real
+# session that later quotes prebump output must stay a real session.
+_PREBUMP_HEAD_LINES = 8
+_PREBUMP_HEAD_CHARS = 64 * 1024
+_PREBUMP_MIN_PROMPT_CHARS = 12
+
+
+def _prebump_prompt_needles(agent_cfg: dict[str, Any] | None) -> tuple[str, ...]:
+    """The agent's configured prebump prompt, raw and JSON-escaped, as head needles."""
+    prebump = (agent_cfg or {}).get("prebump") if isinstance(agent_cfg, dict) else None
+    prompt = prebump.get("prompt") if isinstance(prebump, dict) else None
+    if not isinstance(prompt, str) or len(prompt.strip()) < _PREBUMP_MIN_PROMPT_CHARS:
+        return ()
+    prompt = prompt.strip()
+    escaped = json.dumps(prompt)[1:-1]
+    return (prompt,) if escaped == prompt else (prompt, escaped)
+
+
+def _text_has_prebump_signal(text: str, prompt_needles: tuple[str, ...] | list[str] = ()) -> bool:
+    if _PREBUMP_MARKER_RE.search(text) or _PREBUMP_SANDBOX_CWD_RE.search(text):
+        return True
+    return any(needle and needle in text for needle in prompt_needles)
+
+
+def _is_prebump_session_file(
+    path: Path,
+    prompt_needles: tuple[str, ...] | list[str] = (),
+    *,
+    read_head: bool = True,
+) -> bool:
+    """True when a real-home prebump run wrote this session (see `_PREBUMP_MARKER_RE`)."""
+    if _PREBUMP_SANDBOX_RE.search(str(path)):
+        return True
+    if not read_head:
+        return False
+    try:
+        with _open_session_text(path) as handle:
+            head = handle.read(_PREBUMP_HEAD_CHARS)
+    except _SESSION_READ_ERRORS:
+        return False
+    if ".jsonl" in path.name:
+        head = "\n".join(head.splitlines()[:_PREBUMP_HEAD_LINES])
+    return _text_has_prebump_signal(head, prompt_needles)
+
+
+def _prefer_real_sessions(
+    candidates: list[Any], count: int, is_prebump: Any
+) -> tuple[list[Any], dict[str, int]]:
+    """The newest `count` real sessions from newest-first `candidates`.
+
+    Prebump sessions fill the sample only when fewer than `count` real sessions exist,
+    newest first; the result keeps the candidates' newest-first order. On a machine with
+    little real use they are still the freshest evidence, so they are counted, not
+    hidden: `sampled_prebump_sessions` in the sample, `skipped_prebump_sessions` left out.
+    """
+    real: list[int] = []
+    prebump: list[int] = []
+    for index, candidate in enumerate(candidates):
+        if len(real) >= count:
+            break
+        (prebump if is_prebump(candidate) else real).append(index)
+    topped_up = prebump[: max(0, count - len(real))]
+    picked = [candidates[i] for i in sorted(real + topped_up)]
+    return picked, {
+        "sampled_prebump_sessions": len(topped_up),
+        "skipped_prebump_sessions": len(prebump) - len(topped_up),
+    }
+
+
+# agent_watch's agent name -> its section name in agent-support-matrix.yml.
+#
+# THE ONE COPY. This existed three times — twice in this file (weekly local_schema,
+# prebump fresh-session diff) and once as rebuild_stage0_baseline.MATRIX_KEY — and the
+# copies drifted apart, which is a silent-wrong-answer bug rather than an untidiness:
+# a missing entry resolves `matrix_key` to None, so `baseline_paths` is empty,
+# `baseline_type_keys` is empty, and the prebump diff takes its "no baseline → nothing
+# diffs" branch and reports fresh_matches=True having compared NOTHING. On 2026-08-17
+# the prebump copy was still missing grok and qwen while the weekly copy had both, so
+# grok's first prebump driver would have passed without ever consulting a baseline.
+# Import this from rebuild_stage0_baseline rather than re-declaring it there.
+MATRIX_KEY_FOR_AGENT: dict[str, str] = {
+    "codex": "codex_cli",
+    "claude": "claude_code",
+    "copilot": "copilot_cli",
+    "antigravity": "antigravity",
+    "opencode": "opencode",
+    "hermes": "hermes",
+    "openclaw": "openclaw",
+    "cursor": "cursor",
+    "pi": "pi",
+    "kimi": "kimi_code",
+    "grok": "grok_cli",
+    "qwen": "qwen_code",
+    "devin": "devin_cli",
+    "fx": "fx",
+    "cline": "cline",
+    "deepseek_harness": "deepseek_harness",
+    "droid": "droid",
+}
+
+
+def _verified_versions_by_agent(matrix_versions: dict[str, str]) -> dict[str, str | None]:
+    """Resolve configured agent names through the one shared matrix-key map."""
+    return {
+        agent_name: matrix_versions.get(matrix_key)
+        for agent_name, matrix_key in MATRIX_KEY_FOR_AGENT.items()
+    }
+
+
+def _cline_effective_roots(
+    configured_roots: list[str], environment: dict[str, str] | None = None
+) -> list[str]:
+    """Apply Cline's authoritative CLINE_DATA_DIR precedence to monitor roots."""
+    env = os.environ if environment is None else environment
+    data_dir = (env.get("CLINE_DATA_DIR") or "").strip()
+    if data_dir:
+        return [str(Path(os.path.expanduser(os.path.expandvars(data_dir))) / "sessions")]
+    return [root for root in configured_roots if "$CLINE_DATA_DIR" not in root]
+
+
+def _cline_pair_stat(manifest: Path) -> tuple[float, int] | None:
+    """Logical mtime/size for a Cline manifest and its adjacent transcript."""
+    paths = [manifest, manifest.with_name(f"{manifest.stem}.messages.json")]
+    stats: list[os.stat_result] = []
+    for path in paths:
+        try:
+            if path.is_file():
+                stats.append(path.stat())
+        except OSError:
+            continue
+    if not stats:
+        return None
+    return max(st.st_mtime for st in stats), sum(int(st.st_size) for st in stats)
+
+
+def _newest_cline_files(
+    roots: list[str], glob: str, count: int, exclude_globs: list[str] | None = None
+) -> list[Path]:
+    """Newest Cline manifests ranked by the logical manifest/messages pair."""
+    candidates: set[Path] = set()
+    for root_value in roots:
+        root = _expand_path(root_value)
+        if not root.exists():
+            continue
+        matches = root.glob(glob) if "*" in glob and "/" not in glob else root.rglob(glob)
+        candidates.update(matches)
+    scored: list[tuple[float, Path]] = []
+    for path in candidates:
+        if not path.is_file() or _path_matches_any_exclude(path, exclude_globs):
+            continue
+        logical = _cline_pair_stat(path)
+        if logical is not None:
+            scored.append((logical[0], path))
+    scored.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    return [path for _, path in scored[:count]]
+
+
+def _newest_files(
+    roots: list[str], glob: str, count: int, exclude_globs: list[str] | None = None
+) -> list[Path]:
+    """The `count` most recently modified matches, newest first."""
+    candidates: list[Path] = []
+    for r in roots:
+        root = _expand_path(r)
+        if not root.exists():
+            continue
+        candidates.extend(root.glob(glob) if "*" in glob and "/" not in glob else root.rglob(glob))
+    scored: list[tuple[float, Path]] = []
+    for p in candidates:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if not p.is_file():
+            continue
+        if _path_matches_any_exclude(p, exclude_globs) or not _is_session_candidate(p):
+            continue
+        scored.append((st.st_mtime, p))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in scored[:count]]
+
+
+def _jsonl_contains_any_type(path: Path, required_types: set[str], max_lines: int) -> bool:
+    try:
+        lines_seen = 0
+        with _open_session_text(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                lines_seen += 1
+                if lines_seen > max_lines:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                t = obj.get("type")
+                if isinstance(t, str) and t in required_types:
+                    return True
+    except _SESSION_READ_ERRORS:
+        return False
+    return False
+
+
+def _newest_file_with_types(
+    roots: list[str],
+    glob: str,
+    required_types: list[str],
+    max_lines: int,
+    exclude_globs: list[str] | None = None,
+) -> Path | None:
+    candidates: list[Path] = []
+    for r in roots:
+        root = _expand_path(r)
+        if not root.exists():
+            continue
+        candidates.extend(root.glob(glob) if "*" in glob and "/" not in glob else root.rglob(glob))
+    candidates = [
+        c
+        for c in candidates
+        if c.is_file() and not _path_matches_any_exclude(c, exclude_globs) and _is_session_candidate(c)
+    ]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    wanted = {t for t in required_types if isinstance(t, str) and t}
+    for p in candidates:
+        if _jsonl_contains_any_type(p, wanted, max_lines=max_lines):
+            return p
+    return None
+
+
+def _newest_files_with_types(
+    roots: list[str],
+    glob: str,
+    required_types: list[str],
+    count: int,
+    max_lines: int,
+    exclude_globs: list[str] | None = None,
+) -> list[Path]:
+    """The `count` most recent files that actually contain one of `required_types`.
+
+    Sibling sampling MUST apply this filter, not just recency. OpenClaw's glob is
+    `**/*.jsonl` over `~/.openclaw`, which also sweeps up audit logs and an embedded
+    codex-home — sampling those unfiltered reported codex's own event types as OpenClaw
+    schema drift.
+    """
+    wanted = {t for t in required_types if isinstance(t, str) and t}
+    out: list[Path] = []
+    for p in _newest_files(roots, glob, count * 20, exclude_globs=exclude_globs):
+        if _jsonl_contains_any_type(p, wanted, max_lines=max_lines):
+            out.append(p)
+            if len(out) >= count:
+                break
+    return out
+
+
+def _check_required_companion_files(
+    local_file: str, entries_cfg: Any
+) -> list[dict[str, Any]]:
+    """Verify the sibling files an agent's DISCOVERY requires, not just its parser.
+
+    Some agents treat a session as a directory and refuse to list it at all when a
+    sidecar next to the transcript is gone. Grok is the live case:
+    `GrokSessionDiscovery.discoverSessionFiles()` skips any session directory whose
+    `summary.json` is absent, so losing that one file makes every Grok session
+    vanish from the app — a total outage for that source.
+
+    The schema fingerprint cannot catch this. A sidecar that fails to load simply
+    contributes no keys, and `_schema_diff` deliberately ignores `missing_keys` /
+    `missing_types` (a thin sample legitimately lacks baseline types; that is what
+    `coverage_ratio` is for). So the drift report stayed "compatible, no drift"
+    while discovery was already dead. This check is declared in config next to
+    `patterns` because it is the same class of thing: a discovery precondition
+    whose breach must flip the agent's status, not merely be logged.
+
+    Each entry is either a bare relative path (existence is enough) or an object
+    `{path, must_parse, note}`. `must_parse: "json_object"` additionally requires
+    the file to load as a JSON object — for Grok that is the difference between
+    "sessions disappear" (missing) and "every session loses its id, cwd, title and
+    both timestamps" (present but unparseable), and both are app-visible breaks.
+    A path may contain `{stem}` or `{name}` when the companion repeats the sampled
+    filename, such as Cline's `<id>.json` plus `<id>.messages.json`.
+    `cline_messages_v1` additionally checks both v1 contract numbers, matching
+    session ids, and an array-valued `messages` field.
+    """
+    if not isinstance(entries_cfg, list) or not entries_cfg:
+        return []
+
+    base = Path(local_file).parent
+    results: list[dict[str, Any]] = []
+    for entry in entries_cfg:
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        if not isinstance(entry, dict):
+            results.append({"ok": False, "error": "invalid_companion_entry"})
+            continue
+        rel = entry.get("path")
+        if not isinstance(rel, str) or not rel:
+            results.append({"ok": False, "error": "invalid_companion_entry"})
+            continue
+
+        must_parse = entry.get("must_parse")
+        local_path = Path(local_file)
+        rendered_rel = rel.replace("{stem}", local_path.stem).replace("{name}", local_path.name)
+        target = base / rendered_rel
+        record: dict[str, Any] = {"path": rel, "resolved": str(target)}
+        if rendered_rel != rel:
+            record["rendered_path"] = rendered_rel
+        if must_parse is not None:
+            record["must_parse"] = must_parse
+
+        if must_parse is None:
+            exists = target.is_file()
+            record["ok"] = exists
+            if not exists:
+                record["error"] = "missing"
+        elif must_parse == "json_object":
+            _obj, err = _read_json_object(target)
+            record["ok"] = err is None
+            if err:
+                record["error"] = err
+        elif must_parse == "cline_messages_v1":
+            manifest, manifest_error = _read_json_object(local_path)
+            transcript, transcript_error = _read_json_object(target)
+            error = manifest_error or transcript_error
+            if error is None and manifest is not None and transcript is not None:
+                manifest_id = manifest.get("session_id")
+                transcript_id = transcript.get("sessionId") or transcript.get("session_id")
+                if manifest.get("version") != 1 or transcript.get("version") != 1:
+                    error = "unsupported_contract_version"
+                elif not isinstance(manifest_id, str) or not manifest_id:
+                    error = "missing_manifest_session_id"
+                elif transcript_id != manifest_id:
+                    error = "session_id_mismatch"
+                elif not isinstance(transcript.get("messages"), list):
+                    error = "messages_not_array"
+            record["ok"] = error is None
+            if error:
+                record["error"] = error
+        else:
+            # An unrecognized rule must fail loudly. Treating it as "no requirement"
+            # would turn a config typo into exactly the silent pass this check exists
+            # to remove.
+            record["ok"] = False
+            record["error"] = "unsupported_must_parse"
+
+        note = entry.get("note")
+        if isinstance(note, str) and note:
+            record["note"] = note
+        results.append(record)
+    return results
+
+
+def _check_discovery_path_contract(local_file: str | None, contract_cfg: dict[str, Any]) -> dict[str, Any]:
+    patterns_raw = contract_cfg.get("patterns")
+    patterns = [p for p in (patterns_raw if isinstance(patterns_raw, list) else []) if isinstance(p, str) and p]
+    if not patterns:
+        return {"ok": False, "error": "missing_patterns"}
+
+    description = contract_cfg.get("description")
+    candidate = (local_file or "").replace("\\", "/")
+    if not candidate:
+        return {"ok": False, "error": "no_local_file", "patterns": patterns, "description": description}
+
+    matched = next((pat for pat in patterns if re.search(pat, candidate)), None)
+    # Resolved against the ORIGINAL path, not the forward-slashed `candidate`:
+    # `candidate` exists only so the regexes can be written one way, and rewriting
+    # separators before touching the filesystem is how a check starts stat-ing paths
+    # that do not exist.
+    companions = _check_required_companion_files(local_file or "", contract_cfg.get("required_companion_files"))
+    companions_ok = all(bool(c.get("ok")) for c in companions)
+
+    result: dict[str, Any] = {
+        "ok": bool(matched) and companions_ok,
+        "file": candidate,
+        "matched_pattern": matched,
+        "patterns": patterns,
+        "description": description,
+    }
+    if companions:
+        result["required_companion_files"] = companions
+    return result
+
+
+def _tail_lines(path: Path, max_lines: int) -> list[str]:
+    # Read tail-ish by keeping only last max_lines lines (simple but OK for monitoring).
+    lines: list[str] = []
+    with _open_session_text(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            lines.append(line)
+            if len(lines) > max_lines:
+                lines.pop(0)
+    return lines
+
+
+def _jsonl_schema_fingerprint(path: Path, max_lines: int) -> dict[str, Any]:
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors: int = 0
+    total_lines: int = 0
+
+    lines = _tail_lines(path, max_lines)
+
+    for raw in lines:
+        total_lines += 1
+        s = raw.strip()
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if not isinstance(obj, dict):
+            continue
+        t = obj.get("type")
+        event_type = t if isinstance(t, str) and t else "<missing-type>"
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k in obj.keys():
+            ks.add(k)
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_lines": total_lines,
+        "parse_errors": parse_errors,
+    }
+
+
+_NESTED_FINGERPRINT_MAX_DEPTH = 3
+
+# Cap on list elements walked per key. Guards against a pathologically long array
+# while still unioning far more than the one element the first implementation saw.
+_NESTED_LIST_SAMPLE_LIMIT = 50
+
+# A sample counts as evidence unless it is BOTH narrow (exercised under this fraction
+# of baseline types) and tiny (fewer than this many events). Either alone is normal:
+# rare event families keep coverage low on healthy sessions, and a short session can
+# still be a legitimate sample of a narrow format.
+_MIN_SAMPLE_COVERAGE_RATIO = 0.5
+_MIN_SAMPLE_EVENT_COUNT = 25
+
+# Agents whose renderable/usage surface sits under a nested payload wrapper, where a
+# flat fingerprint proves only that the envelope is intact while everything inside it
+# drifts unseen. Codex fingerprints flat as {payload,timestamp,type} and Copilot as
+# {data,id,parentId,timestamp,type} — almost nothing. Claude's envelope is genuinely
+# informative (18 keys), but `.message` hid its content-block types and the entire
+# `usage` struct, so it belongs here too. Qwen has the same `.message.parts` shape as
+# Claude, so it belongs here for the same reason. Pi and OpenClaw keep renderable
+# content and usage under `.message`; Antigravity keeps tool calls under
+# `.tool_calls` on its `PLANNER_RESPONSE` records.
+_NESTED_PAYLOAD_AGENTS = {
+    "antigravity", "codex", "copilot", "claude", "deepseek_harness", "grok",
+    "openclaw", "pi", "qwen",
+}
+
+# These list fields are parser-defined tagged unions below the top-level payload.
+# Their `type` strings are schema discriminators, so keep separate buckets for new
+# block kinds. Other nested `type` values remain collapsed to avoid treating user
+# configuration variants as format drift.
+_NESTED_TYPED_LIST_KEYS: dict[str, set[str]] = {
+    "antigravity": {"tool_calls"},
+    "openclaw": {"content"},
+    "pi": {"content"},
+}
+
+# Keys whose values are open-ended maps rather than fixed structs. Descending into
+# these turns ordinary content into permanent phantom drift — a new model name, tool
+# name, or edited file would each read as a new schema bucket — so the key itself is
+# recorded and the walk stops there.
+_NESTED_OPAQUE_KEYS: dict[str, set[str]] = {
+    # `modelMetrics` is keyed by model id; the rest are whatever a tool happened to send.
+    # `models` (on session.usage_checkpoint.data.promptCacheBreakState, new in 1.0.82) is
+    # keyed by model id too — observed `claude-haiku-4.5`. Same trap as `modelMetrics`
+    # above, and the third of its kind found in the 2026-08-31 sweep after claude's
+    # `artifacts` and `modelUsage`. Listed BEFORE copilot's baseline was rebuilt, so the
+    # ids never entered the fixture.
+    # Copilot 1.0.95 accounting: `toolCounts` is keyed by tool name, `agentMetrics` by
+    # agent name, `variables` by prompt-variable name, and `usageAccountingWatermarks`
+    # by SESSION UUID, which `_redact` would write into the fixture as a key.
+    "copilot": {
+        "modelMetrics", "arguments", "toolArgs", "properties", "metrics", "models",
+        "toolCounts", "agentMetrics", "variables", "usageAccountingWatermarks",
+    },
+    # `changes` is keyed by ABSOLUTE FILE PATH — walking it both invents a new bucket
+    # per edited file (permanent phantom drift) and writes the user's real paths into
+    # report artifacts. `arguments`/`parameters`/`inputSchema`/`_meta` are free-form
+    # tool payloads with the same problem minus the leak.
+    # `changes` is keyed by absolute file path and `statuses` by thread UUID.
+    # `structuredContent` is an MCP `CallToolResult` payload, so its whole substructure
+    # belongs to whichever connector ran: 152 local records carried `emails` +
+    # `next_page_token` (a Gmail connector), `responses`, and `execution_duration_ms`.
+    # PROPHYLACTIC, not currently load-bearing: it sits at
+    # `event_msg.payload:item_completed.item.result.structuredContent`, i.e. depth 4, and
+    # nested_depth is 3 — so the walk already stops above it and listing it changes no
+    # current diff (verified 2026-08-30: no `structuredContent.*` bucket exists in any
+    # report). Kept because 0.151 also added `response_item.payload:function_call_output`
+    # at depth 2, so the same payload appearing one level shallower would silently make
+    # every newly-used connector read as Codex drift. Delete it only after confirming
+    # no reachable path exposes it.
+    "codex": {
+        "changes", "statuses", "arguments", "parameters", "inputSchema", "_meta",
+        "structuredContent", "agents_states",
+        # `world_state.payload.state.tools` (0.160) is keyed by TOOL/MCP SERVER NAME —
+        # 18 buckets like `mcp__codex_apps__gmail` on 2026-10-11. Every connector a user
+        # enables would read as Codex drift.
+        "tools",
+        # `world_state.payload.state.top_level_tools` (0.163) is the same kind of map,
+        # keyed by tool path (`functions.exec`, `mcp__cua_repl.js`).
+        "top_level_tools",
+    },
+    # Claude's envelope is rich enough that flat fingerprinting caught envelope drift,
+    # but `.message` was opaque — hiding content-block types and the whole `usage`
+    # struct (cache_creation, server_tool_use, iterations). Nesting exposes those. The
+    # two exclusions are TOOL-defined, not Claude-format: `input` is a tool's parameter
+    # object (every new tool parameter would read as schema drift) and `toolUseResult`
+    # is a tool's output payload.
+    # `headers` is an HTTP response header map — open-ended, CDN-dependent, and it
+    # carries set-cookie; its KEY NAMES would land in fixtures and reports. `mcpMeta`
+    # is whatever an MCP server chose to return.
+    # `artifacts` (on `artifact-autoreact-ledger` / `artifact-comment-monitor`) is a map
+    # keyed by ARTIFACT UUID. `_redact` blanks values but never dict keys, so emitting it
+    # would write real artifact ids into a committed fixture as if they were schema, and
+    # every artifact anyone creates later would then read as Claude drift. Same class as
+    # `collab_waiting_end.statuses`; caught 2026-08-30 before the first emit.
+    # `cost-state.modelUsage` is keyed by MODEL SLUG (observed: claude-fable-5), so every
+    # model the user ever runs would otherwise land in the fixture as a bucket and read as
+    # drift. Third instance of this same trap in one sweep, after `artifacts` here and
+    # copilot's `promptCacheBreakState.models` — and note the fixture guard test only
+    # matches UUID-shaped keys, so a slug-keyed map like this one slips past it.
+    "claude": {
+        "input", "input_schema", "toolUseResult", "headers", "mcpMeta", "artifacts",
+        "modelUsage", "wireIngestContext", "wireToolInputs", "trackedFileBackups",
+    },
+    # Grok's transcript nests the parts that matter (content blocks, tool_calls,
+    # reasoning summaries, backend_tool_call kinds), so it is worth walking. The one
+    # exclusion is `arguments` — a tool's own parameter object, where every new tool
+    # parameter would otherwise read as Grok schema drift.
+    "grok": {"arguments"},
+    # Tool-call inputs are open-ended user/tool payloads. Their containing blocks
+    # remain fingerprinted, while argument key names and values stay out of reports.
+    "antigravity": {"args"},
+    "openclaw": {"arguments", "input"},
+    "pi": {"arguments"},
+    # Qwen's renderable surface (text, functionCall, functionResponse) sits inside
+    # `message.parts`, so flat fingerprinting would miss part-type drift the same way
+    # it did for Claude. `args` is a tool's own parameter object (functionCall.args);
+    # `response` is a tool's own output payload (functionResponse.response);
+    # `toolCallResult` is the legacy top-level tool-result struct; `usageMetadata` is
+    # the token-usage struct, which the support matrix already marks out of scope
+    # (usage/rate-limit tracking is an explicit unsupported surface for Qwen).
+    # `function_args` is the telemetry echo of a tool's own parameter object
+    # (`systemPayload.uiEvent.function_args`), so it is the same class as `args`: its
+    # keys are whatever tool ran (`file_path`, `glob`, `subagent_type`), and walking it
+    # makes every new tool parameter read as Qwen schema drift forever.
+    "qwen": {"args", "response", "toolCallResult", "usageMetadata", "function_args"},
+}
+
+# Keys whose own key set matters but whose children are free-form. The walk records
+# the child's keys and stops there. OpenClaw `details` is a tool's structured result
+# (toolResult) or an extension payload (custom_message): ToolTextBlockNormalizer reads
+# its exit code and status, so a renamed first-level key must still show as drift,
+# while the `message` tool's nested messageDelivery/sourceReply objects must not.
+_NESTED_SHALLOW_KEYS: dict[str, set[str]] = {
+    "openclaw": {"details"},
+}
+
+
+def _nested_bucket_walk(
+    bucket: str,
+    obj: dict[str, Any],
+    out: dict[str, set[str]],
+    depth: int,
+    max_depth: int,
+    opaque_keys: frozenset[str] = frozenset(),
+    typed_list_keys: frozenset[str] = frozenset(),
+    shallow_keys: frozenset[str] = frozenset(),
+) -> None:
+    """Record `obj`'s keys under `bucket`, then recurse into dict-valued children.
+
+    Child buckets are `<bucket>.<key>`, with `:<type>` appended when the child carries
+    its own string `type` (codex's `event_msg`/`response_item` wrappers put the real
+    event name there). Keeping the key in the name means two different wrappers can
+    never collapse into one bucket. A `shallow_keys` child records its own keys but
+    is never descended into.
+    """
+    ks = out.setdefault(bucket, set())
+    for k in obj.keys():
+        ks.add(k)
+    if depth >= max_depth:
+        return
+    for k, v in obj.items():
+        if k in opaque_keys:
+            continue
+        if k in shallow_keys:
+            if isinstance(v, dict):
+                out.setdefault(f"{bucket}.{k}", set()).update(v.keys())
+            continue
+        # Union EVERY dict in a list, not just the first. Lists here are heterogeneous
+        # — Claude's message.content mixes text/thinking/tool_use blocks — so taking the
+        # first element as representative hid every later block type, which is precisely
+        # the drift this is meant to catch. Only keys are collected, so this stays cheap.
+        children = (
+            [e for e in v[:_NESTED_LIST_SAMPLE_LIMIT] if isinstance(e, dict)]
+            if isinstance(v, list)
+            else ([v] if isinstance(v, dict) else [])
+        )
+        for child in children:
+            sub = f"{bucket}.{k}"
+            # Split by `type` at the payload wrapper (depth 0 -> 1), plus the narrowly
+            # configured parser-defined tagged-union lists. Elsewhere nested `type`
+            # tags enum-like config variants — sandbox_policy:read-only vs
+            # :danger-full-access, permission_profile:managed vs :disabled — and
+            # splitting on those makes an ordinary settings change look like drift.
+            if depth == 0 or (isinstance(v, list) and k in typed_list_keys):
+                child_type = child.get("type")
+                if isinstance(child_type, str) and child_type:
+                    sub = f"{sub}:{child_type}"
+            _nested_bucket_walk(
+                sub, child, out, depth + 1, max_depth, opaque_keys, typed_list_keys, shallow_keys
+            )
+
+
+# Agents whose writer can glue several JSON objects onto one physical line and
+# whose app parser recovers them (QwenJSONL.objects(inPhysicalLine:)). For these,
+# such a line is a tolerated format quirk, not an unreadable record.
+_GLUED_OBJECT_AGENTS = {"qwen"}
+
+_JSON_WHITESPACE = " \t\n\r"
+
+
+def _glued_json_objects(line: str) -> list[dict[str, Any]] | None:
+    """Split a line made only of whitespace-separated JSON objects.
+
+    Mirrors QwenJSONL.objects(inPhysicalLine:) in the app: every piece must be
+    a JSON object and nothing else may appear between or around them, so junk
+    anywhere rejects the whole line (None). One object is not "glued".
+    """
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    index = 0
+    while True:
+        while index < len(line) and line[index] in _JSON_WHITESPACE:
+            index += 1
+        if index == len(line):
+            break
+        if line[index] != "{":
+            return None
+        try:
+            obj, index = decoder.raw_decode(line, index)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        objects.append(obj)
+    return objects if len(objects) > 1 else None
+
+
+def _nested_jsonl_schema_fingerprint(
+    path: Path,
+    max_lines: int,
+    max_depth: int = _NESTED_FINGERPRINT_MAX_DEPTH,
+    opaque_keys: frozenset[str] = frozenset(),
+    typed_list_keys: frozenset[str] = frozenset(),
+    glued_objects: bool = False,
+    shallow_keys: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Like `_jsonl_schema_fingerprint`, but walks into nested payload wrappers.
+
+    A flat fingerprint reported `unknown_keys: {}` for codex while ten new
+    `turn_context.payload` keys had appeared, and — more seriously — it could never
+    see the `token_count`/`rate_limits` usage channel that
+    docs/agent-support/monitoring.md relies on this fingerprint to watch, because
+    those live under `event_msg.payload`.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors: int = 0
+    tolerated_glued_lines: int = 0
+    total_lines: int = 0
+
+    for raw in _tail_lines(path, max_lines):
+        total_lines += 1
+        line = raw.strip()
+        try:
+            objs = [json.loads(line)]
+        except json.JSONDecodeError:
+            glued = _glued_json_objects(line) if glued_objects else None
+            if glued is None:
+                parse_errors += 1
+                continue
+            tolerated_glued_lines += 1
+            objs = glued
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get("type")
+            event_type = t if isinstance(t, str) and t else "<missing-type>"
+            type_counts[event_type] = type_counts.get(event_type, 0) + 1
+            _nested_bucket_walk(
+                event_type, obj, type_keys, 0, max_depth, opaque_keys, typed_list_keys, shallow_keys
+            )
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_lines": total_lines,
+        "parse_errors": parse_errors,
+        "tolerated_glued_lines": tolerated_glued_lines,
+        "nested_depth": max_depth,
+        "nested_opaque_keys": sorted(opaque_keys),
+        "nested_typed_list_keys": sorted(typed_list_keys),
+    }
+
+
+_DSH_MAX_COMPRESSED_BYTES = 128 * 1024 * 1024
+_DSH_MAX_DECODED_BYTES = 128 * 1024 * 1024
+_DSH_MAX_FRAMES = 100_000
+_DSH_MAX_EXPANSION_RATIO = 1_000
+_DSH_MAX_RECORDS = 1_000_000
+_DSH_MAX_SESSIONS_TO_INSPECT = 10_000
+_DSH_MAX_DISCOVERY_ENTRIES = 100_000
+_DSH_MAX_HEADER_SCAN_BYTES = 512 * 1024 * 1024
+_DSH_MAX_HEADER_BYTES = 1024 * 1024
+_DSH_HEADER_READ_CHUNK_BYTES = 4096
+_DSH_SAFE_INTEGER = 9_007_199_254_740_991
+_DSH_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
+_DSH_PACKED_TYPES = {"text-chunks", "reasoning-chunks", "tool-call-chunks"}
+_DSH_SURFACE_V3 = {"system/message", "user/message", "assistant/message", "tool/result"}
+_DSH_SURFACE_V4 = _DSH_SURFACE_V3 | {"developer/message"}
+_DSH_V4_VALIDATION_SOURCE: Path | None = None
+_DSH_V4_VALIDATION_SOURCE_RESOLUTION: tuple[Path | None, str | None] | None = None
+_DSH_V4_VALIDATION_SOURCE_RELATIVE = Path(
+    "node_modules/@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js"
+)
+_DSH_PACKAGE_DISCOVERY_TIMEOUT_SECONDS = 5
+_DSH_MAX_NPM_ROOT_OUTPUT_BYTES = 4096
+_DSH_MAX_V4_VALIDATION_SOURCE_BYTES = 4 * 1024 * 1024
+_DSH_ZSTD_LIBRARY: Any | None = None
+_DSH_ZSTD_LOAD_ATTEMPTED = False
+_DSH_APP_EVENT_CATALOG: dict[int, set[str]] | None = None
+
+# These are exact shapes already accepted by the app or fixed envelope shapes
+# for app-known events that are not represented in the minimal fixture corpus.
+# They only suppress matching unbaselined keys; a new key or nested bucket still
+# appears as drift. Opaque payloads (notably tool results) are not fingerprinted.
+_DSH_SUPPORTED_UNBASELINED_KEYS: dict[str, set[str]] = {
+    "session": {
+        "type", "version", "id", "createdAt", "delegationDepth", "cwd",
+        "parentSession", "seedLength", "origin", "agentPreset", "isSeeded",
+    },
+    "agent/inbox/spliced": {"type", "seq", "time", "data"},
+    "agent/inbox/spliced.data": {"inserted", "outcome", "removedCount", "start", "target"},
+    "agent/inbox/spliced.data.inserted": {"content", "id", "role", "source"},
+    "agent/inbox/spliced.data.inserted.content": {"text", "type"},
+    "agent/inbox/spliced.data.inserted.source": {
+        "clientTimeZone", "form", "kind", "plugin", "rpcId", "senderSessionId", "summary",
+    },
+    "approval/policy": {"type", "seq", "time", "data"},
+    "approval/policy.data": {"policy", "source"},
+    "assistant/message.data": {"usage"},
+    "assistant/message.data.message.content": {"arguments", "id", "name"},
+    "assistant/message.data.message.source": {"replayState"},
+    "assistant/message.data.message.source.replayState": {"blocks", "response"},
+    "assistant/message.data.stream": {
+        "args", "chunk", "dt", "id", "index", "name", "texts", "time", "time0", "type",
+    },
+    "assistant/message.data.stream.chunk": {
+        "block", "blockType", "index", "reason", "replayState", "type", "usage",
+    },
+    "assistant/message.data.stream.chunk.block": {"arguments", "id", "name", "text", "type"},
+    "assistant/message.data.stream.chunk.reason": {"kind"},
+    "assistant/message.data.stream.chunk.replayState": {"blocks", "response"},
+    "assistant/message.data.stream.chunk.usage": {
+        "cacheReadTokens", "cacheWriteTokens", "inputTokens", "outputTokens",
+        "reasoningTokens", "totalTokens",
+    },
+    "assistant/message.data.usage": {
+        "cacheReadTokens", "cacheWriteTokens", "inputTokens", "outputTokens",
+        "reasoningTokens", "totalTokens",
+    },
+    "deliverables/presented": {"type", "seq", "time", "data"},
+    "deliverables/presented.data": {"callId", "files", "turn"},
+    "deliverables/presented.data.files": {"description", "path"},
+    "permission/preset": {"type", "seq", "time", "data"},
+    "permission/preset.data": {"preset"},
+    "request/context": {"type", "seq", "time", "data"},
+    "request/context.data": {"contextWindow", "model", "provider", "systemPromptUpdate"},
+    "sandbox/mode": {"type", "seq", "time", "data"},
+    "sandbox/mode.data": {"mode", "source"},
+    "session-log-deepseek/delivery-accepted": {"type", "seq", "time", "data"},
+    "session-log-deepseek/delivery-accepted.data": {"sessionFormatVersion", "sessionId", "throughSeq"},
+    "session/end-seed": {"type", "seq", "time", "data"},
+    "session/end-seed.data": set(),
+    "session/title": {"type", "seq", "time", "data"},
+    "session/title.data": {"messageSeqs", "source", "title"},
+    "session/title.data.source": {"kind", "model", "provider"},
+    "session/title.data.source.model": {"model", "provider"},
+    "session/title-llm-request": {"type", "seq", "time", "data"},
+    "session/title-llm-request.data": {
+        "maxTokens", "messageSeqs", "messages", "route", "system", "titleProvider",
+    },
+    "session/title-llm-request.data.messages": {"content", "id", "role", "source"},
+    "session/title-llm-request.data.messages.content": {"text", "type"},
+    "session/title-llm-request.data.messages.source": {"kind", "plugin"},
+    "session/title-llm-request.data.route": {"model", "provider"},
+    "subagent/catalog": {"type", "seq", "time", "data"},
+    "subagent/catalog.data": {"childCreatedAt", "childId", "label", "mode", "version"},
+    "subagent/descriptor": {"type", "seq", "time", "data"},
+    "subagent/descriptor.data": {
+        "agentModel", "agentProvider", "agentReasoningEffort", "label", "mode", "provider", "version",
+    },
+    "todo/write": {"type", "seq", "time", "data"},
+    "todo/write.data": {"todos"},
+    "todo/write.data.todos": {"content", "status"},
+    "tool/call": {"type", "seq", "time", "data"},
+    "tool/call.data": {"arguments", "callId", "name", "step", "turn"},
+    "user/message": {"type", "seq", "time", "data", "surfaceOp", "sourceEventSeqs"},
+    "user/message.data": {"content", "id", "role", "source"},
+    "tool/result": {"type", "seq", "time", "data", "sourceEventSeqs", "surfaceOp"},
+    "tool/result.data": {"message", "meta", "step", "turn"},
+    "tool/result.surfaceOp": {"op", "startSeq", "endSeq", "start", "end"},
+    "user/message.data.source": {
+        "baseline", "baselineIdentity", "changes", "clientTimeZone", "entries", "form",
+        "kind", "plugin", "rpcId", "sections", "senderSessionId", "summary",
+    },
+    "user/message.data.source.changes": {"action", "digest", "path", "scope"},
+    "user/message.data.source.entries": {"description", "name"},
+    "user/message.data.source.sections": {"name", "text"},
+    "workspace/changes": {"type", "seq", "time", "data"},
+    "workspace/changes.data": {"turn"},
+}
+
+
+class _DeepSeekHarnessMonitorError(Exception):
+    """A sanitized DSH monitoring error code; never carries session content."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _dsh_package_root_from_executable(executable: Path) -> Path | None:
+    """Find the installed DSH package when the executable resolves into it."""
+    try:
+        resolved = executable.resolve(strict=True)
+    except OSError:
+        return None
+    for candidate in (resolved.parent, *resolved.parents):
+        if candidate.name == "dsh" and candidate.parent.name == "@deepseek-ai":
+            return candidate
+    return None
+
+
+def _dsh_resolve_v4_validation_source() -> tuple[Path | None, str | None]:
+    """Resolve the installed DSH V4 validator across npm installation layouts."""
+    dsh_executable_text = shutil.which("dsh")
+    dsh_executable = Path(dsh_executable_text) if dsh_executable_text else None
+    if dsh_executable is not None:
+        package_root = _dsh_package_root_from_executable(dsh_executable)
+        if package_root is not None:
+            source = package_root / _DSH_V4_VALIDATION_SOURCE_RELATIVE
+            if source.is_file():
+                return source, None
+
+    npm_executable: str | None = None
+    if dsh_executable is not None:
+        sibling_npm = dsh_executable.parent / "npm"
+        if sibling_npm.is_file() and os.access(sibling_npm, os.X_OK):
+            npm_executable = str(sibling_npm)
+    if npm_executable is None:
+        npm_executable = shutil.which("npm")
+    if npm_executable is None:
+        return None, "npm_executable_unavailable"
+
+    rc, stdout, _stderr = _run_cmd(
+        [npm_executable, "root", "--global"],
+        timeout=_DSH_PACKAGE_DISCOVERY_TIMEOUT_SECONDS,
+    )
+    if rc != 0:
+        return None, "npm_root_command_failed"
+    if len(stdout.encode("utf-8")) > _DSH_MAX_NPM_ROOT_OUTPUT_BYTES:
+        return None, "npm_root_output_too_large"
+    roots = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if len(roots) != 1:
+        return None, "npm_root_output_invalid"
+    npm_root = Path(roots[0])
+    if not npm_root.is_absolute():
+        return None, "npm_root_output_invalid"
+    return (
+        npm_root
+        / "@deepseek-ai/dsh"
+        / _DSH_V4_VALIDATION_SOURCE_RELATIVE,
+        None,
+    )
+
+
+def _dsh_v4_validation_source() -> tuple[Path | None, str | None]:
+    if _DSH_V4_VALIDATION_SOURCE is not None:
+        return _DSH_V4_VALIDATION_SOURCE, None
+    global _DSH_V4_VALIDATION_SOURCE_RESOLUTION
+    if _DSH_V4_VALIDATION_SOURCE_RESOLUTION is None:
+        _DSH_V4_VALIDATION_SOURCE_RESOLUTION = (
+            _dsh_resolve_v4_validation_source()
+        )
+    return _DSH_V4_VALIDATION_SOURCE_RESOLUTION
+
+
+def _dsh_v4_validation_source_contract() -> dict[str, Any]:
+    """Prove the local V4 checks still correspond to the installed DSH package.
+
+    The monitor reports only the public package path and marker names. It never
+    copies package source or Session values into an artifact.
+    """
+    source_path, resolution_error = _dsh_v4_validation_source()
+    if source_path is None:
+        return {
+            "ok": False,
+            "path": None,
+            "error": "v4_validation_source_unresolved",
+            "resolution_error": resolution_error,
+        }
+    try:
+        if (
+            source_path.stat().st_size
+            > _DSH_MAX_V4_VALIDATION_SOURCE_BYTES
+        ):
+            return {
+                "ok": False,
+                "path": str(source_path),
+                "error": "v4_validation_source_size_limit",
+            }
+        source = source_path.read_text(encoding="utf-8")
+    except OSError:
+        return {
+            "ok": False,
+            "path": str(source_path),
+            "error": "v4_validation_source_unavailable",
+        }
+    required_markers = (
+        "function assertReleasedV4Header(",
+        "function assertV4RowAdmission(",
+        "function assertReleasedV4Relationships(",
+        "const SURFACE_TYPES = new Set([",
+        'row["type"] === "developer/message"',
+        'row["type"] !== "tool/result"',
+    )
+    missing = [marker for marker in required_markers if marker not in source]
+    return {
+        "ok": not missing,
+        "path": str(source_path),
+        "missing_markers": missing,
+    }
+
+
+class _ZstdInBuffer(ctypes.Structure):
+    _fields_ = [("src", ctypes.c_void_p), ("size", ctypes.c_size_t), ("pos", ctypes.c_size_t)]
+
+
+class _ZstdOutBuffer(ctypes.Structure):
+    _fields_ = [("dst", ctypes.c_void_p), ("size", ctypes.c_size_t), ("pos", ctypes.c_size_t)]
+
+
+def _dsh_zstd_library() -> Any:
+    """Load the system Zstandard streaming API without a Python package dependency."""
+    global _DSH_ZSTD_LIBRARY, _DSH_ZSTD_LOAD_ATTEMPTED
+    if _DSH_ZSTD_LOAD_ATTEMPTED:
+        if _DSH_ZSTD_LIBRARY is None:
+            raise _DeepSeekHarnessMonitorError("zstd_library_unavailable")
+        return _DSH_ZSTD_LIBRARY
+    _DSH_ZSTD_LOAD_ATTEMPTED = True
+    library_name = ctypes.util.find_library("zstd")
+    if not library_name:
+        raise _DeepSeekHarnessMonitorError("zstd_library_unavailable")
+    try:
+        library = ctypes.CDLL(library_name)
+        library.ZSTD_createDStream.argtypes = []
+        library.ZSTD_createDStream.restype = ctypes.c_void_p
+        library.ZSTD_freeDStream.argtypes = [ctypes.c_void_p]
+        library.ZSTD_freeDStream.restype = ctypes.c_size_t
+        library.ZSTD_initDStream.argtypes = [ctypes.c_void_p]
+        library.ZSTD_initDStream.restype = ctypes.c_size_t
+        library.ZSTD_decompressStream.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ZstdOutBuffer),
+            ctypes.POINTER(_ZstdInBuffer),
+        ]
+        library.ZSTD_decompressStream.restype = ctypes.c_size_t
+        library.ZSTD_isError.argtypes = [ctypes.c_size_t]
+        library.ZSTD_isError.restype = ctypes.c_uint
+    except (AttributeError, OSError):
+        raise _DeepSeekHarnessMonitorError("zstd_library_unavailable") from None
+    _DSH_ZSTD_LIBRARY = library
+    return library
+
+
+def _dsh_decode_zstd_frame(
+    raw: bytes, offset: int, source: Any | None = None
+) -> tuple[bytes, int]:
+    if offset < 0 or offset + len(_DSH_FRAME_MAGIC) > len(raw):
+        raise _DeepSeekHarnessMonitorError("incomplete_zstd_frame")
+    if raw[offset : offset + len(_DSH_FRAME_MAGIC)] != _DSH_FRAME_MAGIC:
+        raise _DeepSeekHarnessMonitorError("invalid_zstd_frame_header")
+
+    library = _dsh_zstd_library()
+    if source is None:
+        source = ctypes.create_string_buffer(raw, len(raw))
+    stream = library.ZSTD_createDStream()
+    if not stream:
+        raise _DeepSeekHarnessMonitorError("zstd_decoder_unavailable")
+    try:
+        if library.ZSTD_isError(library.ZSTD_initDStream(stream)):
+            raise _DeepSeekHarnessMonitorError("zstd_decoder_unavailable")
+        input_buffer = _ZstdInBuffer(
+            ctypes.addressof(source) + offset,
+            len(raw) - offset,
+            0,
+        )
+        decoded = bytearray()
+        while True:
+            output_storage = (ctypes.c_ubyte * (64 * 1024))()
+            output_buffer = _ZstdOutBuffer(
+                ctypes.addressof(output_storage),
+                ctypes.sizeof(output_storage),
+                0,
+            )
+            previous_input = input_buffer.pos
+            result = library.ZSTD_decompressStream(
+                stream, ctypes.byref(output_buffer), ctypes.byref(input_buffer)
+            )
+            if library.ZSTD_isError(result):
+                raise _DeepSeekHarnessMonitorError("corrupt_zstd_frame")
+            if output_buffer.pos:
+                decoded.extend(bytes(output_storage[: output_buffer.pos]))
+                if len(decoded) > _DSH_MAX_DECODED_BYTES:
+                    raise _DeepSeekHarnessMonitorError("decoded_size_limit")
+            consumed = int(input_buffer.pos)
+            if consumed and len(decoded) > consumed * _DSH_MAX_EXPANSION_RATIO:
+                raise _DeepSeekHarnessMonitorError("decoded_expansion_limit")
+            if result == 0:
+                if consumed <= 0:
+                    raise _DeepSeekHarnessMonitorError("zstd_decoder_no_progress")
+                return bytes(decoded), consumed
+            if input_buffer.pos >= input_buffer.size:
+                raise _DeepSeekHarnessMonitorError("incomplete_zstd_frame")
+            if input_buffer.pos == previous_input and output_buffer.pos == 0:
+                raise _DeepSeekHarnessMonitorError("zstd_decoder_no_progress")
+    finally:
+        library.ZSTD_freeDStream(stream)
+
+
+def _dsh_zstd_frames(raw: bytes):
+    if not raw:
+        raise _DeepSeekHarnessMonitorError("empty_zstd_artifact")
+    if len(raw) > _DSH_MAX_COMPRESSED_BYTES:
+        raise _DeepSeekHarnessMonitorError("compressed_size_limit")
+    offset = 0
+    frame_count = 0
+    decoded_total = 0
+    source = ctypes.create_string_buffer(raw, len(raw))
+    while offset < len(raw):
+        if frame_count >= _DSH_MAX_FRAMES:
+            raise _DeepSeekHarnessMonitorError("zstd_frame_count_limit")
+        decoded, consumed = _dsh_decode_zstd_frame(raw, offset, source)
+        decoded_total += len(decoded)
+        if decoded_total > _DSH_MAX_DECODED_BYTES:
+            raise _DeepSeekHarnessMonitorError("decoded_size_limit")
+        yield decoded
+        offset += consumed
+        frame_count += 1
+
+
+def _dsh_read_stable_bytes(path: Path) -> tuple[bytes, os.stat_result]:
+    for attempt in range(2):
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+            before = os.fstat(descriptor)
+            if before.st_size < 0 or before.st_size > _DSH_MAX_COMPRESSED_BYTES:
+                raise _DeepSeekHarnessMonitorError("compressed_size_limit")
+            raw = bytearray()
+            while True:
+                remaining = _DSH_MAX_COMPRESSED_BYTES + 1 - len(raw)
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > _DSH_MAX_COMPRESSED_BYTES:
+                    raise _DeepSeekHarnessMonitorError("compressed_size_limit")
+            after_descriptor = os.fstat(descriptor)
+            after_path = path.stat()
+        except _DeepSeekHarnessMonitorError:
+            raise
+        except OSError:
+            raise _DeepSeekHarnessMonitorError("unreadable_artifact") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        stable = (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            == (
+                after_descriptor.st_dev,
+                after_descriptor.st_ino,
+                after_descriptor.st_size,
+                after_descriptor.st_mtime_ns,
+                after_descriptor.st_ctime_ns,
+            )
+            == (
+                after_path.st_dev,
+                after_path.st_ino,
+                after_path.st_size,
+                after_path.st_mtime_ns,
+                after_path.st_ctime_ns,
+            )
+            and len(raw) == after_descriptor.st_size
+        )
+        if stable:
+            return bytes(raw), after_path
+        if attempt == 1:
+            raise _DeepSeekHarnessMonitorError("artifact_changed_during_read")
+    raise _DeepSeekHarnessMonitorError("artifact_changed_during_read")
+
+
+def _dsh_read_plain_header_line(descriptor: int) -> tuple[bytes, int]:
+    line = bytearray()
+    bytes_read = 0
+    while bytes_read <= _DSH_MAX_HEADER_BYTES:
+        amount = min(
+            _DSH_HEADER_READ_CHUNK_BYTES,
+            _DSH_MAX_HEADER_BYTES + 1 - bytes_read,
+        )
+        chunk = os.read(descriptor, amount)
+        if not chunk:
+            if not line:
+                raise _DeepSeekHarnessMonitorError("missing_session_header")
+            raise _DeepSeekHarnessMonitorError("torn_jsonl_record")
+        bytes_read += len(chunk)
+        newline = chunk.find(b"\n")
+        if newline >= 0:
+            line_length = len(line) + newline + 1
+            if line_length > _DSH_MAX_HEADER_BYTES:
+                raise _DeepSeekHarnessMonitorError("header_size_limit")
+            line.extend(chunk[: newline + 1])
+            return bytes(line), bytes_read
+        line.extend(chunk)
+        if len(line) > _DSH_MAX_HEADER_BYTES:
+            raise _DeepSeekHarnessMonitorError("header_size_limit")
+    raise _DeepSeekHarnessMonitorError("header_size_limit")
+
+
+def _dsh_read_first_zstd_frame(descriptor: int) -> tuple[bytes, int]:
+    library = _dsh_zstd_library()
+    stream = library.ZSTD_createDStream()
+    if not stream:
+        raise _DeepSeekHarnessMonitorError("zstd_decoder_unavailable")
+    decoded = bytearray()
+    bytes_read = 0
+    try:
+        if library.ZSTD_isError(library.ZSTD_initDStream(stream)):
+            raise _DeepSeekHarnessMonitorError("zstd_decoder_unavailable")
+        while bytes_read <= _DSH_MAX_HEADER_BYTES:
+            amount = min(
+                _DSH_HEADER_READ_CHUNK_BYTES,
+                _DSH_MAX_HEADER_BYTES + 1 - bytes_read,
+            )
+            chunk = os.read(descriptor, amount)
+            if not chunk:
+                if bytes_read == 0:
+                    raise _DeepSeekHarnessMonitorError("missing_session_header")
+                raise _DeepSeekHarnessMonitorError("incomplete_zstd_frame")
+            bytes_read += len(chunk)
+            source = ctypes.create_string_buffer(chunk, len(chunk))
+            input_buffer = _ZstdInBuffer(ctypes.addressof(source), len(chunk), 0)
+            while input_buffer.pos < input_buffer.size:
+                output_storage = (ctypes.c_ubyte * (64 * 1024))()
+                output_buffer = _ZstdOutBuffer(
+                    ctypes.addressof(output_storage),
+                    ctypes.sizeof(output_storage),
+                    0,
+                )
+                previous_input = input_buffer.pos
+                result = library.ZSTD_decompressStream(
+                    stream, ctypes.byref(output_buffer), ctypes.byref(input_buffer)
+                )
+                if library.ZSTD_isError(result):
+                    raise _DeepSeekHarnessMonitorError("corrupt_zstd_frame")
+                if output_buffer.pos:
+                    decoded.extend(bytes(output_storage[: output_buffer.pos]))
+                    if len(decoded) > _DSH_MAX_HEADER_BYTES:
+                        raise _DeepSeekHarnessMonitorError("header_size_limit")
+                    consumed = int(input_buffer.pos)
+                    if consumed and len(decoded) > consumed * _DSH_MAX_EXPANSION_RATIO:
+                        raise _DeepSeekHarnessMonitorError("decoded_expansion_limit")
+                if result == 0:
+                    return bytes(decoded), bytes_read
+                if input_buffer.pos == previous_input and output_buffer.pos == 0:
+                    raise _DeepSeekHarnessMonitorError("zstd_decoder_no_progress")
+        raise _DeepSeekHarnessMonitorError("header_scan_size_limit")
+    finally:
+        library.ZSTD_freeDStream(stream)
+
+
+def _dsh_read_stable_header(
+    path: Path, *, compressed: bool
+) -> tuple[bytes, os.stat_result, int]:
+    for attempt in range(2):
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise _DeepSeekHarnessMonitorError("unreadable_artifact")
+            raw, bytes_read = (
+                _dsh_read_first_zstd_frame(descriptor)
+                if compressed
+                else _dsh_read_plain_header_line(descriptor)
+            )
+            after_descriptor = os.fstat(descriptor)
+            after_path = path.stat()
+        except _DeepSeekHarnessMonitorError:
+            raise
+        except OSError:
+            raise _DeepSeekHarnessMonitorError("unreadable_artifact") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        stable = (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            == (
+                after_descriptor.st_dev,
+                after_descriptor.st_ino,
+                after_descriptor.st_size,
+                after_descriptor.st_mtime_ns,
+                after_descriptor.st_ctime_ns,
+            )
+            == (
+                after_path.st_dev,
+                after_path.st_ino,
+                after_path.st_size,
+                after_path.st_mtime_ns,
+                after_path.st_ctime_ns,
+            )
+        )
+        if stable:
+            return raw, after_path, bytes_read
+        if attempt == 1:
+            raise _DeepSeekHarnessMonitorError("artifact_changed_during_read")
+    raise _DeepSeekHarnessMonitorError("artifact_changed_during_read")
+
+
+def _dsh_nonnegative_integer(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= _DSH_SAFE_INTEGER
+    return isinstance(value, float) and math.isfinite(value) and value.is_integer() and 0 <= value <= _DSH_SAFE_INTEGER
+
+
+def _dsh_safe_integer(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return -_DSH_SAFE_INTEGER <= value <= _DSH_SAFE_INTEGER
+    return isinstance(value, float) and math.isfinite(value) and value.is_integer() and -_DSH_SAFE_INTEGER <= value <= _DSH_SAFE_INTEGER
+
+
+def _dsh_validate_header(obj: dict[str, Any], filename_generation: int | None = None) -> dict[str, Any]:
+    version = obj.get("version")
+    if not _dsh_nonnegative_integer(version) or version > 4 or obj.get("type") != "session":
+        raise _DeepSeekHarnessMonitorError("invalid_or_unsupported_header")
+    if filename_generation is not None and filename_generation != version:
+        raise _DeepSeekHarnessMonitorError("generation_header_mismatch")
+    if version <= 1:
+        required = {"type", "version", "id", "createdAt", "delegationDepth"}
+        optional = {"cwd", "parentSession", "seedLength", "origin", "agentPreset"}
+    else:
+        required = {"type", "version", "id", "createdAt", "isSeeded", "delegationDepth"}
+        optional = {"cwd", "parentSession", "origin", "agentPreset"}
+    if not required.issubset(obj) or not set(obj).issubset(required | optional):
+        raise _DeepSeekHarnessMonitorError("invalid_header_fields")
+    if (
+        not isinstance(obj.get("id"), str)
+        or not obj["id"]
+        or not _dsh_nonnegative_integer(obj.get("createdAt"))
+        or not _dsh_nonnegative_integer(obj.get("delegationDepth"))
+    ):
+        raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    if version <= 1:
+        if "seedLength" in obj and not _dsh_nonnegative_integer(obj["seedLength"]):
+            raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    elif not isinstance(obj.get("isSeeded"), bool):
+        raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    if "cwd" in obj and (not isinstance(obj["cwd"], str) or not obj["cwd"].startswith("/")):
+        raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    if "parentSession" in obj and not isinstance(obj["parentSession"], str):
+        raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    if "agentPreset" in obj and not isinstance(obj["agentPreset"], str):
+        raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    if "origin" in obj and obj["origin"] != "subagent":
+        raise _DeepSeekHarnessMonitorError("invalid_header_values")
+    return obj
+
+
+def _dsh_validate_surface_op(value: Any) -> bool:
+    if value == "append":
+        return True
+    if not isinstance(value, dict) or value.get("op") != "replace":
+        return False
+    if set(value) == {"op", "startSeq", "endSeq"}:
+        return _dsh_nonnegative_integer(value.get("startSeq")) and _dsh_nonnegative_integer(value.get("endSeq"))
+    if set(value) == {"op", "start", "end"}:
+        return _dsh_nonnegative_integer(value.get("start")) and _dsh_nonnegative_integer(value.get("end"))
+    return False
+
+
+def _dsh_validate_source_sequences(value: Any, seq: int) -> bool:
+    if not isinstance(value, list):
+        return False
+    flattened_count = 0
+    previous = -1
+    strictly_increasing = True
+    has_range = False
+    for item in value:
+        if isinstance(item, list):
+            if len(item) != 2 or not all(_dsh_nonnegative_integer(part) for part in item):
+                return False
+            start, end = item
+            if end < start or end >= seq or end - start + 1 > seq - flattened_count:
+                return False
+            if flattened_count and start <= previous:
+                strictly_increasing = False
+            previous = end
+            flattened_count += end - start + 1
+            has_range = True
+        else:
+            if not _dsh_nonnegative_integer(item) or flattened_count >= seq or item >= seq:
+                return False
+            if flattened_count and item <= previous:
+                strictly_increasing = False
+            previous = item
+            flattened_count += 1
+    return not has_range or strictly_increasing
+
+
+def _dsh_decode_v3_source_sequences(value: Any, seq: int) -> list[int] | None:
+    if not isinstance(value, list):
+        return None
+    flattened: list[int] = []
+    has_range = False
+    for item in value:
+        if isinstance(item, list):
+            if len(item) != 2 or not all(_dsh_nonnegative_integer(part) for part in item):
+                return None
+            start, end = item
+            if end < start or end - start + 1 > seq - len(flattened):
+                return None
+            flattened.extend(range(start, end + 1))
+            has_range = True
+            continue
+        if not _dsh_nonnegative_integer(item) or len(flattened) >= seq:
+            return None
+        flattened.append(item)
+    if has_range and any(
+        flattened[index] <= flattened[index - 1]
+        for index in range(1, len(flattened))
+    ):
+        return None
+    return flattened
+
+
+def _dsh_validate_v3_surface_operation(value: Any, seq: int) -> bool:
+    if value == "append":
+        return True
+    if not isinstance(value, dict) or set(value) != {"op", "startSeq", "endSeq"}:
+        return False
+    if value.get("op") != "replace":
+        return False
+    return (
+        _dsh_nonnegative_integer(value.get("startSeq"))
+        and _dsh_nonnegative_integer(value.get("endSeq"))
+        and value["startSeq"] < seq
+        and value["endSeq"] < seq
+    )
+
+
+def _dsh_validate_v3_surface_message(
+    value: Any, expected_role: str
+) -> bool:
+    if not isinstance(value, dict) or not {
+        "id", "role", "content", "source"
+    }.issubset(value):
+        return False
+    if (
+        not isinstance(value.get("id"), str)
+        or not value["id"]
+        # The app's released `messageValue(expected: "tool")` path constrains
+        # the envelope role to "user"; tool identity lives in source.kind and
+        # the matching tool-result block's toolCallId.
+        or value.get("role") != ("user" if expected_role == "tool" else expected_role)
+        or not isinstance(value.get("content"), list)
+        or not all(
+            isinstance(block, dict)
+            and isinstance(block.get("type"), str)
+            and bool(block["type"])
+            for block in value["content"]
+        )
+    ):
+        return False
+    source = value.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("kind"), str) or not source["kind"]:
+        return False
+    if expected_role == "assistant":
+        return (
+            source.get("kind") == "model"
+            and isinstance(source.get("provider"), str)
+            and bool(source["provider"])
+            and isinstance(source.get("model"), str)
+            and bool(source["model"])
+        )
+    if expected_role == "system":
+        return source.get("kind") == "plugin" and isinstance(source.get("plugin"), str) and bool(source["plugin"])
+    if expected_role == "tool":
+        if source.get("kind") != "tool" or not isinstance(source.get("callId"), str):
+            return False
+        content = value["content"]
+        return (
+            len(content) == 1
+            and content[0].get("type") == "tool-result"
+            and content[0].get("toolCallId") == source.get("callId")
+        )
+    return True
+
+
+def _dsh_validate_v3_content_blocks(value: Any) -> bool:
+    pending = [value]
+    while pending:
+        blocks = pending.pop()
+        if not isinstance(blocks, list):
+            return False
+        for block in blocks:
+            if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+                return False
+            block_type = block["type"]
+            if block_type in {"text", "reasoning"}:
+                if set(block) != {"type", "text"} or not isinstance(block.get("text"), str):
+                    return False
+            elif block_type == "image":
+                if set(block) != {"type", "attachment"}:
+                    return False
+                attachment = block.get("attachment")
+                if not isinstance(attachment, dict):
+                    return False
+                required = {"attachmentId", "mediaType", "bytes", "width", "height"}
+                optional = {"name", "originalDimensions"}
+                if not required.issubset(attachment) or not set(attachment).issubset(required | optional):
+                    return False
+                if (
+                    not isinstance(attachment.get("attachmentId"), str)
+                    or not attachment["attachmentId"]
+                    or attachment.get("mediaType") not in {
+                        "image/png", "image/jpeg", "image/webp", "image/gif"
+                    }
+                    or not _dsh_nonnegative_integer(attachment.get("bytes"))
+                    or not _dsh_nonnegative_integer(attachment.get("width"))
+                    or attachment["width"] <= 0
+                    or not _dsh_nonnegative_integer(attachment.get("height"))
+                    or attachment["height"] <= 0
+                    or ("name" in attachment and not isinstance(attachment["name"], str))
+                ):
+                    return False
+                if "originalDimensions" in attachment:
+                    dimensions = attachment["originalDimensions"]
+                    if (
+                        not isinstance(dimensions, dict)
+                        or set(dimensions) != {"width", "height"}
+                        or not _dsh_nonnegative_integer(dimensions.get("width"))
+                        or dimensions["width"] <= 0
+                        or not _dsh_nonnegative_integer(dimensions.get("height"))
+                        or dimensions["height"] <= 0
+                    ):
+                        return False
+            elif block_type == "tool-call":
+                if (
+                    set(block) != {"type", "id", "name", "arguments"}
+                    or not isinstance(block.get("id"), str)
+                    or not block["id"]
+                    or not isinstance(block.get("name"), str)
+                    or not block["name"]
+                    or not isinstance(block.get("arguments"), str)
+                ):
+                    return False
+            elif block_type == "tool-result":
+                required = {"type", "toolCallId", "content"}
+                optional = {"isError"}
+                if not required.issubset(block) or not set(block).issubset(required | optional):
+                    return False
+                if not isinstance(block.get("toolCallId"), str) or not block["toolCallId"]:
+                    return False
+                if "isError" in block and not isinstance(block["isError"], bool):
+                    return False
+                pending.append(block["content"])
+            # Unknown non-empty block types are intentionally admitted by the
+            # app validator so future content can pass through losslessly.
+    return True
+
+
+def _dsh_validate_v3_plugin_source(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("kind") != "plugin":
+        return False
+    plugin = value.get("plugin")
+    if not isinstance(plugin, str) or not plugin:
+        return False
+    allowed = {"kind", "plugin", "form", "sections", "summary"}
+    if plugin == "compact":
+        allowed.update({"compactionId", "sourceCommandId"})
+        if not isinstance(value.get("compactionId"), str) or not value["compactionId"]:
+            return False
+        if "sourceCommandId" in value and (
+            not isinstance(value["sourceCommandId"], str) or not value["sourceCommandId"]
+        ):
+            return False
+    if not set(value).issubset(allowed):
+        return False
+    form = value.get("form")
+    if "form" in value and form not in {
+        "instructions", "catalog", "snapshot", "notice", "relay", "recall"
+    }:
+        return False
+    if form == "snapshot":
+        sections = value.get("sections")
+        if not isinstance(sections, list):
+            return False
+        for section in sections:
+            if (
+                not isinstance(section, dict)
+                or set(section) != {"name", "text"}
+                or not isinstance(section.get("name"), str)
+                or not section["name"]
+                or not isinstance(section.get("text"), str)
+            ):
+                return False
+    elif "sections" in value:
+        return False
+    if form == "notice":
+        if not isinstance(value.get("summary"), str):
+            return False
+    elif "summary" in value:
+        return False
+    return True
+
+
+def _dsh_validate_v3_system_payload(data: dict[str, Any]) -> bool:
+    if (
+        set(data) != {"turn", "step", "message"}
+        or not _dsh_nonnegative_integer(data.get("turn"))
+        or data["turn"] <= 0
+        or not _dsh_nonnegative_integer(data.get("step"))
+        or data["step"] <= 0
+    ):
+        return False
+    message = data.get("message")
+    if (
+        not isinstance(message, dict)
+        or set(message) != {"id", "role", "source", "content"}
+        or not isinstance(message.get("id"), str)
+        or not message["id"]
+        or message.get("role") != "system"
+        or not _dsh_validate_v3_plugin_source(message.get("source"))
+    ):
+        return False
+    return _dsh_validate_v3_content_blocks(message.get("content"))
+
+
+def _dsh_validate_v3_surface_payload(
+    event_type: str, data: dict[str, Any]
+) -> bool:
+    if event_type == "user/message":
+        return _dsh_validate_v3_surface_message(data, "user")
+    if event_type == "system/message":
+        return _dsh_validate_v3_system_payload(data)
+    if event_type == "assistant/message":
+        return (
+            {"turn", "step", "message", "stream"}.issubset(data)
+            and _dsh_nonnegative_integer(data.get("turn"))
+            and _dsh_nonnegative_integer(data.get("step"))
+            and isinstance(data.get("stream"), list)
+            and _dsh_validate_v3_surface_message(data.get("message"), "assistant")
+            and ("interrupted" not in data or data["interrupted"] is True)
+        )
+    if event_type == "tool/result":
+        return (
+            {"turn", "step", "message"}.issubset(data)
+            and _dsh_nonnegative_integer(data.get("turn"))
+            and _dsh_nonnegative_integer(data.get("step"))
+            and _dsh_validate_v3_surface_message(data.get("message"), "tool")
+            and (
+                "error" not in data
+                or (
+                    isinstance(data["message"].get("content"), list)
+                    and len(data["message"]["content"]) == 1
+                    and isinstance(data["message"]["content"][0], dict)
+                    and data["message"]["content"][0].get("type") == "tool-result"
+                    and data["message"]["content"][0].get("isError") is True
+                )
+            )
+        )
+    return False
+
+
+def _dsh_validate_v4_message(value: Any, expected_role: str) -> bool:
+    """Port the native V4 message/source and retired-wrapper admission floor."""
+    if not isinstance(value, dict) or not {
+        "id", "role", "content", "source"
+    }.issubset(value):
+        return False
+    if (
+        not isinstance(value.get("id"), str)
+        or not value["id"]
+        or value.get("role") != expected_role
+        or not isinstance(value.get("content"), list)
+    ):
+        return False
+    source = value.get("source")
+    if (
+        not isinstance(source, dict)
+        or not isinstance(source.get("kind"), str)
+        or not source["kind"]
+        or source["kind"] == "plugin"
+    ):
+        return False
+    for block in value["content"]:
+        if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+            return False
+        if block["type"] == "tool-result":
+            return False
+    if expected_role != "tool":
+        return True
+    tool_call_id = value.get("toolCallId")
+    return (
+        isinstance(tool_call_id, str)
+        and bool(tool_call_id)
+        and source.get("kind") == "tool"
+        and source.get("callId") == tool_call_id
+        and ("isError" not in value or isinstance(value["isError"], bool))
+    )
+
+
+def _dsh_validate_v4_surface_payload(
+    event_type: str, data: dict[str, Any], event_seq: int
+) -> bool:
+    if event_type == "user/message":
+        return _dsh_validate_v4_message(data, "user")
+    expected_roles = {
+        "system/message": "system",
+        "developer/message": "developer",
+        "assistant/message": "assistant",
+        "tool/result": "tool",
+    }
+    expected_role = expected_roles.get(event_type)
+    if expected_role is None or not {
+        "turn", "step", "message"
+    }.issubset(data):
+        return False
+    if (
+        not _dsh_nonnegative_integer(data.get("turn"))
+        or not _dsh_nonnegative_integer(data.get("step"))
+        or not _dsh_validate_v4_message(data.get("message"), expected_role)
+    ):
+        return False
+    if event_type == "developer/message" and "headerSeq" in data:
+        header_seq = data["headerSeq"]
+        if not _dsh_nonnegative_integer(header_seq) or header_seq >= event_seq:
+            return False
+    if event_type == "assistant/message":
+        return isinstance(data.get("stream"), list) and (
+            "interrupted" not in data or data["interrupted"] is True
+        )
+    if event_type == "tool/result" and "error" in data:
+        return data["message"].get("isError") is True
+    return True
+
+
+def _dsh_exact_keys(
+    value: Any, required: set[str], optional: set[str] | frozenset[str] = frozenset()
+) -> bool:
+    return (
+        isinstance(value, dict)
+        and required.issubset(value)
+        and set(value).issubset(required | optional)
+    )
+
+
+def _dsh_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _dsh_validate_legacy_payload(
+    event_type: str, data: dict[str, Any], generation: int
+) -> bool | None:
+    """Validate only legacy families fully mirrored from the app.
+
+    `None` preserves app-supported families outside this bounded subset; their
+    keys and nested types still participate in the schema fingerprint.
+    """
+    if event_type == "agent-preset/selected":
+        return _dsh_exact_keys(data, {"agentPreset"}) and isinstance(
+            data.get("agentPreset"), str
+        )
+    if event_type == "approval/policy":
+        return (
+            _dsh_exact_keys(data, {"policy"}, {"source"})
+            and data.get("policy") in {"ask", "never"}
+            and ("source" not in data or data["source"] == "delegation")
+        )
+    if event_type == "model/selection":
+        return (
+            _dsh_exact_keys(data, {"provider", "model"}, {"reasoningEffort"})
+            and _dsh_nonempty_string(data.get("provider"))
+            and _dsh_nonempty_string(data.get("model"))
+            and (
+                "reasoningEffort" not in data
+                or _dsh_nonempty_string(data["reasoningEffort"])
+            )
+        )
+    if event_type == "permission/preset":
+        return _dsh_exact_keys(data, {"preset"}) and _dsh_nonempty_string(
+            data.get("preset")
+        )
+    if event_type == "plan/mode":
+        return _dsh_exact_keys(data, {"active"}) and isinstance(
+            data.get("active"), bool
+        )
+    if event_type == "sandbox/mode":
+        return (
+            _dsh_exact_keys(data, {"mode"}, {"source"})
+            and data.get("mode")
+            in {"read-only", "workspace-write", "danger-full-access"}
+            and ("source" not in data or data["source"] == "delegation")
+        )
+    if event_type == "turn/start":
+        return _dsh_exact_keys(data, {"turn"}) and _dsh_nonnegative_integer(
+            data.get("turn")
+        )
+    if event_type in {"step/start", "step/end"}:
+        return (
+            _dsh_exact_keys(data, {"turn", "step"})
+            and _dsh_nonnegative_integer(data.get("turn"))
+            and _dsh_nonnegative_integer(data.get("step"))
+        )
+    if event_type == "request/context":
+        return (
+            _dsh_exact_keys(data, {"provider", "model"}, {"contextWindow"})
+            and _dsh_nonempty_string(data.get("provider"))
+            and _dsh_nonempty_string(data.get("model"))
+            and (
+                "contextWindow" not in data
+                or (
+                    _dsh_nonnegative_integer(data["contextWindow"])
+                    and data["contextWindow"] > 0
+                )
+            )
+        )
+    return None
+
+
+def _dsh_validate_row(obj: dict[str, Any], generation: int, expected_seq: int) -> int:
+    event_type = obj.get("type")
+    if isinstance(event_type, str) and event_type in _DSH_PACKED_TYPES:
+        if generation > 1 or set(obj) != {"type", "seq0", "time0", "data"}:
+            raise _DeepSeekHarnessMonitorError("invalid_packed_event")
+        data = obj.get("data")
+        is_tool = event_type == "tool-call-chunks"
+        required = {"turn", "step", "index", "dt", "id" if is_tool else "texts"}
+        if is_tool:
+            required.add("args")
+        optional = {"name"} if is_tool else set()
+        values = data.get("args" if is_tool else "texts") if isinstance(data, dict) else None
+        gaps = data.get("dt") if isinstance(data, dict) else None
+        if (
+            not isinstance(data, dict)
+            or set(data) not in (required, required | optional)
+            or not all(_dsh_nonnegative_integer(data.get(key)) for key in ("turn", "step", "index"))
+            or not isinstance(values, list)
+            or not values
+            or not all(isinstance(value, str) for value in values)
+            or not isinstance(gaps, list)
+            or len(gaps) != len(values) - 1
+            or not all(_dsh_safe_integer(value) for value in gaps)
+            or not _dsh_nonnegative_integer(obj.get("seq0"))
+            or not _dsh_safe_integer(obj.get("time0"))
+            or (is_tool and (not isinstance(data.get("id"), str) or not data.get("id")))
+            or (is_tool and "name" in data and not isinstance(data["name"], str))
+        ):
+            raise _DeepSeekHarnessMonitorError("invalid_packed_event")
+        first_seq = obj["seq0"]
+        if first_seq != expected_seq:
+            raise _DeepSeekHarnessMonitorError("sequence_gap")
+        if first_seq + len(values) - 1 > _DSH_SAFE_INTEGER:
+            raise _DeepSeekHarnessMonitorError("sequence_range_limit")
+        if first_seq + len(values) > _DSH_MAX_RECORDS:
+            raise _DeepSeekHarnessMonitorError("record_count_limit")
+        return len(values)
+
+    allowed = {"type", "seq", "time", "data", "ignorable", "sourceEventSeqs", "surfaceOp"}
+    if (
+        not isinstance(event_type, str)
+        or not event_type
+        or not set(obj).issubset(allowed)
+        or not _dsh_nonnegative_integer(obj.get("seq"))
+        or not _dsh_safe_integer(obj.get("time"))
+        or not isinstance(obj.get("data"), dict)
+    ):
+        raise _DeepSeekHarnessMonitorError("invalid_event_envelope")
+    if obj["seq"] != expected_seq:
+        raise _DeepSeekHarnessMonitorError("sequence_gap")
+    if expected_seq >= _DSH_MAX_RECORDS:
+        raise _DeepSeekHarnessMonitorError("record_count_limit")
+    if "ignorable" in obj and obj["ignorable"] is not True:
+        raise _DeepSeekHarnessMonitorError("invalid_event_envelope")
+    if generation in (3, 4):
+        decoded_sources = None
+        if "sourceEventSeqs" in obj:
+            decoded_sources = _dsh_decode_v3_source_sequences(
+                obj["sourceEventSeqs"], expected_seq
+            )
+            if decoded_sources is None:
+                raise _DeepSeekHarnessMonitorError("invalid_event_reference")
+        if "surfaceOp" in obj and not _dsh_validate_surface_op(obj["surfaceOp"]):
+            raise _DeepSeekHarnessMonitorError("invalid_event_envelope")
+        known_types = _dsh_app_event_catalog().get(generation, set())
+        known = event_type in known_types
+        surface_types = _DSH_SURFACE_V3 if generation == 3 else _DSH_SURFACE_V4
+        surface = event_type in surface_types
+        if generation == 4 and event_type in {
+            "tool/code-dispatch-start", "tool/code-dispatch"
+        } and obj.get("ignorable") is not True:
+            raise _DeepSeekHarnessMonitorError("retired_v4_event_type")
+        if known and not surface and (
+            "surfaceOp" in obj or "sourceEventSeqs" in obj
+        ):
+            raise _DeepSeekHarnessMonitorError("invalid_event_envelope")
+        if known and surface:
+            if "surfaceOp" not in obj or not _dsh_validate_v3_surface_operation(
+                obj["surfaceOp"], expected_seq
+            ):
+                raise _DeepSeekHarnessMonitorError("invalid_event_envelope")
+            if event_type == "assistant/message" and "sourceEventSeqs" in obj:
+                raise _DeepSeekHarnessMonitorError("invalid_event_reference")
+            if "sourceEventSeqs" in obj and (
+                not decoded_sources
+                or len(decoded_sources) != len(set(decoded_sources))
+                or any(source >= expected_seq for source in decoded_sources)
+            ):
+                raise _DeepSeekHarnessMonitorError("invalid_event_reference")
+            payload_valid = (
+                _dsh_validate_v3_surface_payload(event_type, obj["data"])
+                if generation == 3
+                else _dsh_validate_v4_surface_payload(
+                    event_type, obj["data"], expected_seq
+                )
+            )
+            if not payload_valid:
+                raise _DeepSeekHarnessMonitorError("invalid_surface_payload")
+    else:
+        if "sourceEventSeqs" in obj and not _dsh_validate_source_sequences(
+            obj["sourceEventSeqs"], expected_seq
+        ):
+            raise _DeepSeekHarnessMonitorError("invalid_event_reference")
+        if "surfaceOp" in obj and not _dsh_validate_surface_op(obj["surfaceOp"]):
+            raise _DeepSeekHarnessMonitorError("invalid_event_envelope")
+        payload_valid = _dsh_validate_legacy_payload(event_type, obj["data"], generation)
+        if payload_valid is False:
+            raise _DeepSeekHarnessMonitorError("invalid_legacy_payload")
+    return 1
+
+
+def _dsh_record_lines(frame: bytes):
+    if not frame:
+        return
+    stream = io.BytesIO(frame)
+    while True:
+        line = stream.readline()
+        if not line:
+            return
+        if not line.endswith(b"\n"):
+            raise _DeepSeekHarnessMonitorError("torn_jsonl_record")
+        payload = line[:-1]
+        if not payload:
+            raise _DeepSeekHarnessMonitorError("empty_jsonl_record")
+        try:
+            obj = json.loads(payload)
+        except (UnicodeDecodeError, ValueError):
+            raise _DeepSeekHarnessMonitorError("invalid_json_record") from None
+        if not isinstance(obj, dict):
+            raise _DeepSeekHarnessMonitorError("record_not_object")
+        yield obj
+
+
+def _dsh_parse_artifact(path: Path, max_lines: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw, metadata = _dsh_read_stable_bytes(path)
+    compressed = path.name.endswith(".jsonl.zstd")
+    filename_generation, _ = _dsh_parse_generation_filename(path.name)
+    if compressed:
+        frame_iterator = _dsh_zstd_frames(raw)
+        try:
+            first_frame = next(frame_iterator)
+        except StopIteration:
+            raise _DeepSeekHarnessMonitorError("missing_session_header") from None
+        header_rows = list(_dsh_record_lines(first_frame))
+        if len(header_rows) != 1:
+            raise _DeepSeekHarnessMonitorError("first_frame_header_violation")
+        event_frames = frame_iterator
+    else:
+        frame_iterator = iter((raw,))
+        try:
+            first_frame = next(frame_iterator)
+        except StopIteration:
+            raise _DeepSeekHarnessMonitorError("missing_session_header") from None
+        all_rows = _dsh_record_lines(first_frame)
+        try:
+            header = _dsh_validate_header(next(all_rows), filename_generation)
+        except StopIteration:
+            raise _DeepSeekHarnessMonitorError("missing_session_header") from None
+        state = _dsh_new_fingerprint_state(header)
+        expected_seq = 0
+        record_count = 1
+        for row in all_rows:
+            expected_seq += _dsh_validate_row(row, header["version"], expected_seq)
+            record_count += 1
+            _dsh_add_fingerprint_row(header, row, state)
+            if record_count > _DSH_MAX_RECORDS + 1:
+                raise _DeepSeekHarnessMonitorError("record_count_limit")
+        return _dsh_finish_fingerprint(
+            path, header, state, record_count, metadata, compressed
+        ), header
+
+    header = _dsh_validate_header(header_rows[0], filename_generation)
+    state = _dsh_new_fingerprint_state(header)
+    expected_seq = 0
+    record_count = 1
+    for frame in event_frames:
+        for row in _dsh_record_lines(frame):
+            expected_seq += _dsh_validate_row(row, header["version"], expected_seq)
+            record_count += 1
+            _dsh_add_fingerprint_row(header, row, state)
+            if record_count > _DSH_MAX_RECORDS + 1:
+                raise _DeepSeekHarnessMonitorError("record_count_limit")
+    return _dsh_finish_fingerprint(
+        path, header, state, record_count, metadata, compressed
+    ), header
+
+
+def _dsh_new_fingerprint_state(header: dict[str, Any]) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "type_keys": {},
+        "type_counts": {},
+        "catalog_known_event_types": set(),
+        "accepted_unknown_ignorable_types": set(),
+        "unsupported_required_event_types": set(),
+        "catalog": _dsh_app_event_catalog(),
+        "evidence_types": set(),
+        "usage_observed": False,
+        "relationship_reference_observed": False,
+    }
+    _dsh_add_fingerprint_row(header, header, state)
+    return state
+
+
+def _dsh_add_fingerprint_row(
+    header: dict[str, Any], row: dict[str, Any], state: dict[str, Any]
+) -> None:
+    type_keys: dict[str, set[str]] = state["type_keys"]
+    type_counts: dict[str, int] = state["type_counts"]
+    catalog_known_types: set[str] = state["catalog_known_event_types"]
+    accepted_unknown_ignorable_types: set[str] = state[
+        "accepted_unknown_ignorable_types"
+    ]
+    unsupported_required_event_types: set[str] = state[
+        "unsupported_required_event_types"
+    ]
+    event_type = (
+        row.get("type")
+        if isinstance(row.get("type"), str) and row.get("type")
+        else "<missing-type>"
+    )
+    if event_type != "session":
+        state["evidence_types"].add(event_type)
+        data = row.get("data")
+        if (
+            event_type == "assistant/message"
+            and isinstance(data, dict)
+            and isinstance(data.get("usage"), dict)
+            and any(
+                _dsh_nonnegative_integer(data["usage"].get(key))
+                for key in ("inputTokens", "outputTokens", "totalTokens")
+            )
+        ):
+            state["usage_observed"] = True
+        if event_type == "tool/result" and row.get("sourceEventSeqs"):
+            state["relationship_reference_observed"] = True
+    type_counts[event_type] = type_counts.get(event_type, 0) + 1
+    if event_type == "session":
+        _dsh_nested_bucket_walk(event_type, row, type_keys, 0, 4)
+        return
+    generation = header["version"]
+    known_types = state["catalog"].get(generation, set())
+    if event_type in known_types:
+        catalog_known_types.add(event_type)
+    elif generation in (3, 4) and row.get("ignorable") is True:
+        accepted_unknown_ignorable_types.add(event_type)
+        # Unknown v3 ignorable data remains opaque in the app. Retain only
+        # envelope keys so dynamic or sensitive payload keys never enter a report.
+        type_keys.setdefault(event_type, set()).update(row.keys())
+        return
+    else:
+        unsupported_required_event_types.add(event_type)
+        # Unsupported payloads have no known schema, so retain only envelope
+        # keys. The event type itself remains a drift finding below.
+        type_keys.setdefault(event_type, set()).update(row.keys())
+        return
+    _dsh_nested_bucket_walk(event_type, row, type_keys, 0, 4)
+
+
+def _dsh_finish_fingerprint(
+    path: Path,
+    header: dict[str, Any],
+    state: dict[str, Any],
+    record_count: int,
+    metadata: os.stat_result,
+    compressed: bool,
+) -> dict[str, Any]:
+    source_created_at_epoch = header["createdAt"] / 1000.0
+    type_keys: dict[str, set[str]] = state["type_keys"]
+    type_counts: dict[str, int] = state["type_counts"]
+    catalog_known_types: set[str] = state["catalog_known_event_types"]
+    accepted_unknown_ignorable_types: set[str] = state[
+        "accepted_unknown_ignorable_types"
+    ]
+    unsupported_required_event_types: set[str] = state[
+        "unsupported_required_event_types"
+    ]
+    evidence_types = set(state.get("evidence_types") or ())
+    source_contract = (
+        _dsh_v4_validation_source_contract()
+        if header["version"] == 4
+        else {"ok": True, "path": None, "legacy_generation": header["version"]}
+    )
+    evidence_buckets = {
+        "message": {"user/message", "assistant/message"}.issubset(evidence_types),
+        "tool": {"tool/call", "tool/result"}.issubset(evidence_types),
+        "usage": bool(state.get("usage_observed")),
+        "relationship": (
+            {
+                "turn/start", "step/start", "tool/call", "tool/result",
+                "step/end", "turn/end",
+            }.issubset(evidence_types)
+            and bool(state.get("relationship_reference_observed"))
+        ),
+        "integrity": (
+            header["version"] == 4
+            and bool(source_contract.get("ok"))
+            and not unsupported_required_event_types
+        ),
+    }
+    fingerprint = {
+        "file": str(path),
+        "encoding": "zstd" if compressed else "plain",
+        "generation": header["version"],
+        "type_counts": {key: type_counts[key] for key in sorted(type_counts)},
+        "type_keys": {key: sorted(type_keys[key]) for key in sorted(type_keys)},
+        "catalog_known_event_types": sorted(catalog_known_types),
+        "accepted_unknown_ignorable_types": sorted(accepted_unknown_ignorable_types),
+        "unsupported_required_event_types": sorted(unsupported_required_event_types),
+        "evidence_buckets": evidence_buckets,
+        "v4_validation_source": source_contract,
+        "parsed_lines": record_count,
+        "parse_errors": 0,
+        "nested_depth": 4,
+        "nested_opaque_paths": [
+            "tool/call.data.arguments",
+            "tool/code-dispatch.data.arguments",
+            "tool/code-dispatch-start.data.arguments",
+            "tool/result.data.message",
+            "tool/result.data.meta",
+            "request/context.data.systemPromptUpdate",
+            "request/header.data.header",
+        ],
+        "source_created_at_epoch": source_created_at_epoch,
+        "source_created_at_utc": _epoch_to_utc_iso(source_created_at_epoch),
+        "logical_mtime_epoch": source_created_at_epoch,
+        "artifact_mtime_epoch": metadata.st_mtime,
+        "artifact_mtime_utc": _epoch_to_utc_iso(metadata.st_mtime),
+        "logical_size": metadata.st_size,
+    }
+    return fingerprint
+
+
+def _dsh_nested_bucket_walk(
+    bucket: str,
+    obj: dict[str, Any],
+    out: dict[str, set[str]],
+    depth: int,
+    max_depth: int,
+) -> None:
+    keys = out.setdefault(bucket, set())
+    keys.update(obj.keys())
+    if depth >= max_depth:
+        return
+    event_type = bucket.split(".", 1)[0]
+    for key, value in obj.items():
+        child_bucket = f"{bucket}.{key}"
+        if key == "arguments":
+            continue
+        if event_type == "tool/result" and bucket == "tool/result.data" and key == "message":
+            continue
+        if event_type == "tool/result" and bucket == "tool/result.data" and key == "meta":
+            continue
+        if event_type == "request/context" and bucket == "request/context.data" and key == "systemPromptUpdate":
+            continue
+        if event_type == "request/header" and bucket == "request/header.data" and key == "header":
+            continue
+        children = (
+            [entry for entry in value[:_NESTED_LIST_SAMPLE_LIMIT] if isinstance(entry, dict)]
+            if isinstance(value, list)
+            else ([value] if isinstance(value, dict) else [])
+        )
+        for child in children:
+            _dsh_nested_bucket_walk(child_bucket, child, out, depth + 1, max_depth)
+
+
+def _dsh_parse_generation_filename(filename: str) -> tuple[int | None, bool]:
+    compressed = filename.endswith(".jsonl.zstd")
+    if compressed:
+        raw_name = filename[: -len(".zstd")]
+    elif filename.endswith(".jsonl"):
+        raw_name = filename
+    else:
+        return None, False
+    if raw_name == "session.jsonl":
+        return 0, compressed
+    match = re.fullmatch(r"session\.v([1-9][0-9]*)\.jsonl", raw_name)
+    if not match:
+        return None, compressed
+    try:
+        generation = int(match.group(1))
+    except ValueError:
+        return None, compressed
+    if generation > sys.maxsize:
+        return None, compressed
+    return generation, compressed
+
+
+def _dsh_swift_string_inventory(source: str, name: str) -> set[str]:
+    match = re.search(
+        rf"static\s+let\s+{re.escape(name)}\s*:\s*Set<String>\s*=\s*\[(.*?)^\s*\]",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return set()
+    return set(re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', match.group(1)))
+
+
+def _dsh_swift_disposition_inventory(source: str, name: str) -> set[str]:
+    match = re.search(
+        rf"static\s+let\s+{re.escape(name)}\s*:\s*\[String:\s*Disposition\]\s*=\s*\[(.*?)^\s*\]",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return set()
+    return set(re.findall(r'^\s*"([^"\\]+)"\s*:\s*Disposition\b', match.group(1), re.MULTILINE))
+
+
+def _dsh_swift_derived_inventory(
+    source: str, name: str, inherited: set[str]
+) -> set[str]:
+    """Read a nearby Swift Set expression such as ``v3Known.union([...])``."""
+    match = re.search(
+        rf"static\s+let\s+{re.escape(name)}(?:\s*:\s*Set<String>)?\s*=\s*"
+        rf"(.*?)(?=^\s*static\s+let\s+|^\s*}})",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return set()
+    expression = match.group(1)
+    values = set(re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', expression))
+    if "v3Known" in expression:
+        values.update(inherited)
+    return values
+
+
+def _dsh_app_event_catalog() -> dict[int, set[str]]:
+    """Read the app's checked-in event inventories as the monitoring authority."""
+    global _DSH_APP_EVENT_CATALOG
+    if _DSH_APP_EVENT_CATALOG is not None:
+        return _DSH_APP_EVENT_CATALOG
+    repo = Path(__file__).resolve().parents[1]
+    try:
+        format_source = (repo / "AgentSessions/DeepSeekHarness/DeepSeekHarnessFormatTypes.swift").read_text(encoding="utf-8")
+        validator_source = (repo / "AgentSessions/DeepSeekHarness/DeepSeekHarnessPayloadValidator.swift").read_text(encoding="utf-8")
+    except OSError:
+        _DSH_APP_EVENT_CATALOG = {}
+        return _DSH_APP_EVENT_CATALOG
+
+    packed = _dsh_swift_string_inventory(format_source, "packedTypes")
+    legacy = _dsh_swift_string_inventory(format_source, "legacySourceTypes")
+    generations_0_1 = (
+        _dsh_swift_string_inventory(format_source, "v0Events")
+        | _dsh_swift_disposition_inventory(validator_source, "v0Dispositions")
+        | packed
+        | legacy
+    )
+    generations_2 = (
+        _dsh_swift_disposition_inventory(validator_source, "v2Dispositions")
+        | {"feedback/message-put", "feedback/message-delete"}
+        | packed
+        | legacy
+    )
+    generations_3 = _dsh_swift_string_inventory(format_source, "v3Known")
+    generations_4 = (
+        _dsh_swift_string_inventory(format_source, "v4Known")
+        or _dsh_swift_derived_inventory(format_source, "v4Known", generations_3)
+    )
+    _DSH_APP_EVENT_CATALOG = {
+        0: generations_0_1,
+        1: generations_0_1,
+        2: generations_2,
+        3: generations_3,
+        4: generations_4,
+    }
+    return _DSH_APP_EVENT_CATALOG
+
+
+def _dsh_encode_path_segment(text: str) -> str:
+    if text == ".":
+        return "~002E"
+    if text == "..":
+        return "~002E~002E"
+    safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+    units = text.encode("utf-16-le", errors="surrogatepass")
+    encoded = []
+    for index in range(0, len(units), 2):
+        unit = units[index] | units[index + 1] << 8
+        encoded.append(chr(unit) if unit < 128 and chr(unit) in safe else f"~{unit:04X}")
+    return "".join(encoded)
+
+
+def _dsh_project_key(cwd: str | None) -> str:
+    if cwd is None:
+        return "_no-cwd"
+    safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+    units = cwd.encode("utf-16-le", errors="surrogatepass")
+    pieces: list[str] = []
+    separator_run = False
+    for index in range(0, len(units), 2):
+        unit = units[index] | units[index + 1] << 8
+        if unit in (0x2F, 0x5C, 0x3A):
+            if not separator_run:
+                pieces.append("-")
+            separator_run = True
+        elif unit < 128 and chr(unit) in safe:
+            pieces.append(chr(unit))
+            separator_run = False
+        else:
+            pieces.append(f"~{unit:04X}")
+            separator_run = False
+    slug = "".join(pieces).lstrip("-")[:251]
+    return "--" + (slug or "root") + "--"
+
+
+def _dsh_canonical_artifact_path(
+    root: Path, header: dict[str, Any], generation: int, compressed: bool
+) -> Path:
+    project = _dsh_project_key(header.get("cwd"))
+    session = _dsh_encode_path_segment(header["id"])
+    filename = "session.jsonl" if generation == 0 else f"session.v{generation}.jsonl"
+    if compressed:
+        filename += ".zstd"
+    return root / project / session / filename
+
+
+def _dsh_resolve_sessions_root(config: dict[str, Any]) -> Path:
+    env_name = str(config.get("root_env") or "DSH_HOME")
+    configured_home = os.environ.get(env_name, "").strip()
+    if configured_home:
+        root = _expand_path(configured_home)
+        if root.name != "sessions":
+            root = root / "sessions"
+        return root.absolute()
+    default_root = str(config.get("default_root") or "~/.dsh/sessions")
+    return _expand_path(default_root).absolute()
+
+
+def _dsh_inspect_header(
+    path: Path, generation: int
+) -> tuple[dict[str, Any], os.stat_result, int]:
+    compressed = path.name.endswith(".jsonl.zstd")
+    raw, metadata, bytes_read = _dsh_read_stable_header(
+        path, compressed=compressed
+    )
+    if compressed:
+        rows = list(_dsh_record_lines(raw))
+        if len(rows) != 1:
+            raise _DeepSeekHarnessMonitorError("first_frame_header_violation")
+        return _dsh_validate_header(rows[0], generation), metadata, bytes_read
+    rows = list(_dsh_record_lines(raw))
+    if len(rows) != 1:
+        raise _DeepSeekHarnessMonitorError("invalid_session_header")
+    return _dsh_validate_header(rows[0], generation), metadata, bytes_read
+
+
+def _dsh_weekly_scan(config: dict[str, Any], sample_count: int, max_lines: int) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    root = _dsh_resolve_sessions_root(config)
+    issues: dict[str, int] = {}
+
+    def issue(code: str) -> None:
+        issues[code] = issues.get(code, 0) + 1
+
+    try:
+        root_mode = root.stat().st_mode
+    except FileNotFoundError:
+        return None, {
+            "ok": False,
+            "root": str(root),
+            "error": "sessions_root_missing",
+            "candidate_sessions": 0,
+            "sampled_sessions": 0,
+            "issue_counts": {},
+            "failure_is_actionable": False,
+        }
+    except OSError:
+        issue("sessions_root_unreadable")
+        return None, {
+            "ok": False,
+            "root": str(root),
+            "error": "sessions_root_unreadable",
+            "candidate_sessions": 0,
+            "sampled_sessions": 0,
+            "issue_counts": issues,
+            "failure_is_actionable": True,
+        }
+    if not stat.S_ISDIR(root_mode):
+        issue("sessions_root_not_directory")
+        return None, {
+            "ok": False,
+            "root": str(root),
+            "error": "sessions_root_not_directory",
+            "candidate_sessions": 0,
+            "sampled_sessions": 0,
+            "issue_counts": issues,
+            "failure_is_actionable": True,
+        }
+
+    artifacts: list[tuple[Path, Path, int, bool, float]] = []
+    encodings: set[bool] = set()
+    header_scan_bytes = 0
+    discovery_entries = 0
+    scan_exhausted = False
+
+    def count_discovery_entry() -> bool:
+        nonlocal discovery_entries
+        if discovery_entries >= _DSH_MAX_DISCOVERY_ENTRIES:
+            issue("session_discovery_entry_limit")
+            return False
+        discovery_entries += 1
+        return True
+
+    try:
+        project_entries = os.scandir(root)
+    except OSError:
+        issue("sessions_root_unreadable")
+        return None, {
+            "ok": False,
+            "root": str(root),
+            "error": "sessions_root_unreadable",
+            "candidate_sessions": 0,
+            "sampled_sessions": 0,
+            "issue_counts": issues,
+            "failure_is_actionable": True,
+        }
+
+    try:
+        with project_entries:
+            for project_entry in project_entries:
+                if not count_discovery_entry():
+                    break
+                try:
+                    if not project_entry.is_dir(follow_symlinks=False):
+                        continue
+                    child_entries = os.scandir(project_entry.path)
+                except OSError:
+                    issue("filesystem_access")
+                    continue
+                with child_entries:
+                    for child_entry in child_entries:
+                        if not count_discovery_entry():
+                            scan_exhausted = True
+                            break
+                        try:
+                            child_is_file = child_entry.is_file(follow_symlinks=False)
+                            child_is_dir = child_entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            issue("filesystem_access")
+                            continue
+                        if child_is_file and child_entry.name.endswith((".jsonl", ".jsonl.zstd")):
+                            encodings.add(child_entry.name.endswith(".jsonl.zstd"))
+                            issue("legacy_flat_layout")
+                            continue
+                        if not child_is_dir:
+                            continue
+                        try:
+                            artifact_entries = os.scandir(child_entry.path)
+                        except OSError:
+                            issue("filesystem_access")
+                            continue
+                        with artifact_entries:
+                            for artifact_entry in artifact_entries:
+                                if not count_discovery_entry():
+                                    scan_exhausted = True
+                                    break
+                                generation, compressed = _dsh_parse_generation_filename(artifact_entry.name)
+                                if generation is None:
+                                    continue
+                                if len(artifacts) >= _DSH_MAX_SESSIONS_TO_INSPECT:
+                                    issue("session_scan_limit")
+                                    scan_exhausted = True
+                                    break
+                                try:
+                                    if not artifact_entry.is_file(follow_symlinks=False):
+                                        continue
+                                    artifact_mtime = artifact_entry.stat(follow_symlinks=False).st_mtime
+                                except OSError:
+                                    issue("filesystem_access")
+                                    continue
+                                path = Path(artifact_entry.path)
+                                session_dir = Path(child_entry.path)
+                                encodings.add(compressed)
+                                artifacts.append((path, session_dir, generation, compressed, artifact_mtime))
+                        if scan_exhausted:
+                            break
+                if scan_exhausted:
+                    break
+    except OSError:
+        issue("sessions_root_unreadable")
+
+    if len(encodings) > 1:
+        issue("mixed_compression_encodings")
+        contract = {
+            "ok": False,
+            "root": str(root),
+            "encoding": "mixed",
+            "candidate_sessions": 0,
+            "sampled_sessions": 0,
+            "issue_counts": issues,
+            "failure_is_actionable": True,
+        }
+        return None, contract
+
+    if not artifacts:
+        return None, {
+            "ok": False,
+            "root": str(root),
+            "error": "no_sessions_found",
+            "candidate_sessions": 0,
+            "sampled_sessions": 0,
+            "issue_counts": issues,
+            "failure_is_actionable": bool(issues),
+        }
+
+    grouped: dict[Path, list[tuple[Path, int, bool, float]]] = {}
+    for path, session_dir, generation, compressed, mtime in artifacts:
+        grouped.setdefault(session_dir, []).append((path, generation, compressed, mtime))
+
+    candidates: list[tuple[Path, int, bool, float, dict[str, Any]]] = []
+    by_id: dict[str, list[tuple[Path, int, bool, float, dict[str, Any]]]] = {}
+    for session_dir, members in grouped.items():
+        highest = max(member[1] for member in members)
+        selected = [member for member in members if member[1] == highest]
+        if len(selected) != 1:
+            issue("ambiguous_generation")
+            continue
+        path, generation, compressed, mtime = selected[0]
+        try:
+            header, metadata, bytes_read = _dsh_inspect_header(path, generation)
+            header_scan_bytes += bytes_read
+            if header_scan_bytes > _DSH_MAX_HEADER_SCAN_BYTES:
+                raise _DeepSeekHarnessMonitorError("header_scan_size_limit")
+            expected = _dsh_canonical_artifact_path(root, header, generation, compressed)
+            same_spelling = path.absolute() == expected.absolute()
+            same_physical_path = path.resolve(strict=False) == expected.resolve(strict=False)
+            if not (same_spelling or same_physical_path):
+                raise _DeepSeekHarnessMonitorError("canonical_path_mismatch")
+            candidate = (path, generation, compressed, metadata.st_mtime, header)
+            by_id.setdefault(header["id"], []).append(candidate)
+        except _DeepSeekHarnessMonitorError as exc:
+            issue(exc.code)
+
+    for same_id_candidates in by_id.values():
+        if len(same_id_candidates) != 1:
+            issue("ambiguous_session_id")
+            continue
+        candidates.append(same_id_candidates[0])
+
+    candidates.sort(
+        key=lambda entry: (-int(entry[4]["createdAt"]), str(entry[0]))
+    )
+    # A real-home prebump run's project key encodes its sandbox cwd.
+    sample_candidates, prebump_stats = _prefer_real_sessions(
+        candidates,
+        max(1, sample_count),
+        lambda entry: _is_prebump_session_file(entry[0], read_head=False),
+    )
+    fingerprints: list[dict[str, Any]] = []
+    newest_error: str | None = None
+    for index, (path, generation, compressed, _mtime, discovered_header) in enumerate(sample_candidates):
+        try:
+            fingerprint, parsed_header = _dsh_parse_artifact(path, max_lines=max_lines)
+            if (
+                parsed_header.get("id") != discovered_header.get("id")
+                or parsed_header.get("version") != generation
+                or parsed_header.get("createdAt") != discovered_header.get("createdAt")
+                or path.name.endswith(".jsonl.zstd") != compressed
+            ):
+                raise _DeepSeekHarnessMonitorError(
+                    "artifact_changed_between_discovery_and_parse"
+                )
+            if (
+                generation == 4
+                and not bool(
+                    (fingerprint.get("v4_validation_source") or {}).get("ok")
+                )
+            ):
+                issue("v4_validation_source_contract")
+            fingerprints.append(fingerprint)
+        except _DeepSeekHarnessMonitorError as exc:
+            issue(exc.code)
+            if index == 0:
+                newest_error = exc.code
+
+    local_schema: dict[str, Any] | None = None
+    if fingerprints:
+        local_schema = _dsh_merge_fingerprints(fingerprints)
+    elif newest_error and sample_candidates:
+        local_schema = {
+            "file": str(sample_candidates[0][0]),
+            "error": newest_error,
+            "type_counts": {},
+            "type_keys": {},
+            "parsed_lines": 0,
+            "parse_errors": 1,
+        }
+    if local_schema is not None:
+        local_schema.update(prebump_stats)
+
+    all_issues = bool(issues)
+    contract = {
+        "ok": not all_issues and bool(candidates),
+        "root": str(root),
+        "layout": "<root>/<project-key>/<encoded-session-id>/session[.vN].jsonl[.zstd]",
+        "encoding": "zstd" if encodings == {True} else "plain" if encodings == {False} else None,
+        "candidate_sessions": len(candidates),
+        "sampled_sessions": len(fingerprints),
+        **prebump_stats,
+        "header_scan_bytes": header_scan_bytes,
+        "header_scan_bytes_limit": _DSH_MAX_HEADER_SCAN_BYTES,
+        "issue_counts": issues,
+        "failure_is_actionable": all_issues,
+    }
+    return local_schema, contract
+
+
+def _dsh_merge_fingerprints(
+    fingerprints: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not fingerprints:
+        return None
+    merged = dict(fingerprints[0])
+    merged["type_keys"] = _merge_type_keys(fingerprints)
+    merged_counts: dict[str, int] = {}
+    merged_catalog_known: set[str] = set()
+    merged_accepted_ignorable: set[str] = set()
+    merged_unsupported_required: set[str] = set()
+    merged_evidence_buckets: dict[str, bool] = {}
+    for fingerprint in fingerprints:
+        for event_type, count in (fingerprint.get("type_counts") or {}).items():
+            merged_counts[event_type] = merged_counts.get(event_type, 0) + int(count)
+        merged_catalog_known.update(fingerprint.get("catalog_known_event_types") or [])
+        merged_accepted_ignorable.update(fingerprint.get("accepted_unknown_ignorable_types") or [])
+        merged_unsupported_required.update(fingerprint.get("unsupported_required_event_types") or [])
+        for bucket, present in (fingerprint.get("evidence_buckets") or {}).items():
+            if isinstance(bucket, str):
+                merged_evidence_buckets[bucket] = (
+                    merged_evidence_buckets.get(bucket, False) or present is True
+                )
+    merged["type_counts"] = dict(sorted(merged_counts.items()))
+    merged["catalog_known_event_types"] = sorted(merged_catalog_known)
+    merged["accepted_unknown_ignorable_types"] = sorted(merged_accepted_ignorable)
+    merged["unsupported_required_event_types"] = sorted(merged_unsupported_required)
+    merged["evidence_buckets"] = dict(sorted(merged_evidence_buckets.items()))
+    merged["sampled_files"] = [fingerprint["file"] for fingerprint in fingerprints]
+    merged["sampled_sessions"] = len(fingerprints)
+    merged["sampled_total_parsed_lines"] = sum(
+        int(fingerprint.get("parsed_lines") or 0) for fingerprint in fingerprints
+    )
+    merged["sample_evidence"] = [
+        {
+            "file": fingerprint.get("file"),
+            "generation": fingerprint.get("generation"),
+            "source_created_at_epoch": fingerprint.get("source_created_at_epoch"),
+            "source_created_at_utc": fingerprint.get("source_created_at_utc"),
+            "artifact_mtime_epoch": fingerprint.get("artifact_mtime_epoch"),
+            "artifact_mtime_utc": fingerprint.get("artifact_mtime_utc"),
+            "parsed_lines": fingerprint.get("parsed_lines"),
+            "type_counts": fingerprint.get("type_counts"),
+            "type_keys": fingerprint.get("type_keys"),
+            "catalog_known_event_types": fingerprint.get("catalog_known_event_types"),
+            "accepted_unknown_ignorable_types": fingerprint.get("accepted_unknown_ignorable_types"),
+            "unsupported_required_event_types": fingerprint.get("unsupported_required_event_types"),
+            "evidence_buckets": fingerprint.get("evidence_buckets"),
+            "v4_validation_source": fingerprint.get("v4_validation_source"),
+        }
+        for fingerprint in fingerprints
+    ]
+    _merge_sampled_parse_errors(merged, fingerprints)
+    return merged
+
+
+def _observed_event_count(fingerprint: dict[str, Any] | None) -> int | None:
+    """Total physical records seen, without double-counting nested schema buckets."""
+    if not isinstance(fingerprint, dict):
+        return None
+    for key in ("sampled_total_parsed_lines", "parsed_lines", "parsed_messages"):
+        v = fingerprint.get(key)
+        if isinstance(v, int):
+            return v
+    counts = fingerprint.get("type_counts")
+    if isinstance(counts, dict) and counts:
+        total = 0
+        for n in counts.values():
+            if isinstance(n, int):
+                total += n
+        return total
+    return None
+
+
+def _grok_session_schema_fingerprint(path: Path, max_lines: int) -> dict[str, Any]:
+    """Fingerprint a Grok session directory from its `chat_history.jsonl`.
+
+    A Grok session is a directory, not a single file: the transcript lives in
+    `chat_history.jsonl` and everything discovery depends on (ids, cwd, model,
+    `chat_format_version`) lives in the sibling `summary.json`. Fingerprinting only
+    the transcript would leave the discovery-critical half unwatched, so the summary
+    is merged in as its own `summary` bucket.
+
+    A sidecar that cannot be read contributes no keys, and no key-level diff can
+    represent that: `_schema_diff` ignores `missing_keys`/`missing_types` on purpose,
+    so an unreadable summary.json reads as a clean bill of health here. The
+    fingerprint therefore records `summary_error` so the failure is at least visible
+    in the report, and the loud verdict-flipping check lives in the discovery
+    contract (`required_companion_files`), where a discovery precondition belongs.
+    """
+    fp = _nested_jsonl_schema_fingerprint(
+        path,
+        max_lines=max_lines,
+        opaque_keys=frozenset(_NESTED_OPAQUE_KEYS.get("grok", ())),
+    )
+
+    summary_path = path.parent / "summary.json"
+    type_keys = dict(fp.get("type_keys") or {})
+    type_counts = dict(fp.get("type_counts") or {})
+    summary, summary_error = _read_json_object(summary_path)
+    if isinstance(summary, dict):
+        buckets: dict[str, set[str]] = {}
+        _nested_bucket_walk(
+            "summary",
+            summary,
+            buckets,
+            depth=0,
+            max_depth=_NESTED_FINGERPRINT_MAX_DEPTH,
+            opaque_keys=frozenset(_NESTED_OPAQUE_KEYS.get("grok", ())),
+        )
+        for bucket, keys in buckets.items():
+            merged = set(type_keys.get(bucket, [])) | keys
+            type_keys[bucket] = sorted(merged)
+        # Deliberately NOT counted in `type_counts`: summary.json is one metadata
+        # file, not a transcript event, and `_observed_event_count` sums these
+        # counts to feed the thin-sample gate. Counting it would hand every
+        # sampled session a free event and let a genuinely thin grok sample clear
+        # `_MIN_SAMPLE_EVENT_COUNT` on phantom volume. The keys still land in
+        # `type_keys`, which is where drift detection actually looks.
+
+    fp["type_keys"] = {k: type_keys[k] for k in sorted(type_keys)}
+    fp["type_counts"] = {k: type_counts[k] for k in sorted(type_counts)}
+    fp["summary_file"] = str(summary_path) if isinstance(summary, dict) else None
+    fp["summary_error"] = summary_error
+    return fp
+
+
+def _deepseek_harness_schema_fingerprint(path: Path, max_lines: int) -> dict[str, Any]:
+    """Fingerprint validated DSH event data for fixture and real-session parity."""
+    try:
+        fingerprint, _ = _dsh_parse_artifact(path, max_lines=max_lines)
+        return fingerprint
+    except _DeepSeekHarnessMonitorError as exc:
+        return {
+            "file": str(path),
+            "error": exc.code,
+            "type_counts": {},
+            "type_keys": {},
+            "parsed_lines": 0,
+            "parse_errors": 1,
+        }
+
+
+def _schema_fingerprint_for_agent(agent_name: str, path: Path, max_lines: int) -> dict[str, Any]:
+    """Single place that decides how deep an agent's JSONL is fingerprinted.
+
+    Baseline and observed samples MUST go through this together — fingerprinting one
+    side flat and the other nested would diff two different alphabets.
+    """
+    if agent_name == "deepseek_harness":
+        return _deepseek_harness_schema_fingerprint(path, max_lines=max_lines)
+    if agent_name == "kimi":
+        return _kimi_wire_schema_fingerprint(path, max_lines=max_lines)
+    if agent_name == "grok":
+        return _grok_session_schema_fingerprint(path, max_lines=max_lines)
+    if agent_name == "fx":
+        return _fx_session_schema_fingerprint(path, max_lines=max_lines)
+    if agent_name in _NESTED_PAYLOAD_AGENTS:
+        return _nested_jsonl_schema_fingerprint(
+            path,
+            max_lines=max_lines,
+            opaque_keys=frozenset(_NESTED_OPAQUE_KEYS.get(agent_name, ())),
+            typed_list_keys=frozenset(_NESTED_TYPED_LIST_KEYS.get(agent_name, ())),
+            glued_objects=agent_name in _GLUED_OBJECT_AGENTS,
+            shallow_keys=frozenset(_NESTED_SHALLOW_KEYS.get(agent_name, ())),
+        )
+    return _jsonl_schema_fingerprint(path, max_lines=max_lines)
+
+
+_KIMI_LOOP_EVENT_TYPE = "context.append_loop_event"
+_KIMI_AGENT_MESSAGE_TYPE = "agent.message.appended"
+
+
+def _kimi_wire_schema_fingerprint(path: Path, max_lines: int) -> dict[str, Any]:
+    """
+    Schema fingerprint for Kimi Code `agents/<id>/wire.jsonl` journals.
+
+    Legacy renderable content arrives under `context.append_loop_event` -> `event`.
+    Kimi 2.x also writes projected history entries under
+    `agent.message.appended` -> `message`. A top-level-only fingerprint sees both as
+    opaque buckets, so this walks their fixed schema while leaving message text, ids,
+    reasoning content, and tool arguments opaque.
+
+    Synthetic buckets (prefixes cannot collide with a real top-level wire op):
+      `event.<event.type>`               keys of the loop event; count = histogram
+      `part.<part.type>`                 keys of a `content.part` payload
+      `part.<part.type>.<multi-per-step>`  more than one part of that type inside a
+                                         single step, i.e. streamed/partial text.
+                                         KimiSessionParser emits one whole event per
+                                         part, so this shape would fragment
+                                         transcripts and inflate assistant counts.
+      `event.<event.type>.result`        keys inside `tool.result`'s `result` object,
+                                         where `isError` drives error classification.
+      `agent.message.appended.entry`    keys of the projected history entry
+      `agent.message.appended.message.<role>` keys of its role-specific message
+      `agent.message.appended.content.<type>` keys of each content part
+      `agent.message.appended.tool_call` keys of each tool call; arguments stay opaque
+      `agent.message.appended.meta[.<kind>]` fixed metadata object keys
+
+    Nested shape changes (a value that stops being an object) get their own
+    `.<non-object>` bucket rather than being silently skipped.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors: int = 0
+    total_lines: int = 0
+    loop_events: int = 0
+    # (turnId, step, stepUuid, part.type) -> count, to spot streamed parts.
+    part_runs: dict[tuple[Any, Any, Any, str], int] = {}
+
+    lines: list[str] = []
+    with _open_session_text(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            lines.append(line)
+            if len(lines) > max_lines:
+                lines.pop(0)
+
+    def _add(bucket: str, keys: Any = ()) -> None:
+        type_counts[bucket] = type_counts.get(bucket, 0) + 1
+        ks = type_keys.setdefault(bucket, set())
+        for k in keys:
+            if isinstance(k, str):
+                ks.add(k)
+
+    def _named(value: Any) -> str:
+        return value if isinstance(value, str) and value else "<missing-type>"
+
+    for raw in lines:
+        total_lines += 1
+        s = raw.strip()
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        top_type = _named(obj.get("type"))
+        _add(top_type, obj.keys())
+        if top_type == _KIMI_AGENT_MESSAGE_TYPE:
+            entry = obj.get("message")
+            if not isinstance(entry, dict):
+                _add("agent.message.appended.entry.<non-object>")
+                continue
+
+            _add("agent.message.appended.entry", entry.keys())
+            message = entry.get("message")
+            if not isinstance(message, dict):
+                _add("agent.message.appended.message.<non-object>")
+            else:
+                role = _named(message.get("role"))
+                _add(f"agent.message.appended.message.{role}", message.keys())
+
+                if "content" in message:
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict):
+                                part_type = _named(part.get("type"))
+                                _add(f"agent.message.appended.content.{part_type}", part.keys())
+                            else:
+                                _add("agent.message.appended.content.<non-object>")
+                    else:
+                        _add("agent.message.appended.content.<non-list>")
+
+                if "toolCalls" in message:
+                    tool_calls = message.get("toolCalls")
+                    if isinstance(tool_calls, list):
+                        for call in tool_calls:
+                            if isinstance(call, dict):
+                                # `arguments` is a tool-defined payload. Record the
+                                # containing key but never descend into its contents.
+                                _add("agent.message.appended.tool_call", call.keys())
+                            else:
+                                _add("agent.message.appended.tool_call.<non-object>")
+                    else:
+                        _add("agent.message.appended.toolCalls.<non-list>")
+
+            if "meta" in entry:
+                meta = entry.get("meta")
+                if isinstance(meta, dict):
+                    _add("agent.message.appended.meta", meta.keys())
+                    for meta_kind in ("finish", "model", "origin", "usage"):
+                        if meta_kind not in meta:
+                            continue
+                        nested = meta.get(meta_kind)
+                        if isinstance(nested, dict):
+                            _add(f"agent.message.appended.meta.{meta_kind}", nested.keys())
+                        else:
+                            _add(f"agent.message.appended.meta.{meta_kind}.<non-object>")
+                else:
+                    _add("agent.message.appended.meta.<non-object>")
+            continue
+
+        if top_type != _KIMI_LOOP_EVENT_TYPE:
+            continue
+
+        loop_events += 1
+        event = obj.get("event")
+        if not isinstance(event, dict):
+            _add("event.<non-object>")
+            continue
+
+        event_type = _named(event.get("type"))
+        _add(f"event.{event_type}", event.keys())
+
+        if "part" in event:
+            part = event.get("part")
+            if isinstance(part, dict):
+                part_type = _named(part.get("type"))
+                _add(f"part.{part_type}", part.keys())
+                run = (event.get("turnId"), event.get("step"), event.get("stepUuid"), part_type)
+                part_runs[run] = part_runs.get(run, 0) + 1
+            else:
+                _add(f"event.{event_type}.part.<non-object>")
+
+        if "result" in event:
+            result = event.get("result")
+            if isinstance(result, dict):
+                _add(f"event.{event_type}.result", result.keys())
+            else:
+                _add(f"event.{event_type}.result.<non-object>")
+
+    for (_turn, _step, _step_uuid, part_type), count in part_runs.items():
+        if count > 1:
+            _add(f"part.{part_type}.<multi-per-step>")
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_lines": total_lines,
+        "loop_events_parsed": loop_events,
+        "parse_errors": parse_errors,
+    }
+
+
+_ROLE_MAP = {
+    "user": "user", "human": "user",
+    "assistant": "assistant", "model": "assistant",
+    "system": "system",
+}
+
+
+def _cursor_transcript_schema_fingerprint(path: Path, max_lines: int) -> dict[str, Any]:
+    """
+    Schema fingerprint for Cursor agent transcript JSONL files.
+
+    Cursor transcripts use `role` (user/assistant) as the top-level discriminator
+    instead of `type`. We bucket by normalized role AND by content block type
+    (prefixed `content.<type>`) so _schema_diff() detects both structural and
+    content-level drift. Roleless typed records get their own `type.<type>` bucket.
+
+    Role normalization matches CursorSessionParser.swift:187-193:
+      user/human -> user, assistant/model -> assistant, system -> system, else -> assistant
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors: int = 0
+    total_lines: int = 0
+
+    lines: list[str] = []
+    with _open_session_text(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            lines.append(line)
+            if len(lines) > max_lines:
+                lines.pop(0)
+
+    for raw in lines:
+        total_lines += 1
+        s = raw.strip()
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if not isinstance(obj, dict):
+            parse_errors += 1
+            continue
+
+        # Bucket top-level keys by normalized role. Cursor also emits typed,
+        # roleless turn events (for example turn_ended errors); keep those apart
+        # from assistant messages so the monitor can catch their shape explicitly.
+        raw_role = obj.get("role")
+        role_key = raw_role.lower() if isinstance(raw_role, str) else ""
+        event_type = obj.get("type")
+        bucket = _ROLE_MAP.get(role_key)
+        if bucket is None:
+            bucket = f"type.{event_type}" if isinstance(event_type, str) and event_type else "assistant"
+        type_counts[bucket] = type_counts.get(bucket, 0) + 1
+        ks = type_keys.setdefault(bucket, set())
+        for k in obj.keys():
+            ks.add(k)
+
+        # Bucket content block keys by content type
+        msg = obj.get("message")
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    ct = block.get("type")
+                    if not isinstance(ct, str) or not ct:
+                        ct = "<missing-content-type>"
+                    bucket = f"content.{ct}"
+                    type_counts[bucket] = type_counts.get(bucket, 0) + 1
+                    cks = type_keys.setdefault(bucket, set())
+                    for k in block.keys():
+                        cks.add(k)
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_lines": total_lines,
+        "parse_errors": parse_errors,
+    }
+
+
+def _cursor_recent_schema_fingerprint(
+    roots: list[str],
+    glob: str,
+    *,
+    max_lines: int,
+    exclude_globs: list[str] | None = None,
+    exclude_prebump: bool = False,
+    prompt_needles: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """Union the five newest Cursor transcripts so a short newest chat cannot hide drift.
+
+    With `exclude_prebump`, transcripts a real-home prebump run wrote (their project
+    directory encodes the `agent-watch-prebump-cursor-*` sandbox cwd) are skipped while
+    enough real ones exist.
+    """
+    prebump_stats: dict[str, int] = {}
+    if exclude_prebump:
+        paths, prebump_stats = _prefer_real_sessions(
+            _newest_files(roots, glob, _PREBUMP_CANDIDATE_POOL, exclude_globs=exclude_globs),
+            _LOCAL_SCHEMA_SAMPLE_COUNT,
+            lambda p: _is_prebump_session_file(p, prompt_needles),
+        )
+    else:
+        paths = _newest_files(
+            roots, glob, _LOCAL_SCHEMA_SAMPLE_COUNT, exclude_globs=exclude_globs
+        )
+    if not paths:
+        return None
+
+    fingerprints = [
+        _cursor_transcript_schema_fingerprint(path, max_lines=max_lines)
+        for path in paths
+    ]
+    merged = dict(fingerprints[0])
+    merged["type_keys"] = _merge_type_keys(fingerprints)
+    merged_counts: dict[str, int] = {}
+    for fingerprint in fingerprints:
+        for event_type, count in (fingerprint.get("type_counts") or {}).items():
+            merged_counts[event_type] = merged_counts.get(event_type, 0) + int(count)
+    merged["type_counts"] = dict(sorted(merged_counts.items()))
+    merged["parse_errors"] = sum(
+        int(fingerprint.get("parse_errors") or 0) for fingerprint in fingerprints
+    )
+    merged["sampled_files"] = [fingerprint["file"] for fingerprint in fingerprints]
+    merged["sampled_sessions"] = len(fingerprints)
+    merged["sampled_total_parsed_lines"] = sum(
+        int(fingerprint.get("parsed_lines") or 0) for fingerprint in fingerprints
+    )
+    merged.update(prebump_stats)
+    return merged
+
+
+def _antigravity_markdown_schema_fingerprint(path: Path, max_lines: int) -> dict[str, Any]:
+    """Coarse fingerprint for Antigravity brain markdown artifacts."""
+    type_keys: dict[str, set[str]] = {"markdown": {"content"}}
+    type_counts: dict[str, int] = {"markdown": 1}
+    parsed_lines = 0
+    parse_errors = 0
+    in_fence = False
+
+    try:
+        with _open_session_text(path) as handle:
+            for idx, line in enumerate(handle):
+                if idx >= max(0, int(max_lines)):
+                    break
+                parsed_lines += 1
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                keys = type_keys["markdown"]
+                if stripped.startswith("#"):
+                    keys.add("heading")
+                if stripped.startswith("```"):
+                    keys.add("fenced_code")
+                    in_fence = not in_fence
+                if "](" in stripped:
+                    keys.add("markdown_link")
+                if "file://" in stripped or "(/" in stripped:
+                    keys.add("local_path_reference")
+                if in_fence:
+                    keys.add("fenced_code_content")
+    except OSError:
+        parse_errors += 1
+        read_failed = True
+    else:
+        read_failed = False
+
+    if parsed_lines == 0 and parse_errors == 0:
+        parse_errors = 1
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_lines": parsed_lines,
+        "parse_errors": parse_errors,
+        "read_failed": read_failed,
+    }
+
+
+def _hermes_session_json_schema_fingerprint(path: Path, max_messages: int) -> dict[str, Any]:
+    """
+    Schema fingerprint for Hermes canonical session JSON files.
+
+    Hermes stores one JSON object per session under ~/.hermes/sessions/session_*.json.
+    The app parser consumes root metadata, message-role records, assistant tool_calls,
+    and declared root tools, so bucket those shapes separately.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parsed_messages = 0
+    parsed_tool_calls = 0
+    parsed_tools = 0
+
+    try:
+        root = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {
+            "file": str(path),
+            "type_counts": {},
+            "type_keys": {},
+            "parsed_messages": 0,
+            "parsed_tool_calls": 0,
+            "parsed_tools": 0,
+            "parse_errors": 1,
+        }
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k in obj.keys():
+            ks.add(k)
+
+    if not isinstance(root, dict):
+        return {
+            "file": str(path),
+            "type_counts": {},
+            "type_keys": {},
+            "parsed_messages": 0,
+            "parsed_tool_calls": 0,
+            "parsed_tools": 0,
+            "parse_errors": 0,
+        }
+
+    _add("root", root)
+
+    tools = root.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            _add("tool", tool)
+            parsed_tools += 1
+
+    messages = root.get("messages")
+    if isinstance(messages, list):
+        for item in messages[: max(0, int(max_messages))]:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            event_type = f"message.{role}" if isinstance(role, str) and role else "message"
+            _add(event_type, item)
+            parsed_messages += 1
+
+            tool_calls = item.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    call_type = call.get("type")
+                    bucket = f"tool_call.{call_type}" if isinstance(call_type, str) and call_type else "tool_call"
+                    _add(bucket, call)
+                    parsed_tool_calls += 1
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_messages": parsed_messages,
+        "parsed_tool_calls": parsed_tool_calls,
+        "parsed_tools": parsed_tools,
+        "parse_errors": 0,
+    }
+
+
+def _hermes_state_db_latest_session_schema_fingerprint(
+    path: Path,
+    max_messages: int,
+    *,
+    exclude_prebump: bool = False,
+    prompt_needles: tuple[str, ...] = (),
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Fingerprint the newest Hermes session in `state.db`.
+
+    The prebump fresh-session diff wants exactly that session. The weekly passes
+    `exclude_prebump`: a real-home prebump run's session (marker in its first user
+    message) is skipped for the newest real one, and used only when no real one exists.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parsed_messages = 0
+    parsed_tool_calls = 0
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k, value in obj.items():
+            if value is not None:
+                ks.add(k)
+
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parsed_messages": 0, "parsed_tool_calls": 0, "parsed_tools": 0, "parse_errors": 1, "read_failed": True}
+    try:
+        prebump_stats: dict[str, int] = {}
+        rows = conn.execute(
+            f"""
+            SELECT id, source, model, model_config, system_prompt, started_at, ended_at, message_count
+            FROM sessions
+            WHERE (? IS NULL OR id = ?)
+            ORDER BY started_at DESC
+            LIMIT {_PREBUMP_CANDIDATE_POOL if exclude_prebump else 1};
+            """, (session_id, session_id)
+        ).fetchall()
+        if exclude_prebump and rows:
+
+            def _hermes_is_prebump(candidate: sqlite3.Row) -> bool:
+                first_user = conn.execute(
+                    "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+                    "ORDER BY timestamp, id LIMIT 1;",
+                    (candidate["id"],),
+                ).fetchone()
+                text = first_user[0] if first_user is not None else None
+                return isinstance(text, str) and _text_has_prebump_signal(
+                    text[:_PREBUMP_HEAD_CHARS], prompt_needles
+                )
+
+            rows, prebump_stats = _prefer_real_sessions(rows, 1, _hermes_is_prebump)
+        row = rows[0] if rows else None
+        if row is None:
+            return {"file": str(path), "type_counts": {}, "type_keys": {}, "parsed_messages": 0, "parsed_tool_calls": 0, "parsed_tools": 0, "parse_errors": 0}
+        root = {
+            "session_id": row["id"],
+            "platform": row["source"],
+            "model": row["model"],
+            "model_config": row["model_config"],
+            "system_prompt": row["system_prompt"],
+            "session_start": row["started_at"],
+            "last_updated": row["ended_at"] or row["started_at"],
+            "message_count": row["message_count"],
+            "messages": [],
+        }
+        _add("root", root)
+
+        for msg in conn.execute(
+            """
+            SELECT role, content, tool_call_id, tool_calls, tool_name, finish_reason, reasoning, reasoning_content, codex_reasoning_items
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY timestamp, id
+            LIMIT ?;
+            """,
+            (row["id"], max(0, int(max_messages))),
+        ):
+            item = {
+                "role": msg["role"],
+                "content": msg["content"],
+                "tool_call_id": msg["tool_call_id"],
+                "tool_calls": msg["tool_calls"],
+                "tool_name": msg["tool_name"],
+                "finish_reason": msg["finish_reason"],
+                "reasoning": msg["reasoning"],
+                "reasoning_content": msg["reasoning_content"],
+                "codex_reasoning_items": msg["codex_reasoning_items"],
+            }
+            role = item.get("role")
+            event_type = f"message.{role}" if isinstance(role, str) and role else "message"
+            _add(event_type, item)
+            parsed_messages += 1
+            raw_calls = item.get("tool_calls")
+            if isinstance(raw_calls, str) and raw_calls.strip():
+                try:
+                    calls = json.loads(raw_calls)
+                except Exception:
+                    calls = []
+                if isinstance(calls, list):
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            continue
+                        call_type = call.get("type")
+                        bucket = f"tool_call.{call_type}" if isinstance(call_type, str) and call_type else "tool_call"
+                        _add(bucket, call)
+                        parsed_tool_calls += 1
+    except Exception:
+        # Row JSON is decoded under its own guard above; this only catches
+        # SQLite failures (locked, corrupt, schema change), a read failure.
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parsed_messages": parsed_messages, "parsed_tool_calls": parsed_tool_calls, "parsed_tools": 0, "parse_errors": 1, "read_failed": True}
+    finally:
+        conn.close()
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parsed_messages": parsed_messages,
+        "parsed_tool_calls": parsed_tool_calls,
+        "parsed_tools": 0,
+        "parse_errors": 0,
+        "session_id": str(row["id"]),
+        **prebump_stats,
+    }
+
+
+def _hermes_weekly_schema_fingerprint(path: Path, max_messages: int,
+                                      prompt_needles: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Read up to five real Hermes sessions; leave the single-session prebump path exact."""
+    try:
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+            candidates = conn.execute("SELECT id FROM sessions ORDER BY started_at DESC LIMIT ?",
+                                      (_PREBUMP_CANDIDATE_POOL,)).fetchall()
+            def is_prebump(row):
+                message = conn.execute("SELECT content FROM messages WHERE session_id=? AND role='user' "
+                                       "ORDER BY timestamp,id LIMIT 1", (row[0],)).fetchone()
+                return bool(message and isinstance(message[0], str)
+                            and _text_has_prebump_signal(message[0][:_PREBUMP_HEAD_CHARS], prompt_needles))
+            selected, stats = _prefer_real_sessions(candidates, _LOCAL_SCHEMA_SAMPLE_COUNT, is_prebump)
+        fps = [_hermes_state_db_latest_session_schema_fingerprint(path, max_messages, session_id=row[0])
+               for row in selected]
+        if not fps:
+            return _hermes_state_db_latest_session_schema_fingerprint(path, max_messages)
+        merged = dict(fps[0])
+        merged.update(stats)
+        merged["type_keys"] = _merge_type_keys(fps)
+        counts: dict[str, int] = {}
+        for fp in fps:
+            for kind, count in fp.get("type_counts", {}).items():
+                counts[kind] = counts.get(kind, 0) + count
+        merged["type_counts"] = counts
+        merged["sampled_sessions"] = len(fps)
+        merged["parsed_messages"] = sum(fp.get("parsed_messages", 0) for fp in fps)
+        merged["parsed_tool_calls"] = sum(fp.get("parsed_tool_calls", 0) for fp in fps)
+        _merge_sampled_parse_errors(merged, fps)
+        return merged
+    except sqlite3.Error:
+        return {"file": str(path), "read_failed": True, "type_counts": {}, "type_keys": {}, "parse_errors": 1}
+
+
+def _opencode_storage_root_for_session_file(session_path: Path) -> Path | None:
+    # Typical layout: ~/.local/share/opencode/storage/session/<project>/ses_*.json
+    for parent in session_path.parents:
+        try:
+            if (parent / "session").exists() and (parent / "message").exists() and (parent / "part").exists():
+                return parent
+        except OSError:
+            continue
+    return None
+
+
+def _opencode_fixture_file_schema_fingerprint(path: Path) -> dict[str, Any]:
+    """
+    Fingerprint a single OpenCode JSON file from fixtures.
+
+    We bucket keys by "record kind" so message/part schema changes are visible separately
+    from session record schema changes.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors: int = 0
+
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 1}
+
+    if not isinstance(obj, dict):
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 0}
+
+    p = str(path).replace("\\", "/")
+    # OpenCode 2.x SQLite rows: one file per session_v2 row, and one per
+    # session_message row stored as {"type": <row type>, "data": <data JSON>}.
+    if "/sqlite_v2/session_v2/" in p:
+        return {
+            "file": str(path),
+            "type_counts": {"session_v2": 1},
+            "type_keys": {"session_v2": sorted(k for k, v in obj.items() if v is not None)},
+            "parse_errors": 0,
+        }
+    if "/sqlite_v2/session_message/" in p:
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 1}
+        keys: dict[str, set[str]] = {}
+        counts: dict[str, int] = {}
+        for bucket, bucket_obj in _opencode_v2_message_buckets(str(obj.get("type") or ""), data):
+            counts[bucket] = counts.get(bucket, 0) + 1
+            keys.setdefault(bucket, set()).update(k for k, v in bucket_obj.items() if v is not None)
+        return {
+            "file": str(path),
+            "type_counts": {k: counts[k] for k in sorted(counts)},
+            "type_keys": {k: sorted(keys[k]) for k in sorted(keys)},
+            "parse_errors": 0,
+        }
+    if "/storage_v2/session/" in p or "/storage_legacy/session/" in p:
+        event_type = "session"
+    elif "/storage_v2/message/" in p:
+        role = obj.get("role")
+        event_type = f"message.{role}" if isinstance(role, str) and role else "message"
+    elif "/storage_v2/part/" in p:
+        part_type = obj.get("type")
+        event_type = f"part.{part_type}" if isinstance(part_type, str) and part_type else "part"
+    else:
+        event_type = "opencode_json"
+
+    type_counts[event_type] = 1
+    type_keys[event_type] = set(obj.keys())
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parse_errors": parse_errors,
+    }
+
+
+def _opencode_storage_session_tree_schema_fingerprint(
+    session_path: Path, *, max_messages: int, max_parts: int
+) -> dict[str, Any]:
+    """
+    Fingerprint a local OpenCode v2 session by scanning:
+    - session record (storage/session/**/ses_*.json)
+    - message records (storage/message/<sessionId>/msg_*.json)
+    - part records (storage/part/<messageId>/*.json)
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors: int = 0
+    message_files_parsed: int = 0
+    part_files_parsed: int = 0
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k in obj.keys():
+            ks.add(k)
+
+    try:
+        session_obj = json.loads(session_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {
+            "file": str(session_path),
+            "type_counts": {},
+            "type_keys": {},
+            "message_files_parsed": 0,
+            "part_files_parsed": 0,
+            "parse_errors": 1,
+        }
+
+    if isinstance(session_obj, dict):
+        _add("session", session_obj)
+
+    session_id = session_obj.get("id") if isinstance(session_obj, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        return {
+            "file": str(session_path),
+            "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+            "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+            "message_files_parsed": 0,
+            "part_files_parsed": 0,
+            "parse_errors": parse_errors,
+        }
+
+    storage_root = _opencode_storage_root_for_session_file(session_path)
+    if storage_root is None:
+        return {
+            "file": str(session_path),
+            "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+            "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+            "message_files_parsed": 0,
+            "part_files_parsed": 0,
+            "parse_errors": parse_errors,
+            "warning": "storage_root_not_found",
+        }
+
+    msg_dir = storage_root / "message" / session_id
+    if not msg_dir.exists():
+        return {
+            "file": str(session_path),
+            "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+            "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+            "message_files_parsed": 0,
+            "part_files_parsed": 0,
+            "parse_errors": parse_errors,
+            "warning": "message_dir_not_found",
+        }
+
+    total_parts_budget = max(0, int(max_parts))
+    msg_budget = max(0, int(max_messages))
+    for msg_file in sorted(msg_dir.glob("msg_*.json"))[:msg_budget]:
+        try:
+            msg_obj = json.loads(msg_file.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            parse_errors += 1
+            continue
+        if not isinstance(msg_obj, dict):
+            continue
+        role = msg_obj.get("role")
+        event_type = f"message.{role}" if isinstance(role, str) and role else "message"
+        _add(event_type, msg_obj)
+        message_files_parsed += 1
+
+        mid = msg_obj.get("id")
+        if not isinstance(mid, str) or not mid:
+            continue
+        part_dir = storage_root / "part" / mid
+        if not part_dir.exists():
+            continue
+        if total_parts_budget <= 0:
+            continue
+        part_files = sorted(part_dir.glob("*.json"))
+        for part_file in part_files:
+            if total_parts_budget <= 0:
+                break
+            try:
+                part_obj = json.loads(part_file.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                parse_errors += 1
+                total_parts_budget -= 1
+                continue
+            total_parts_budget -= 1
+            if not isinstance(part_obj, dict):
+                continue
+            part_type = part_obj.get("type")
+            et = f"part.{part_type}" if isinstance(part_type, str) and part_type else "part"
+            _add(et, part_obj)
+            part_files_parsed += 1
+
+    return {
+        "file": str(session_path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "message_files_parsed": message_files_parsed,
+        "part_files_parsed": part_files_parsed,
+        "parse_errors": parse_errors,
+    }
+
+
+def _devin_node_bucket(obj: dict[str, Any]) -> str:
+    """
+    Bucket a `message_nodes.chat_message` payload by its role.
+
+    The Swift reader branches on `role` and reads the sibling keys, so role is
+    the unit drift matters in: a new role, or a new key on an existing one, is
+    exactly what would silently lose transcript content.
+    """
+    role = obj.get("role")
+    return f"node.{role}" if isinstance(role, str) and role else "node"
+
+
+def _devin_fixture_file_schema_fingerprint(path: Path) -> dict[str, Any]:
+    """
+    Fingerprint the synthetic Devin fixture.
+
+    Devin stores every session in one shared SQLite database, so there is no
+    per-session file to sanitize and the fixture is a JSON projection of the
+    same logical records: the `sessions` row plus its main-chain
+    `message_nodes` payloads. The live fingerprint below normalizes into these
+    same buckets, so a diff reports real format drift rather than the
+    difference between a table and a JSON file. Same split OpenCode uses.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k, v in obj.items():
+            if v is not None and k != "_fixture":
+                ks.add(k)
+
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 1}
+    if not isinstance(obj, dict):
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 0}
+
+    session = obj.get("session")
+    if isinstance(session, dict):
+        _add("session", session)
+    nodes = obj.get("nodes")
+    if isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict):
+                _add(_devin_node_bucket(node), node)
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parse_errors": 0,
+    }
+
+
+def _fx_turn_bucket(obj: dict[str, Any]) -> str:
+    """
+    Bucket one `state.history[]` entry by its `kind`.
+
+    FxSessionParser switches on kind and reads that kind's own sibling keys, so
+    kind is the unit drift matters in. A fifth kind, or a new key on one of the
+    four, is exactly what would silently lose transcript content — the review of
+    PR #59 caught the parser handling two of the four.
+    """
+    kind = obj.get("kind")
+    return f"turn.{kind}" if isinstance(kind, str) and kind else "turn"
+
+
+def _fx_checkpoint_schema_fingerprint(path: Path) -> dict[str, Any]:
+    """
+    Fingerprint one fx `checkpoint.json`.
+
+    Unlike Devin, fx's live store is already JSON files in the shape the reader
+    parses, so the baseline and the live pass share this one function — there is
+    no projection to keep in step. The nested execution records are bucketed too:
+    a turn's content lives under `execution.tool_steps[]`, and drift there is
+    just as silent as drift on the turn itself.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k, v in obj.items():
+            if v is not None:
+                ks.add(k)
+
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 1}
+    if not isinstance(obj, dict):
+        return {"file": str(path), "type_counts": {}, "type_keys": {}, "parse_errors": 0}
+
+    # The sidecar carries identity/workspace/model; it sits beside the checkpoint.
+    sidecar = path.parent / "session.json"
+    if sidecar.exists():
+        try:
+            sc = json.loads(sidecar.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(sc, dict):
+                _add("session", sc)
+        except Exception:
+            pass
+
+    state = obj.get("state")
+    history = state.get("history") if isinstance(state, dict) else None
+    if isinstance(history, list):
+        for turn in history:
+            if not isinstance(turn, dict):
+                continue
+            _add(_fx_turn_bucket(turn), turn)
+            user = turn.get("user")
+            if isinstance(user, dict):
+                _add("user", user)
+                for image in user.get("images") or []:
+                    if isinstance(image, dict):
+                        _add("user.image", image)
+            execution = turn.get("execution")
+            steps = execution.get("tool_steps") if isinstance(execution, dict) else None
+            for step in steps or []:
+                if not isinstance(step, dict):
+                    continue
+                _add("tool_step", step)
+                for call in step.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        _add("tool_call", call)
+                for result in step.get("tool_results") or []:
+                    if isinstance(result, dict):
+                        _add("tool_result", result)
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "parse_errors": 0,
+    }
+
+
+# Nested records inside a schema-4 frame payload that carry user-visible facts.
+# Each is bucketed as `event.<kind>.<name>`; list-valued ones are unioned.
+_FX_EVENT_NESTED: dict[str, tuple[tuple[str, str], ...]] = {
+    "user": (("images", "image"),),
+    "assistant": (("provider_replay", "provider_replay"),),
+    "tool_result": (("committed_file_presentation", "committed_file_presentation"),),
+    "turn_completed": (("files", "file"), ("turn_summary", "turn_summary")),
+    "interrupted": (("files", "file"), ("turn_summary", "turn_summary")),
+}
+
+
+def _fx_events_schema_fingerprint(path: Path, max_lines: int = 5000) -> dict[str, Any]:
+    """
+    Fingerprint one fx schema-4 session: `events.jsonl` plus its sidecars.
+
+    fx 0.0.8+ (verified at upstream v0.0.14) writes one conversation frame per
+    line: `{schema_version, seq, timestamp_ms, event: {<kind>: payload}}`
+    (`session_event.zig` `ConversationEnvelope`). The kind is the payload's single
+    key, so frames bucket as `event.<kind>`; the envelope itself is `event`.
+    The nested records in `_FX_EVENT_NESTED` get their own buckets. A line
+    without an `event` object (a schema-3 `kind`/`payload` infrastructure record)
+    lands in `<not-a-frame>` so it cannot pass as a frame.
+
+    Unlike the schema-3 checkpoint walker, null-valued keys count: fx writes
+    every optional field explicitly (`emit_null_optional_fields` defaults on), so
+    a null key is schema, not absence.
+
+    Sidecars beside the log: `session.json` buckets as `session` (shared with the
+    schema-3 manifest so steward_check's session.json export keeps working) and
+    `recovery.json`, when present, as `recovery` / `recovery.checkpoint`. A probe
+    file with no siblings fingerprints its frames alone, which is what
+    steward_check's per-record drift harvest relies on.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors = 0
+    parsed_lines = 0
+
+    def _add(bucket: str, obj: dict[str, Any]) -> None:
+        type_counts[bucket] = type_counts.get(bucket, 0) + 1
+        type_keys.setdefault(bucket, set()).update(obj.keys())
+
+    try:
+        lines = _tail_lines(path, max_lines)
+    except _SESSION_READ_ERRORS:
+        lines = []
+    for raw in lines:
+        parsed_lines += 1
+        try:
+            frame = json.loads(raw)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if not isinstance(frame, dict):
+            continue
+        envelope = frame.get("event")
+        if not isinstance(envelope, dict) or len(envelope) != 1:
+            _add("<not-a-frame>", frame)
+            continue
+        _add("event", frame)
+        kind, payload = next(iter(envelope.items()))
+        bucket = f"event.{kind}"
+        if not isinstance(payload, dict):
+            _add(f"{bucket}.<non-object>", {})
+            continue
+        _add(bucket, payload)
+        for key, name in _FX_EVENT_NESTED.get(kind, ()):
+            value = payload.get(key)
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, dict):
+                    _add(f"{bucket}.{name}", item)
+
+    for sidecar_name, bucket in (("session.json", "session"), ("recovery.json", "recovery")):
+        sidecar = path.parent / sidecar_name
+        if not sidecar.is_file():
+            continue
+        obj, _err = _read_json_object(sidecar)
+        if not isinstance(obj, dict):
+            continue
+        _add(bucket, obj)
+        checkpoint = obj.get("checkpoint") if bucket == "recovery" else None
+        if isinstance(checkpoint, dict):
+            _add("recovery.checkpoint", checkpoint)
+
+    return {
+        "file": str(path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(type_keys[k]) for k in sorted(type_keys)},
+        "parsed_lines": parsed_lines,
+        "parse_errors": parse_errors,
+    }
+
+
+def _fx_session_schema_fingerprint(path: Path, max_lines: int = 5000) -> dict[str, Any]:
+    """Route an fx session file to its layout's fingerprint (see `_fx_session_unit`)."""
+    if path.name.endswith(".jsonl"):
+        return _fx_events_schema_fingerprint(path, max_lines=max_lines)
+    return _fx_checkpoint_schema_fingerprint(path)
+
+
+_FX_RESERVED_DIR_NAMES = frozenset({"latest", "v2"})
+
+
+def _fx_session_unit(directory: Path) -> Path | None:
+    """The file that stands for one fx session directory, mirroring FxSessionDiscovery.
+
+    Schema 3 (fx <= 0.0.7): `checkpoint.json`. Schema 4 (fx 0.0.8+):
+    `events.jsonl`, only when there is no checkpoint and no `authority.json` --
+    a schema-3 directory whose checkpoint never materialized keeps its authority
+    file, and its `events.jsonl` is write-ahead infrastructure, not a transcript.
+    Both layouts require the `session.json` sidecar.
+    """
+    if not (directory / "session.json").is_file():
+        return None
+    checkpoint = directory / "checkpoint.json"
+    if checkpoint.is_file():
+        return checkpoint
+    if (directory / "authority.json").exists():
+        return None
+    events = directory / "events.jsonl"
+    return events if events.is_file() else None
+
+
+def _fx_newest_session_files(roots: list[str], count: int) -> list[Path]:
+    """The `count` newest fx sessions across both layouts, newest first.
+
+    `latest/` (the CLI's pointer) and `v2/` (the opt-in sessions-v2 root that
+    fx 0.0.14 reserves inside the sessions folder) are never sessions.
+    """
+    scored: list[tuple[float, Path]] = []
+    for r in roots:
+        root = _expand_path(r)
+        if not root.is_dir():
+            continue
+        for directory in root.iterdir():
+            if not directory.is_dir() or directory.name.lower() in _FX_RESERVED_DIR_NAMES:
+                continue
+            unit = _fx_session_unit(directory)
+            if unit is None:
+                continue
+            try:
+                scored.append((unit.stat().st_mtime, unit))
+            except OSError:
+                continue
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in scored[:count]]
+
+
+def _cline_session_schema_fingerprint(path: Path) -> dict[str, Any]:
+    """Fingerprint Cline's manifest and its identity-matched transcript together."""
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        keys = type_keys.setdefault(event_type, set())
+        keys.update(obj.keys())
+
+    manifest, manifest_error = _read_json_object(path)
+    if manifest is not None:
+        _add("manifest", manifest)
+        metadata = manifest.get("metadata")
+        if isinstance(metadata, dict):
+            _add("manifest.metadata", metadata)
+            for nested_key in ("sessionHistoryOrigin", "importedFrom", "git", "checkpoint", "usage", "aggregateUsage"):
+                nested = metadata.get(nested_key)
+                if isinstance(nested, dict):
+                    _add(f"manifest.metadata.{nested_key}", nested)
+
+    transcript_path = path.with_name(f"{path.stem}.messages.json")
+    transcript, transcript_error = _read_json_object(transcript_path)
+    contract_errors: list[str] = []
+    if manifest is not None and manifest.get("version") != 1:
+        contract_errors.append("unsupported_manifest_version")
+    if transcript is not None:
+        _add("transcript", transcript)
+        if transcript.get("version") != 1:
+            contract_errors.append("unsupported_transcript_version")
+        manifest_id = manifest.get("session_id") if manifest is not None else None
+        transcript_id = transcript.get("sessionId") or transcript.get("session_id")
+        if not isinstance(manifest_id, str) or not manifest_id:
+            contract_errors.append("missing_manifest_session_id")
+        elif transcript_id != manifest_id:
+            contract_errors.append("session_id_mismatch")
+        if not isinstance(transcript.get("messages"), list):
+            contract_errors.append("messages_not_array")
+        origin = transcript.get("origin")
+        if isinstance(origin, dict):
+            _add("transcript.origin", origin)
+        for message in transcript.get("messages") if isinstance(transcript.get("messages"), list) else []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            role_bucket = role if isinstance(role, str) and role else "unknown"
+            _add(f"message.{role_bucket}", message)
+            # `metadata` carries `displayOnly`/`displayRole` (Desktop 0.0.48 writes a
+            # failed request as a display-only assistant error); the parser reads both.
+            for nested_key in ("modelInfo", "metrics", "metadata"):
+                nested = message.get(nested_key)
+                if isinstance(nested, dict):
+                    _add(f"message.{role_bucket}.{nested_key}", nested)
+            for block in message.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                bucket = block_type if isinstance(block_type, str) and block_type else "unknown"
+                _add(f"content.{bucket}", block)
+
+    parse_errors = int(manifest_error is not None) + int(transcript_error is not None) + len(contract_errors)
+    return {
+        "file": str(path),
+        "transcript_file": str(transcript_path) if transcript_error is None else None,
+        "manifest_error": manifest_error,
+        "transcript_error": transcript_error,
+        "contract_errors": contract_errors,
+        "type_counts": {key: type_counts[key] for key in sorted(type_counts)},
+        "type_keys": {key: sorted(type_keys[key]) for key in sorted(type_keys)},
+        "parse_errors": parse_errors,
+    }
+
+
+def _devin_sqlite_latest_session_schema_fingerprint(
+    db_path: Path, *, max_nodes: int
+) -> dict[str, Any]:
+    """
+    Fingerprint the newest visible session in Devin's shared `sessions.db`.
+
+    `message_nodes` is a forest: `sessions.main_chain_id` names the tip of the
+    live conversation and the rest are abandoned retries, so this walks
+    `parent_node_id` back from the tip exactly as the Swift reader does —
+    fingerprinting every row would report drift from branches the app never
+    renders. The walk carries a depth bound because nothing in the schema
+    forbids a cycle.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors = 0
+    node_rows_parsed = 0
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k, v in obj.items():
+            if v is not None:
+                ks.add(k)
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception as exc:
+        return {
+            "file": str(db_path),
+            "type_counts": {},
+            "type_keys": {},
+            "node_rows_parsed": 0,
+            "parse_errors": 1,
+            "error": f"sqlite_open_failed: {exc}",
+        }
+
+    try:
+        session_row = conn.execute(
+            """
+            SELECT id, title, working_directory, backend_type, model, agent_mode,
+                   created_at, last_activity_at, main_chain_id, hidden
+            FROM sessions
+            WHERE hidden = 0
+            ORDER BY last_activity_at DESC
+            LIMIT 1;
+            """
+        ).fetchone()
+        if session_row is None:
+            return {
+                "file": str(db_path),
+                "type_counts": {},
+                "type_keys": {},
+                "node_rows_parsed": 0,
+                "parse_errors": 0,
+                "warning": "no_sessions_found",
+            }
+
+        _add("session", {k: session_row[k] for k in session_row.keys()})
+        session_id = str(session_row["id"])
+        tip = session_row["main_chain_id"]
+        if tip is None:
+            return {
+                "file": str(db_path),
+                "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+                "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+                "node_rows_parsed": 0,
+                "parse_errors": 0,
+                "warning": "session_has_no_main_chain",
+            }
+
+        node_rows = conn.execute(
+            """
+            WITH RECURSIVE chain(node_id, parent_node_id, chat_message, depth) AS (
+                SELECT node_id, parent_node_id, chat_message, 0
+                FROM message_nodes WHERE session_id = ?1 AND node_id = ?2
+              UNION ALL
+                SELECT m.node_id, m.parent_node_id, m.chat_message, c.depth + 1
+                FROM chain c
+                JOIN message_nodes m ON m.session_id = ?1 AND m.node_id = c.parent_node_id
+                WHERE c.depth < 50000
+            )
+            SELECT chat_message FROM chain ORDER BY depth DESC LIMIT ?3;
+            """,
+            (session_id, tip, max(0, int(max_nodes))),
+        ).fetchall()
+
+        for row in node_rows:
+            try:
+                node_obj = json.loads(str(row["chat_message"]))
+            except Exception:
+                parse_errors += 1
+                continue
+            if not isinstance(node_obj, dict):
+                continue
+            _add(_devin_node_bucket(node_obj), node_obj)
+            node_rows_parsed += 1
+    except Exception as exc:
+        parse_errors += 1
+        return {
+            "file": str(db_path),
+            "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+            "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+            "node_rows_parsed": node_rows_parsed,
+            "parse_errors": parse_errors,
+            "error": f"sqlite_query_failed: {exc}",
+        }
+    finally:
+        conn.close()
+
+    return {
+        "file": str(db_path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "node_rows_parsed": node_rows_parsed,
+        "parse_errors": parse_errors,
+    }
+
+
+def _opencode_v2_message_buckets(row_type: str, data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """
+    Schema buckets for one OpenCode 2.x `session_message` row.
+
+    2.x stores a session as typed rows (user, assistant step, shell, system,
+    compaction, idle, ...) whose `data` JSON nests the interesting structure:
+    an assistant step's `content` array holds text/reasoning/tool items and each
+    tool item has a `state` whose shape depends on its status. Bucket those
+    levels separately so drift inside them is visible. Tool `input` and
+    `metadata` stay opaque: they are tool-defined, not OpenCode format.
+    Used for both the live database and the fixture files, so the two sides
+    always share one alphabet.
+    """
+    kind = row_type or "unknown"
+    buckets: list[tuple[str, dict[str, Any]]] = [(f"session_message.{kind}", data)]
+    if kind == "assistant":
+        content = data.get("content")
+        # A wrong-typed `content` (1, "x", {}) shows up in the .shape bucket and
+        # as a required-field violation; it must not raise here.
+        for item in content if isinstance(content, list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type") if isinstance(item.get("type"), str) else "unknown"
+            buckets.append((f"session_message.assistant.content.{item_type}", item))
+            state = item.get("state")
+            if item_type == "tool" and isinstance(state, dict):
+                status = state.get("status") if isinstance(state.get("status"), str) else "unknown"
+                buckets.append((f"session_message.assistant.tool_state.{status}", state))
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict):
+            buckets.append(("session_message.assistant.tokens", tokens))
+        # Structures the app reads for usage and model attribution get their
+        # own buckets, so a rename inside them (cache.read, model.id) is drift
+        # rather than an unchanged outer key.
+        cache = tokens.get("cache") if isinstance(tokens, dict) else None
+        if isinstance(cache, dict):
+            buckets.append(("session_message.assistant.tokens.cache", cache))
+        model = data.get("model")
+        if isinstance(model, dict):
+            buckets.append(("session_message.assistant.model", model))
+    elif kind == "user":
+        files = data.get("files")
+        for item in files if isinstance(files, list) else []:
+            if isinstance(item, dict):
+                buckets.append(("session_message.user.file", item))
+    # Key names alone cannot see a type change: `model` turning from an object
+    # into a string keeps the key and drops the nested bucket, which reads as
+    # "not observed" rather than drift. Each bucket therefore gets a `.shape`
+    # companion whose keys are "<key>:<json type>", so a new type is a new key.
+    shaped: list[tuple[str, dict[str, Any]]] = []
+    for bucket, obj in buckets:
+        shaped.append((bucket, obj))
+        shaped.append((f"{bucket}.shape", {f"{k}:{_json_type_name(v)}": True for k, v in obj.items() if v is not None}))
+    return shaped
+
+
+def _json_type_name(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "null"
+
+
+def _opencode_v2_required_field_violations(row_type: str, data: dict[str, Any]) -> list[str]:
+    """
+    Fields the app's 2.x reader depends on that are missing or of the wrong type.
+
+    Additive drift shows up as unknown keys; a *removed* field does not, because
+    a key absent from a sample only reads as "not observed". These are the
+    fields whose loss breaks transcript rendering or usage accounting, so
+    their absence counts as an unreadable record instead.
+    """
+    problems: list[str] = []
+
+    def number(obj: Any, key: str) -> bool:
+        value = obj.get(key) if isinstance(obj, dict) else None
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    if row_type == "user":
+        if not isinstance(data.get("text"), str):
+            problems.append("user.text")
+    elif row_type == "assistant":
+        model = data.get("model")
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            problems.append("assistant.model.id")
+        content = data.get("content")
+        if not isinstance(content, list):
+            problems.append("assistant.content")
+            content = []
+        tokens = data.get("tokens")
+        # A request the provider refused before generating (finish "error",
+        # provider.free-limit or HTTP 429, no tokens, no content) used no tokens;
+        # the app counts it as no usage (OpenCodeV2MessageAdapter.isFailedRequestWithoutUsage).
+        # Any other error may have been billed and stays a violation.
+        error = data.get("error")
+        status = error.get("status") if isinstance(error, dict) else None
+        failed_without_usage = (
+            isinstance(error, dict)
+            and "tokens" not in data
+            and data.get("finish") == "error"
+            and content == []
+            and (error.get("type") in ("provider.free-limit", "aborted")
+                 or (isinstance(status, (int, float)) and not isinstance(status, bool) and status == 429))
+        )
+        if not failed_without_usage:
+            for key in ("input", "output", "reasoning"):
+                if not number(tokens, key):
+                    problems.append(f"assistant.tokens.{key}")
+            cache = tokens.get("cache") if isinstance(tokens, dict) else None
+            for key in ("read", "write"):
+                if not number(cache, key):
+                    problems.append(f"assistant.tokens.cache.{key}")
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool":
+                continue
+            state = item.get("state")
+            if not isinstance(item.get("id"), str) or not isinstance(item.get("name"), str):
+                problems.append("assistant.tool.id_name")
+            if not isinstance(state, dict) or not isinstance(state.get("status"), str):
+                problems.append("assistant.tool.state.status")
+    return problems
+
+
+def _opencode_v2_store_fingerprint(
+    conn: sqlite3.Connection, db_path: Path, *, max_messages: int
+) -> dict[str, Any] | None:
+    """
+    Fingerprint the newest OpenCode 2.x sessions from session_v2 + session_message.
+
+    Unions the newest _LOCAL_SCHEMA_SAMPLE_COUNT unarchived sessions written
+    by the newest session's version, as the other agents' weekly samples do,
+    so one short session (a one-line prompt) cannot make the sample thin while
+    richer sessions from the same build exist.
+
+    Returns None when the database has no 2.x store, or when its newest v1
+    session is at least as new as its newest 2.x session. OpenCode copies v1
+    sessions into session_v2 with the same time_updated, and that copy can drop
+    assistant steps, so an equal timestamp means "untouched migrated copy" and
+    the original v1 rows are the faithful sample (same rule as the app reader).
+    """
+    tables = {
+        str(r[0])
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table';").fetchall()
+    }
+    if not {"session_v2", "session_message"} <= tables:
+        return None
+    v2_row = conn.execute(
+        "SELECT * FROM session_v2 WHERE time_archived IS NULL ORDER BY time_updated DESC LIMIT 1;"
+    ).fetchone()
+    if v2_row is None:
+        return None
+    # Only sessions the newest session's version wrote, so an older build's
+    # traffic cannot certify (or contaminate) the version being checked.
+    v2_rows = conn.execute(
+        "SELECT * FROM session_v2 WHERE time_archived IS NULL AND version IS ?"
+        " ORDER BY time_updated DESC LIMIT ?;",
+        (v2_row["version"], _LOCAL_SCHEMA_SAMPLE_COUNT),
+    ).fetchall()
+    if "session" in tables:
+        v1_newest = conn.execute(
+            "SELECT MAX(time_updated) FROM session WHERE time_archived IS NULL;"
+        ).fetchone()[0]
+        v2_updated = v2_row["time_updated"]
+        if v1_newest is not None and (v2_updated is None or v1_newest >= v2_updated):
+            return None
+
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors = 0
+    rows_parsed = 0
+    required_field_violations: dict[str, int] = {}
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k, v in obj.items():
+            if v is not None:
+                ks.add(k)
+
+    rows = []
+    for session in v2_rows:
+        _add("session_v2", {k: session[k] for k in session.keys()})
+        rows.extend(conn.execute(
+            "SELECT type, data FROM session_message WHERE session_id = ? ORDER BY seq LIMIT ?;",
+            (session["id"], max(0, int(max_messages))),
+        ).fetchall())
+    for row in rows:
+        try:
+            data = json.loads(str(row["data"]))
+        except Exception:
+            parse_errors += 1
+            continue
+        if not isinstance(data, dict):
+            # Valid JSON that is not an object (`[]`, `null`, a scalar) is as
+            # unreadable to the app as invalid JSON.
+            parse_errors += 1
+            continue
+        violations = _opencode_v2_required_field_violations(str(row["type"]), data)
+        if violations:
+            # The row parses but the reader cannot use it; gate it like a parse error.
+            parse_errors += 1
+            for problem in violations:
+                required_field_violations[problem] = required_field_violations.get(problem, 0) + 1
+        for bucket, obj in _opencode_v2_message_buckets(str(row["type"]), data):
+            _add(bucket, obj)
+        rows_parsed += 1
+    return {
+        "file": str(db_path),
+        "store": "session_v2",
+        "session_version": v2_row["version"],
+        "sampled_sessions": len(v2_rows),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "message_rows_parsed": rows_parsed,
+        # Physical rows, so nested buckets do not inflate the thin-sample and
+        # nonempty-observation gates. A session header alone counts as zero.
+        "parsed_messages": rows_parsed,
+        "part_rows_parsed": 0,
+        "parse_errors": parse_errors,
+        "required_field_violations": dict(sorted(required_field_violations.items())),
+    }
+
+
+def _opencode_sqlite_latest_session_schema_fingerprint(
+    db_path: Path, *, max_messages: int, max_parts: int
+) -> dict[str, Any]:
+    """
+    Fingerprint OpenCode's current SQLite backend (opencode.db).
+
+    The Swift app reads the SQLite tables and maps records into the same logical
+    session/message/part model as the older storage/ JSON tree. Keep these
+    schema buckets normalized to the fixture keys so version checks report real
+    format drift, not storage implementation details like snake_case columns.
+    """
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    parse_errors = 0
+    message_rows_parsed = 0
+    part_rows_parsed = 0
+
+    def _add(event_type: str, obj: dict[str, Any]) -> None:
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        ks = type_keys.setdefault(event_type, set())
+        for k, v in obj.items():
+            if v is not None:
+                ks.add(k)
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception as exc:
+        return {
+            "file": str(db_path),
+            "type_counts": {},
+            "type_keys": {},
+            "message_rows_parsed": 0,
+            "part_rows_parsed": 0,
+            "parse_errors": 1,
+            "error": f"sqlite_open_failed: {exc}",
+        }
+
+    try:
+        # OpenCode 2.x writes new sessions only to session_v2/session_message
+        # (the v1 tables stay, frozen). Sample the store being written.
+        v2_fp = _opencode_v2_store_fingerprint(conn, db_path, max_messages=max_messages)
+        if v2_fp is not None:
+            return v2_fp
+        session_row = conn.execute(
+            """
+            SELECT id, project_id, parent_id, slug, directory, title, version,
+                   time_created, time_updated, summary_additions, summary_deletions,
+                   summary_files, summary_diffs
+            FROM session
+            WHERE time_archived IS NULL
+            ORDER BY time_updated DESC
+            LIMIT 1;
+            """
+        ).fetchone()
+        if session_row is None:
+            return {
+                "file": str(db_path),
+                "type_counts": {},
+                "type_keys": {},
+                "message_rows_parsed": 0,
+                "part_rows_parsed": 0,
+                "parse_errors": 0,
+                "warning": "no_sessions_found",
+            }
+
+        session_id = str(session_row["id"])
+        session_obj: dict[str, Any] = {
+            "id": session_id,
+            "projectID": session_row["project_id"],
+            "parentID": session_row["parent_id"],
+            "slug": session_row["slug"],
+            "directory": session_row["directory"],
+            "title": session_row["title"],
+            "version": session_row["version"],
+            "time": {
+                "created": session_row["time_created"],
+                "updated": session_row["time_updated"],
+            },
+        }
+        if any(session_row[k] is not None for k in ("summary_additions", "summary_deletions", "summary_files")):
+            session_obj["summary"] = {
+                "additions": session_row["summary_additions"],
+                "deletions": session_row["summary_deletions"],
+                "files": session_row["summary_files"],
+            }
+        if session_row["summary_diffs"] is not None:
+            session_obj["summaryDiffs"] = session_row["summary_diffs"]
+        _add("session", session_obj)
+
+        message_rows = conn.execute(
+            """
+            SELECT id, session_id, data
+            FROM message
+            WHERE session_id = ?
+            ORDER BY time_created, id
+            LIMIT ?;
+            """,
+            (session_id, max(0, int(max_messages))),
+        ).fetchall()
+
+        total_parts_budget = max(0, int(max_parts))
+        for msg_row in message_rows:
+            try:
+                msg_obj = json.loads(str(msg_row["data"]))
+            except Exception:
+                parse_errors += 1
+                continue
+            if not isinstance(msg_obj, dict):
+                continue
+            msg_obj = dict(msg_obj)
+            msg_obj.setdefault("id", msg_row["id"])
+            msg_obj.setdefault("sessionID", msg_row["session_id"])
+            role = msg_obj.get("role")
+            event_type = f"message.{role}" if isinstance(role, str) and role else "message"
+            _add(event_type, msg_obj)
+            message_rows_parsed += 1
+
+            if total_parts_budget <= 0:
+                continue
+            part_rows = conn.execute(
+                """
+                SELECT id, message_id, session_id, data
+                FROM part
+                WHERE message_id = ?
+                ORDER BY time_created, id
+                LIMIT ?;
+                """,
+                (msg_row["id"], total_parts_budget),
+            ).fetchall()
+            for part_row in part_rows:
+                try:
+                    part_obj = json.loads(str(part_row["data"]))
+                except Exception:
+                    parse_errors += 1
+                    total_parts_budget -= 1
+                    continue
+                total_parts_budget -= 1
+                if not isinstance(part_obj, dict):
+                    continue
+                part_obj = dict(part_obj)
+                part_obj.setdefault("id", part_row["id"])
+                part_obj.setdefault("messageID", part_row["message_id"])
+                part_obj.setdefault("sessionID", part_row["session_id"])
+                part_type = part_obj.get("type")
+                event_type = f"part.{part_type}" if isinstance(part_type, str) and part_type else "part"
+                _add(event_type, part_obj)
+                part_rows_parsed += 1
+    except Exception as exc:
+        parse_errors += 1
+        return {
+            "file": str(db_path),
+            "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+            "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+            "message_rows_parsed": message_rows_parsed,
+            "part_rows_parsed": part_rows_parsed,
+            "parse_errors": parse_errors,
+            "error": f"sqlite_query_failed: {exc}",
+        }
+    finally:
+        conn.close()
+
+    return {
+        "file": str(db_path),
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(list(type_keys[k])) for k in sorted(type_keys)},
+        "message_rows_parsed": message_rows_parsed,
+        "part_rows_parsed": part_rows_parsed,
+        "parse_errors": parse_errors,
+    }
+
+
+_OPENCLAW_SQLITE_DB_NAME = "openclaw-agent.sqlite"
+# OpenClaw's own bound for a stored frame and for its decoded event
+# (`transcript-payload` and the `transcript_events` CHECK constraint).
+_OPENCLAW_MAX_PAYLOAD_BYTES = 4_194_304
+# Columns AgentSessions/OpenClaw/OpenClawSqliteReader.swift selects. A store
+# missing one cannot be listed or opened, so it counts as unreadable.
+_OPENCLAW_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "session_windows": frozenset(
+        {"session_id", "created_at", "updated_at", "started_at", "ended_at", "model", "display_name"}
+    ),
+    "transcript_events": frozenset({"session_id", "seq", "event_json", "created_at"}),
+}
+# Store tables whose columns are fingerprinted as `sqlite.<table>` buckets, so a
+# new or renamed column reads as storage drift even when no record changed.
+_OPENCLAW_STORE_TABLES = (
+    "session_windows",
+    "transcript_events",
+    "transcript_event_identities",
+    "session_transcript_archives",
+    "session_transcript_cold_archives",
+)
+
+
+def _openclaw_decode_event_payload(event_json: Any, event_zstd: Any, utf8_bytes: Any) -> str:
+    """Return one `transcript_events` record as text, decoding a zstd row.
+
+    OpenClaw 2026.10.5 stores a record either as `event_json` TEXT or, when that
+    saves space, as one zstd frame (level 1, checksum) in `event_zstd` with the
+    decoded size in `event_utf8_bytes`. Raises ValueError for any row the app
+    reader would also refuse.
+    """
+    if event_json is not None:
+        if not isinstance(event_json, str):
+            raise ValueError("event_json is not text")
+        return event_json
+    if not isinstance(event_zstd, (bytes, bytearray)) or not event_zstd:
+        raise ValueError("row has neither event_json nor event_zstd")
+    if not isinstance(utf8_bytes, int) or not 1 <= utf8_bytes <= _OPENCLAW_MAX_PAYLOAD_BYTES:
+        raise ValueError("compressed row has no valid event_utf8_bytes")
+    if len(event_zstd) > _OPENCLAW_MAX_PAYLOAD_BYTES:
+        raise ValueError("compressed row exceeds the payload bound")
+    try:
+        from compression import zstd as _zstd  # Python 3.14+
+    except ImportError as exc:
+        raise ValueError("decoding event_zstd needs Python 3.14+ (compression.zstd)") from exc
+    try:
+        decoded = _zstd.decompress(bytes(event_zstd))
+    except Exception as exc:  # ZstdError, EOFError
+        raise ValueError(f"event_zstd does not decode: {exc}") from exc
+    if len(decoded) != utf8_bytes:
+        raise ValueError("decoded size does not match event_utf8_bytes")
+    if b"\x00" in decoded:
+        raise ValueError("decoded event contains NUL")
+    return decoded.decode("utf-8")
+
+
+def _openclaw_sqlite_schema_fingerprint(
+    db_path: Path,
+    *,
+    session_ids: list[str] | None = None,
+    sample_count: int = _LOCAL_SCHEMA_SAMPLE_COUNT,
+    max_events: int = 5000,
+    sql_script: str | None = None,
+    exclude_prebump: bool = False,
+) -> dict[str, Any]:
+    """Fingerprint OpenClaw's per-agent SQLite store (2026.9+, required 2026.10.5).
+
+    Records in `transcript_events` keep the legacy JSONL shapes, so each decoded
+    record goes through the same nested walk as `_schema_fingerprint_for_agent`
+    and diffs against the same alphabet as the JSONL fixtures. Store columns add
+    `sqlite.<table>` buckets. Samples the given `session_ids`, else the newest
+    `sample_count` sessions by transcript time (`sample_count <= 0` = every
+    session, used for the baseline). `sql_script` builds an in-memory store from
+    a committed `.sql` fixture instead of opening `db_path`. `exclude_prebump`
+    (weekly) applies `_prefer_real_sessions` to the newest sessions.
+    """
+    opaque = frozenset(_NESTED_OPAQUE_KEYS.get("openclaw", ()))
+    shallow = frozenset(_NESTED_SHALLOW_KEYS.get("openclaw", ()))
+    typed = frozenset(_NESTED_TYPED_LIST_KEYS.get("openclaw", ()))
+    type_keys: dict[str, set[str]] = {}
+    type_counts: dict[str, int] = {}
+    required_field_violations: dict[str, int] = {}
+    parse_errors = 0
+    parsed_lines = 0
+    compressed_events = 0
+    result: dict[str, Any] = {"file": str(db_path), "store": "sqlite"}
+
+    def _failed(error: str) -> dict[str, Any]:
+        result.update({
+            "type_counts": {}, "type_keys": {}, "parsed_lines": 0,
+            "parse_errors": 0, "read_failed": True, "error": error,
+        })
+        return result
+
+    try:
+        if sql_script is not None:
+            conn = sqlite3.connect(":memory:")
+            conn.executescript(sql_script)
+        else:
+            conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    except Exception as exc:
+        return _failed(f"sqlite_open_failed: {exc}")
+    try:
+        tables = {
+            str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table';")
+        }
+        for table in _OPENCLAW_STORE_TABLES:
+            if table not in tables:
+                continue
+            columns = {str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}");')}
+            type_keys.setdefault(f"sqlite.{table}", set()).update(columns)
+            for column in sorted(_OPENCLAW_REQUIRED_COLUMNS.get(table, frozenset()) - columns):
+                problem = f"{table}.{column}:missing"
+                required_field_violations[problem] = required_field_violations.get(problem, 0) + 1
+        for table in _OPENCLAW_REQUIRED_COLUMNS:
+            if table not in tables:
+                required_field_violations[f"{table}:missing"] = 1
+        if "schema_meta" in tables:
+            meta = conn.execute(
+                "SELECT schema_version, app_version FROM schema_meta WHERE meta_key = 'primary';"
+            ).fetchone()
+            if meta is not None:
+                result["schema_version"] = meta[0]
+                result["app_version"] = meta[1]
+        if required_field_violations:
+            # The app cannot read this store at all; report it as unreadable
+            # records so the verdict is format drift, not a clean empty sample.
+            result.update({
+                "type_counts": {},
+                "type_keys": {k: sorted(v) for k, v in sorted(type_keys.items())},
+                "parsed_lines": 0,
+                "parse_errors": 1,
+                "required_field_violations": dict(sorted(required_field_violations.items())),
+            })
+            return result
+
+        event_columns = {str(r[1]) for r in conn.execute('PRAGMA table_info("transcript_events");')}
+        payload_select = "event_json, " + (
+            "event_zstd, event_utf8_bytes" if {"event_zstd", "event_utf8_bytes"} <= event_columns else "NULL, NULL"
+        )
+        window_columns = {str(r[1]) for r in conn.execute('PRAGMA table_info("session_windows");')}
+        prebump_ids: set[str] = set()
+        if "session_key" in window_columns:
+            # The prebump driver passes `--session-key agent:<id>:prebump-<uuid>`.
+            prebump_ids = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT session_id FROM session_windows WHERE session_key LIKE '%:prebump-%';"
+                )
+            }
+        prebump_stats: dict[str, int] = {}
+        if session_ids:
+            selected = [str(s) for s in session_ids]
+        else:
+            limit_clause = "" if sample_count <= 0 else (
+                f" LIMIT {int(sample_count) + (len(prebump_ids) if exclude_prebump else 0)}"
+            )
+            selected = [
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT session_id, MAX(created_at) AS t FROM transcript_events "
+                    f"GROUP BY session_id ORDER BY t DESC, session_id{limit_clause};"
+                )
+            ]
+            if exclude_prebump and sample_count > 0:
+                selected, prebump_stats = _prefer_real_sessions(
+                    selected, int(sample_count), lambda sid: sid in prebump_ids
+                )
+        newest_ms: int | None = None
+        for session_id in selected:
+            rows = conn.execute(
+                f"SELECT {payload_select}, created_at FROM transcript_events "
+                "WHERE session_id = ? ORDER BY seq LIMIT ?;",
+                (session_id, max(0, int(max_events))),
+            ).fetchall()
+            for event_json, event_zstd, utf8_bytes, created_at in rows:
+                parsed_lines += 1
+                if isinstance(created_at, int) and (newest_ms is None or created_at > newest_ms):
+                    newest_ms = created_at
+                if event_json is None:
+                    compressed_events += 1
+                    type_keys.setdefault("sqlite.transcript_events.payload", set()).add("event_zstd")
+                else:
+                    type_keys.setdefault("sqlite.transcript_events.payload", set()).add("event_json")
+                try:
+                    obj = json.loads(_openclaw_decode_event_payload(event_json, event_zstd, utf8_bytes))
+                except (ValueError, UnicodeDecodeError):
+                    parse_errors += 1
+                    continue
+                if not isinstance(obj, dict):
+                    parse_errors += 1
+                    continue
+                t = obj.get("type")
+                event_type = t if isinstance(t, str) and t else "<missing-type>"
+                type_counts[event_type] = type_counts.get(event_type, 0) + 1
+                _nested_bucket_walk(
+                    event_type, obj, type_keys, 0, _NESTED_FINGERPRINT_MAX_DEPTH, opaque, typed, shallow
+                )
+        result["sampled_sessions"] = len(selected)
+        result["sampled_session_ids"] = list(selected)
+        if "session_key" in window_columns:
+            # Real-home prebump runs land in this store as the newest sessions. The
+            # weekly (`exclude_prebump`) skips them while enough real sessions exist;
+            # the count says how many still had to fill the sample.
+            result["sampled_prebump_sessions"] = sum(1 for sid in selected if sid in prebump_ids)
+            result["skipped_prebump_sessions"] = prebump_stats.get("skipped_prebump_sessions", 0)
+        if newest_ms is not None:
+            # The database file's mtime moves on any write (memory index, auth
+            # state), so freshness uses the newest sampled transcript event.
+            result["logical_mtime_epoch"] = newest_ms / 1000.0
+    except sqlite3.Error as exc:
+        conn.close()
+        return _failed(f"sqlite_query_failed: {exc}")
+    conn.close()
+    result.update({
+        "type_counts": {k: type_counts[k] for k in sorted(type_counts)},
+        "type_keys": {k: sorted(v) for k, v in sorted(type_keys.items())},
+        "parsed_lines": parsed_lines,
+        "parse_errors": parse_errors,
+        "compressed_events": compressed_events,
+        "required_field_violations": {},
+        "nested_depth": _NESTED_FINGERPRINT_MAX_DEPTH,
+    })
+    return result
+
+
+def _openclaw_sqlite_databases(roots: list[str], db_globs: list[str]) -> list[Path]:
+    """Every per-agent OpenClaw store under the configured state roots, newest first."""
+    found: dict[str, Path] = {}
+    for root in roots:
+        base = _expand_path(root)
+        if not str(root).strip() or "$" in str(base) or not base.is_dir():
+            continue
+        for pattern in db_globs:
+            for candidate in base.glob(pattern):
+                if candidate.name == _OPENCLAW_SQLITE_DB_NAME and candidate.is_file():
+                    # First root wins: ~/.clawdbot is often a symlink to ~/.openclaw.
+                    found.setdefault(str(candidate.resolve()), candidate)
+
+    def _mtime(p: Path) -> float:
+        newest = 0.0
+        for sibling in (p, p.with_name(p.name + "-wal")):
+            try:
+                newest = max(newest, sibling.stat().st_mtime)
+            except OSError:
+                pass
+        return newest
+
+    return sorted(found.values(), key=_mtime, reverse=True)
+
+
+def _openclaw_weekly_sqlite_fingerprint(local_schema_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Weekly OpenClaw sample from the SQLite store; None when no store exists (legacy JSONL)."""
+    roots = [str(r) for r in (local_schema_cfg.get("roots") or []) if isinstance(r, str)]
+    db_globs = [str(g) for g in (local_schema_cfg.get("db_globs") or []) if isinstance(g, str)]
+    databases = _openclaw_sqlite_databases(roots, db_globs)
+    if not databases:
+        return None
+    max_events = int(local_schema_cfg.get("max_events") or 5000)
+    fingerprints = [
+        _openclaw_sqlite_schema_fingerprint(db, max_events=max_events, exclude_prebump=True)
+        for db in databases
+    ]
+    readable = [fp for fp in fingerprints if not _sample_read_failed(fp)]
+    failed = [fp for fp in fingerprints if _sample_read_failed(fp)]
+    if not readable:
+        lead = dict(fingerprints[0])
+        lead["read_failed_files"] = [str(fp.get("file")) for fp in failed]
+        return lead
+    lead = dict(readable[0])
+    if len(readable) > 1:
+        lead["type_keys"] = _merge_type_keys(readable)
+        merged_counts: dict[str, int] = {}
+        for fp in readable:
+            for t, n in (fp.get("type_counts") or {}).items():
+                merged_counts[t] = merged_counts.get(t, 0) + int(n)
+        lead["type_counts"] = dict(sorted(merged_counts.items()))
+        lead["parsed_lines"] = sum(int(fp.get("parsed_lines") or 0) for fp in readable)
+        for key in ("sampled_prebump_sessions", "skipped_prebump_sessions"):
+            lead[key] = sum(int(fp.get(key) or 0) for fp in readable)
+        _merge_sampled_parse_errors(lead, readable)
+        newest = [fp.get("logical_mtime_epoch") for fp in readable if isinstance(fp.get("logical_mtime_epoch"), float)]
+        if newest:
+            lead["logical_mtime_epoch"] = max(newest)
+    lead["sampled_files"] = [str(fp.get("file")) for fp in readable]
+    if failed:
+        # A discovered store that cannot be inspected fails the whole sample, even
+        # when another store reads cleanly: dropping it could hide a format change
+        # behind a baseline match. The readable stores' keys stay for diagnostics.
+        lead["read_failed"] = True
+        lead["read_failed_files"] = [str(fp.get("file")) for fp in failed]
+        lead["error"] = "; ".join(
+            f"{fp.get('file')}: {fp.get('error') or 'read_failed'}" for fp in failed
+        )
+    return lead
+
+
+def _baseline_type_keys_for_agent(agent_name: str, baseline_paths: list[str]) -> dict[str, list[str]]:
+    # Baseline should represent the current "normal" format; ignore schema_drift fixtures.
+    filtered = [p for p in baseline_paths if isinstance(p, str) and p and "schema_drift" not in p]
+    fps: list[dict[str, Any]] = []
+
+    if agent_name in ("codex", "claude", "copilot", "deepseek_harness", "droid", "pi", "qwen"):
+        for p in filtered:
+            if not p.endswith(".jsonl") and not (
+                agent_name == "deepseek_harness" and p.endswith(".jsonl.zstd")
+            ):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_schema_fingerprint_for_agent(agent_name, bp, max_lines=5000))
+    elif agent_name == "kimi":
+        # Kimi needs the nested loop-event fingerprint: the fixtures' renderable
+        # content lives under `context.append_loop_event` -> `event`, so a plain
+        # top-level baseline would leave every nested addition undetectable.
+        for p in filtered:
+            if not p.endswith(".jsonl"):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_kimi_wire_schema_fingerprint(bp, max_lines=5000))
+    elif agent_name == "antigravity":
+        # Antigravity has two on-disk formats: legacy markdown brain artifacts and
+        # the current antigravity-cli JSONL transcripts. Fingerprint each fixture by
+        # its type so the baseline covers both and the JSONL drift detector works.
+        for p in filtered:
+            bp = Path(p)
+            if not bp.exists():
+                continue
+            if p.endswith(".md"):
+                fps.append(_antigravity_markdown_schema_fingerprint(bp, max_lines=5000))
+            elif p.endswith(".jsonl"):
+                fps.append(_schema_fingerprint_for_agent(agent_name, bp, max_lines=5000))
+    elif agent_name == "hermes":
+        for p in filtered:
+            if not p.endswith(".json"):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_hermes_session_json_schema_fingerprint(bp, max_messages=5000))
+    elif agent_name == "devin":
+        # The fixture is a JSON projection of the shared database's records, so
+        # the baseline reads it directly while the live pass normalizes SQLite
+        # rows into the same buckets. Same split as opencode.
+        for p in filtered:
+            if not p.endswith(".json"):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_devin_fixture_file_schema_fingerprint(bp))
+    elif agent_name == "fx":
+        # fx's live store is JSON in the same shape as the fixture, so baseline
+        # and live share one fingerprint — no projection to keep in step. The
+        # baseline unions both layouts: schema-3 `checkpoint.json` fixtures and
+        # schema-4 `events.jsonl` fixtures (whose sidecars sit beside them).
+        for p in filtered:
+            # Matrix records fixtures as "…/checkpoint.json (+ session.json, display.json)"
+            # so the sidecar note must be stripped before the path check.
+            base = p.split(" (")[0].strip()
+            if not (base.endswith("checkpoint.json") or base.endswith("events.jsonl")):
+                continue
+            bp = Path(base)
+            if bp.exists():
+                fps.append(_fx_session_schema_fingerprint(bp))
+    elif agent_name == "cline":
+        # The matrix lists both files in each fixture pair. The manifest is the
+        # canonical session file; its fingerprinter opens the adjacent transcript.
+        for p in filtered:
+            base = p.split(" (")[0].strip()
+            if not base.endswith(".json") or base.endswith(".messages.json"):
+                continue
+            bp = Path(base)
+            if bp.exists():
+                fps.append(_cline_session_schema_fingerprint(bp))
+    elif agent_name == "opencode":
+        for p in filtered:
+            if not p.endswith(".json"):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_opencode_fixture_file_schema_fingerprint(bp))
+    elif agent_name == "openclaw":
+        for p in filtered:
+            bp = Path(p)
+            if not bp.exists():
+                continue
+            if p.endswith(".jsonl"):
+                fps.append(_schema_fingerprint_for_agent(agent_name, bp, max_lines=5000))
+            elif p.endswith(".sql"):
+                # The 2026.10.5 SQLite store, committed as a reviewable SQL script and
+                # built in memory. Its records share the JSONL alphabet above.
+                fps.append(_openclaw_sqlite_schema_fingerprint(
+                    bp, sample_count=0, sql_script=bp.read_text(encoding="utf-8")))
+    elif agent_name == "cursor":
+        for p in filtered:
+            if not p.endswith(".jsonl"):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_cursor_transcript_schema_fingerprint(bp, max_lines=5000))
+    elif agent_name == "grok":
+        # Keyed off chat_history.jsonl only: the fingerprinter picks up the sibling
+        # summary.json itself, so listing the summary fixture separately would just
+        # fingerprint it twice.
+        for p in filtered:
+            if not p.endswith("chat_history.jsonl"):
+                continue
+            bp = Path(p)
+            if bp.exists():
+                fps.append(_grok_session_schema_fingerprint(bp, max_lines=5000))
+
+    return _merge_type_keys(fps)
+
+
+def _merge_type_keys(fingerprints: list[dict[str, Any]]) -> dict[str, list[str]]:
+    merged: dict[str, set[str]] = {}
+    for fp in fingerprints:
+        tk = fp.get("type_keys") if isinstance(fp, dict) else None
+        if not isinstance(tk, dict):
+            continue
+        for t, keys in tk.items():
+            if not isinstance(t, str):
+                continue
+            if not isinstance(keys, list):
+                continue
+            bucket = merged.setdefault(t, set())
+            for k in keys:
+                if isinstance(k, str):
+                    bucket.add(k)
+    return {t: sorted(list(keys)) for t, keys in sorted(merged.items())}
+
+
+def _schema_diff(
+    *,
+    observed_type_keys: dict[str, list[str]],
+    baseline_type_keys: dict[str, list[str]],
+    observed_event_count: int | None = None,
+) -> dict[str, Any]:
+    observed_types = set(observed_type_keys.keys())
+    baseline_types = set(baseline_type_keys.keys())
+    unknown_types = sorted(observed_types - baseline_types)
+    missing_types = sorted(baseline_types - observed_types)
+
+    unknown_keys: dict[str, list[str]] = {}
+    missing_keys: dict[str, list[str]] = {}
+    for t in sorted(observed_types | baseline_types):
+        o = set(observed_type_keys.get(t, []))
+        b = set(baseline_type_keys.get(t, []))
+        extra = sorted(o - b)
+        miss = sorted(b - o)
+        if extra:
+            unknown_keys[t] = extra
+        if miss:
+            missing_keys[t] = miss
+
+    unknown_only_is_empty = (not unknown_types and not unknown_keys)
+    # How much of the known format this sample actually exercised. A session too thin
+    # to contain most baseline types cannot evidence "no drift" — it just had nothing
+    # to drift. Without this, a 4-line hello session reports a clean bill of health
+    # and silently outranks a rich session that showed real unknown types.
+    coverage_ratio = (
+        len(observed_types & baseline_types) / len(baseline_types) if baseline_types else None
+    )
+    return {
+        "unknown_types": unknown_types,
+        "missing_types": missing_types,
+        "unknown_keys": unknown_keys,
+        "missing_keys": missing_keys,
+        "unknown_only_is_empty": unknown_only_is_empty,
+        "baseline_type_count": len(baseline_types),
+        "observed_baseline_type_count": len(observed_types & baseline_types),
+        "coverage_ratio": coverage_ratio,
+        "observed_event_count": observed_event_count,
+        "is_empty": (not unknown_types and not missing_types and not unknown_keys and not missing_keys),
+    }
+
+
+def _sample_read_failed(fingerprint: dict[str, Any] | None) -> bool:
+    """
+    True when the sample's store or file could not be read at all (SQLite open
+    or query failure, OS read error), as opposed to records that were read and
+    found unreadable. Fingerprinters mark it with `read_failed`, or with an
+    `error` naming a SQLite open/query failure.
+    """
+    if not isinstance(fingerprint, dict):
+        return False
+    if fingerprint.get("read_failed") is True:
+        return True
+    error = fingerprint.get("error")
+    return isinstance(error, str) and error.startswith(("sqlite_open_failed", "sqlite_query_failed"))
+
+
+def _weekly_schema_matches(schema_diff: dict[str, Any], fingerprint: dict[str, Any]) -> bool:
+    """
+    Weekly schema verdict: no unknown types/keys AND no unreadable records.
+
+    Unreadable records can hide drift, so a sample with parse errors is not
+    schema-clean whatever its readable keys say. Records the count in
+    `schema_diff["parse_errors"]`. A fingerprint with no integer count is
+    treated as zero errors, as before.
+
+    A store that could not be read at all is a monitoring failure, not a
+    format finding: it is recorded as `schema_diff["read_failed"]` (with the
+    fingerprint's `error`) instead of as parse errors, so the compatibility
+    verdict reports monitoring_broken rather than format drift.
+    """
+    if _sample_read_failed(fingerprint):
+        schema_diff["parse_errors"] = 0
+        schema_diff["read_failed"] = True
+        schema_diff["read_error"] = fingerprint.get("error")
+        return False
+    raw = fingerprint.get("parse_errors")
+    parse_errors = raw if isinstance(raw, int) and raw >= 0 else 0
+    schema_diff["parse_errors"] = parse_errors
+    return bool(schema_diff.get("unknown_only_is_empty")) and parse_errors == 0
+
+
+def _required_schema_buckets_for(prebump_cfg: dict[str, Any], fingerprint: dict[str, Any]) -> list[str] | None:
+    """
+    Required prebump buckets for the store the fresh session was written to.
+
+    `required_schema_buckets_by_store` maps a fingerprint's `store` to its
+    list; a fingerprint without `store` uses the "legacy" entry. OpenCode needs
+    this because one driver serves 1.x (message/part rows) and 2.x
+    (session_message rows), whose bucket names share nothing. Without the map,
+    `required_schema_buckets` applies as before.
+    """
+    by_store = prebump_cfg.get("required_schema_buckets_by_store")
+    if isinstance(by_store, dict):
+        store = fingerprint.get("store") if isinstance(fingerprint.get("store"), str) else "legacy"
+        selected = by_store.get(store)
+        if isinstance(selected, list):
+            return list(selected)
+        # Fail closed: a store the config does not know must not drop the
+        # requirement to nothing. This bucket name can never be observed, so
+        # the gate reports it as missing and the prebump fails.
+        return [f"<unmapped store: {store}>"]
+    return prebump_cfg.get("required_schema_buckets")
+
+
+def _set_sampled_total_parsed_lines(merged: dict[str, Any], sampled: list[dict[str, Any]]) -> None:
+    """Record the union's record count for `_observed_event_count`.
+
+    The union starts from the lead fingerprint, whose `parsed_lines` counts one
+    session; the thin-sample gate read that, so a five-session union of 16-event
+    sessions scored as 16 events.
+    """
+    counts = [fp.get("parsed_lines") for fp in sampled]
+    if counts and all(isinstance(n, int) for n in counts):
+        merged["sampled_total_parsed_lines"] = sum(counts)
+
+
+def _merge_sampled_parse_errors(merged: dict[str, Any], sampled: list[dict[str, Any]]) -> None:
+    """
+    Sum parse errors over every sampled fingerprint into `merged`.
+
+    Multi-session sampling starts from the first fingerprint's dict, so without
+    this an unreadable record in any later sample would vanish from the union
+    and the weekly gate would see zero. Per-file counts are kept as evidence.
+    """
+    per_file: dict[str, int] = {}
+    total = 0
+    for fingerprint in sampled:
+        raw = fingerprint.get("parse_errors")
+        count = raw if isinstance(raw, int) and raw >= 0 else 0
+        total += count
+        if count:
+            per_file[str(fingerprint.get("file"))] = count
+    merged["parse_errors"] = total
+    merged["parse_errors_by_file"] = per_file
+    # A read failure in any sample is a read failure of the union.
+    failed = [fp for fp in sampled if _sample_read_failed(fp)]
+    if failed:
+        merged["read_failed"] = True
+        merged.setdefault("error", failed[0].get("error"))
+
+
+def _prebump_may_replace_weekly_verdict(weekly_schema_diff: dict[str, Any] | None) -> bool:
+    """
+    A clean prebump proves the CLI writes parseable sessions; it says nothing
+    about unreadable records in the sessions weekly just sampled. When the
+    weekly sample has parse errors, keep its failing verdict instead of
+    substituting the older clean prebump result.
+    """
+    if not isinstance(weekly_schema_diff, dict):
+        return True
+    raw = weekly_schema_diff.get("parse_errors")
+    return not (isinstance(raw, int) and raw > 0)
+
+
+def _prebump_schema_check(
+    *,
+    fingerprint: dict[str, Any],
+    baseline_type_keys: dict[str, list[str]],
+    required_schema_buckets: list[str] | None = None,
+    required_evidence_buckets: list[str] | None = None,
+    agent_name: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Require valid, nonempty real-session evidence before a prebump can pass."""
+    if agent_name == "deepseek_harness":
+        schema_diff = _dsh_schema_diff(
+            fingerprint=fingerprint,
+            baseline_type_keys=baseline_type_keys,
+        )
+    else:
+        schema_diff = _schema_diff(
+            observed_type_keys=fingerprint.get("type_keys") or {},
+            baseline_type_keys=baseline_type_keys,
+            observed_event_count=_observed_event_count(fingerprint),
+        )
+    raw_parse_errors = fingerprint.get("parse_errors", 0)
+    parse_errors = raw_parse_errors if isinstance(raw_parse_errors, int) and raw_parse_errors >= 0 else 1
+    observed_count = _observed_event_count(fingerprint)
+    observed_buckets = set((fingerprint.get("type_keys") or {}).keys())
+    observed_counts = fingerprint.get("type_counts")
+    if isinstance(observed_counts, dict):
+        observed_buckets.update(observed_counts.keys())
+    required = sorted({item for item in (required_schema_buckets or []) if isinstance(item, str) and item})
+    missing_required = sorted(set(required) - observed_buckets)
+    evidence_buckets = fingerprint.get("evidence_buckets")
+    if not isinstance(evidence_buckets, dict):
+        evidence_buckets = {}
+    required_evidence = sorted({
+        item
+        for item in (required_evidence_buckets or [])
+        if isinstance(item, str) and item
+    })
+    missing_required_evidence = sorted(
+        item for item in required_evidence if evidence_buckets.get(item) is not True
+    )
+    schema_diff["parse_errors"] = parse_errors
+    schema_diff["required_schema_buckets"] = required
+    schema_diff["missing_required_schema_buckets"] = missing_required
+    schema_diff["evidence_buckets"] = {
+        key: evidence_buckets.get(key) is True for key in required_evidence
+    }
+    schema_diff["required_evidence_buckets"] = required_evidence
+    schema_diff["missing_required_evidence_buckets"] = missing_required_evidence
+    schema_diff["observation_nonempty"] = observed_count is not None and observed_count > 0
+    schema_diff["baseline_present"] = bool(baseline_type_keys)
+    matches = (
+        bool(baseline_type_keys)
+        and parse_errors == 0
+        and observed_count is not None
+        and observed_count > 0
+        and not missing_required
+        and not missing_required_evidence
+        and bool(schema_diff.get("unknown_only_is_empty"))
+    )
+    return schema_diff, matches
+
+
+def _dsh_schema_diff(
+    *,
+    fingerprint: dict[str, Any],
+    baseline_type_keys: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Compare DSH keys while separating app-known coverage gaps from drift."""
+    observed_type_keys = fingerprint.get("type_keys") or {}
+    diff = _schema_diff(
+        observed_type_keys=observed_type_keys,
+        baseline_type_keys=baseline_type_keys,
+        observed_event_count=_observed_event_count(fingerprint),
+    )
+    known_event_types = set(fingerprint.get("catalog_known_event_types") or [])
+    accepted_ignorable_types = set(fingerprint.get("accepted_unknown_ignorable_types") or [])
+    baseline_event_types = {bucket for bucket in baseline_type_keys if "." not in bucket}
+
+    unknown_keys: dict[str, list[str]] = {}
+    supported_shapes: dict[str, list[str]] = {}
+    for bucket, keys in diff["unknown_keys"].items():
+        event_type = bucket.split(".", 1)[0]
+        allowed = _DSH_SUPPORTED_UNBASELINED_KEYS.get(bucket)
+        if event_type in accepted_ignorable_types and bucket == event_type:
+            allowed = {"type", "seq", "time", "data", "ignorable", "sourceEventSeqs", "surfaceOp"}
+        if event_type == "session":
+            allowed = _DSH_SUPPORTED_UNBASELINED_KEYS["session"]
+        if allowed is None or (event_type not in known_event_types and event_type not in accepted_ignorable_types and event_type != "session"):
+            unknown_keys[bucket] = keys
+            continue
+        admitted = sorted(set(keys) & allowed)
+        remaining = sorted(set(keys) - allowed)
+        if admitted:
+            supported_shapes[bucket] = admitted
+        if remaining:
+            unknown_keys[bucket] = remaining
+
+    unknown_types: list[str] = []
+    for bucket in diff["unknown_types"]:
+        event_type = bucket.split(".", 1)[0]
+        if bucket in supported_shapes and not unknown_keys.get(bucket):
+            continue
+        allowed = _DSH_SUPPORTED_UNBASELINED_KEYS.get(bucket)
+        if event_type in accepted_ignorable_types and bucket == event_type:
+            allowed = {"type", "seq", "time", "data", "ignorable", "sourceEventSeqs", "surfaceOp"}
+        if event_type == "session":
+            allowed = _DSH_SUPPORTED_UNBASELINED_KEYS["session"]
+        if allowed is not None and (
+            event_type in known_event_types or event_type in accepted_ignorable_types or event_type == "session"
+        ):
+            extra = set(observed_type_keys.get(bucket, [])) - set(baseline_type_keys.get(bucket, []))
+            unexpected = extra - allowed
+            if not unexpected:
+                supported_shapes[bucket] = sorted(extra)
+                continue
+        unknown_types.append(bucket)
+
+    unsupported_required_event_types = sorted(
+        set(fingerprint.get("unsupported_required_event_types") or [])
+    )
+    unknown_types = sorted(set(unknown_types) | set(unsupported_required_event_types))
+    diff["unknown_types"] = unknown_types
+    diff["unknown_keys"] = unknown_keys
+    diff["unknown_only_is_empty"] = not unknown_types and not unknown_keys
+    diff["is_empty"] = (
+        not unknown_types and not diff["missing_types"] and not unknown_keys and not diff["missing_keys"]
+    )
+    diff["known_but_unbaselined_types"] = sorted(known_event_types - baseline_event_types)
+    diff["accepted_unknown_ignorable_types"] = sorted(accepted_ignorable_types)
+    diff["unsupported_required_event_types"] = unsupported_required_event_types
+    diff["supported_unbaselined_shapes"] = supported_shapes
+    diff["catalog_known_event_count"] = len(_dsh_app_event_catalog().get(fingerprint.get("generation"), set()))
+    diff["observed_catalog_known_event_count"] = len(known_event_types)
+    return diff
+
+
+def _run_probe_script(probe: dict[str, Any], out_dir: Path, verbose: bool) -> dict[str, Any]:
+    label = probe.get("label") or "probe"
+    argv = probe.get("argv")
+    timeout = int(probe.get("timeout_seconds") or 60)
+    parse_kind = probe.get("parse")
+
+    if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+        return {"label": label, "ok": False, "error": "invalid_probe_argv"}
+
+    argv = list(argv)
+
+    # Special case: droid probe expects an output directory appended after "--out"
+    if argv and argv[-1] == "--out":
+        argv.append(str(out_dir / "droid"))
+
+    rc, stdout, stderr = _run_cmd(argv, timeout=timeout)
+
+    (out_dir / f"{label}.argv.json").write_text(json.dumps(argv, indent=2) + "\n", encoding="utf-8")
+    (out_dir / f"{label}.stdout.txt").write_text(stdout + "\n", encoding="utf-8")
+    (out_dir / f"{label}.stderr.txt").write_text(stderr + "\n", encoding="utf-8")
+
+    parsed: dict[str, Any] | None = None
+    if parse_kind == "claude_usage_json" or parse_kind == "codex_status_json":
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except Exception:
+            parsed = None
+    elif parse_kind == "claude_status_json":
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except Exception:
+            parsed = None
+    elif parse_kind == "droid_schema_report":
+        # The probe script itself writes schema_report.json in its output directory.
+        report_path = out_dir / "droid" / "schema_report.json"
+        if report_path.exists():
+            try:
+                parsed = json.loads(report_path.read_text(encoding="utf-8"))
+            except Exception:
+                parsed = None
+    elif parse_kind == "capture_latest_sessions":
+        # capture_latest_agent_sessions.py prints paths; we just record stdout.
+        parsed = {"captured": stdout.splitlines()}
+    elif parse_kind == "cursor_sqlite_json":
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except Exception:
+            parsed = None
+    elif parse_kind == "grok_update_json":
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except Exception:
+            parsed = None
+
+    ok = rc == 0
+    if parse_kind == "claude_usage_json":
+        ok = ok and isinstance(parsed, dict) and bool(parsed.get("ok") is True)
+    if parse_kind == "codex_status_json":
+        ok = ok and isinstance(parsed, dict)
+    if parse_kind == "claude_status_json":
+        ok = ok and isinstance(parsed, dict) and bool(parsed.get("ok") is True)
+    if parse_kind == "cursor_sqlite_json":
+        ok = ok and isinstance(parsed, dict) and bool(parsed.get("ok") is True)
+    if parse_kind == "grok_update_json":
+        # Health is "did the CLI answer with a parseable update report", NOT the
+        # exit code: a checker that exits non-zero to signal "update available"
+        # would otherwise flip the agent to monitoring_broken/severity=high at
+        # exactly the moment a new build ships — when the signal matters most.
+        ok = isinstance(parsed, dict) and parsed.get("latestVersion") is not None
+
+    if verbose and not ok:
+        print(f"Probe {label} failed (exit={rc}).", file=sys.stderr)
+
+    result: dict[str, Any] = {
+        "label": label,
+        "argv": argv,
+        "exit_code": rc,
+        "ok": ok,
+        "parse": parse_kind,
+        "parsed": parsed,
+        "stdout_file": str(out_dir / f"{label}.stdout.txt"),
+        "stderr_file": str(out_dir / f"{label}.stderr.txt"),
+    }
+    # Carried through so version reconciliation stays config-driven: the probe entry
+    # declares which key of its own JSON is the vendor's authoritative "latest",
+    # rather than agent_watch hard-coding another `if agent_name == ...` branch.
+    latest_version_key = probe.get("latest_version_key")
+    if isinstance(latest_version_key, str) and latest_version_key:
+        result["latest_version_key"] = latest_version_key
+    return result
+
+
+def _fetch_upstream(source: dict[str, Any], timeout: int) -> dict[str, Any]:
+    kind = source.get("kind")
+    if kind == "github_latest_release_including_prerelease":
+        repo = source.get("repo")
+        if not isinstance(repo, str) or not repo:
+            return {"ok": False, "error": "missing_repo"}
+        url = f"https://api.github.com/repos/{repo}/releases?per_page=20"
+        try:
+            payload = _http_get_json(url, timeout=timeout)
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": "fetch_failed", "detail": str(exc), "url": url}
+        if not isinstance(payload, list):
+            return {"ok": False, "error": "invalid_response", "url": url}
+        releases = [
+            item for item in payload
+            if isinstance(item, dict) and item.get("draft") is not True
+        ]
+        if not releases:
+            return {"ok": False, "error": "no_release", "url": url}
+        obj = max(releases, key=lambda item: str(item.get("published_at") or item.get("created_at") or ""))
+        tag = obj.get("tag_name")
+        name = obj.get("name")
+        raw = tag if isinstance(tag, str) else (name if isinstance(name, str) else "")
+        return {
+            "ok": True,
+            "version": _extract_dsh_semver(raw) or None,
+            "url": url,
+            "html_url": obj.get("html_url"),
+            "tag_name": tag,
+            "name": name,
+            "body": obj.get("body"),
+            "published_at": obj.get("published_at"),
+            "prerelease": obj.get("prerelease") is True,
+        }
+
+    if kind == "github_latest_release":
+        repo = source.get("repo")
+        if not isinstance(repo, str) or not repo:
+            return {"ok": False, "error": "missing_repo"}
+        url = f"https://api.github.com/repos/{repo}/releases/latest"
+        try:
+            obj = _http_get_json(url, timeout=timeout)
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": "fetch_failed", "detail": str(exc), "url": url}
+        if not isinstance(obj, dict):
+            return {"ok": False, "error": "invalid_response", "url": url}
+        tag = obj.get("tag_name")
+        name = obj.get("name")
+        body = obj.get("body")
+        # Most projects put their semantic version in the tag. Hermes is a valid
+        # counterexample: its release tags are calendar versions (v2026.9.14), while
+        # the release name carries the CLI version (Hermes Agent v0.21.3). Let a
+        # source opt into the name without teaching the monitor an agent-specific
+        # exception or comparing two unrelated version families.
+        version_source = source.get("version_source", "tag_name")
+        if version_source == "name":
+            raw = name if isinstance(name, str) else ""
+        elif version_source == "tag_name":
+            raw = tag if isinstance(tag, str) else (name if isinstance(name, str) else "")
+        else:
+            return {
+                "ok": False,
+                "error": "invalid_version_source",
+                "detail": f"unsupported GitHub release version_source: {version_source}",
+                "url": url,
+            }
+        ver = _extract_semver(raw) or None
+        return {
+            "ok": True,
+            "version": ver,
+            "url": url,
+            "html_url": obj.get("html_url"),
+            "tag_name": tag,
+            "name": name,
+            "body": body,
+            "published_at": obj.get("published_at"),
+        }
+
+    if kind == "npm_latest":
+        pkg = source.get("package")
+        if not isinstance(pkg, str) or not pkg:
+            return {"ok": False, "error": "missing_package"}
+        encoded = urllib.parse.quote(pkg, safe="")
+        url = f"https://registry.npmjs.org/{encoded}/latest"
+        try:
+            obj = _http_get_json(url, timeout=timeout)
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": "fetch_failed", "detail": str(exc), "url": url}
+        ver = obj.get("version") if isinstance(obj, dict) else None
+        ver_s = ver if isinstance(ver, str) else None
+        ver_s = _extract_semver(ver_s or "") or ver_s
+        return {"ok": True, "version": ver_s, "url": url}
+
+    if kind == "url_regex_semver_max":
+        url = source.get("url")
+        pattern = source.get("pattern")
+        if not isinstance(url, str) or not isinstance(pattern, str):
+            return {"ok": False, "error": "missing_url_or_pattern"}
+        try:
+            text = _http_get_text(url, timeout=timeout)
+        except urllib.error.URLError as exc:
+            return {"ok": False, "error": "fetch_failed", "detail": str(exc), "url": url}
+        rx = re.compile(pattern)
+        versions: list[Semver] = []
+        for m in rx.finditer(text):
+            raw = m.group(1) if m.groups() else m.group(0)
+            v = Semver.parse(raw)
+            if v:
+                versions.append(v)
+        if not versions:
+            return {"ok": False, "error": "no_versions_found", "url": url}
+        best = max(versions)
+        rejected_versions = source.get("reject_versions")
+        if isinstance(rejected_versions, list) and str(best) in rejected_versions:
+            return {
+                "ok": False,
+                "error": "rejected_version",
+                "detail": f"source matched rejected version {best}",
+                "url": url,
+            }
+        return {"ok": True, "version": str(best), "url": url}
+
+    return {"ok": False, "error": "unsupported_source_kind", "kind": kind}
+
+
+def _reconcile_latest_version_from_probes(
+    *,
+    upstream: str | None,
+    probe_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Reconcile the configured upstream version with the version a CLI reports itself.
+
+    Some agents ship no registry we can trust for "latest". Grok is distributed as a
+    native x.ai binary through the `grok-build` Homebrew cask, and that cask lags an
+    x.ai release — the config note for it already claimed the `grok_update_check`
+    probe made the report "carry the authoritative number", but nothing downstream
+    ever read `latestVersion`, so every compatibility decision kept running against
+    the stale cask value.
+
+    The rule is MAX, not replace. Replacing outright is unsafe in one direction: a
+    CLI's own updater answers for the channel that CLI is pinned to (`"channel":
+    "stable"` in Grok's payload), and a pinned, cached or broken checker reporting a
+    LOWER number would then hide a newer published release and quietly make an agent
+    look current. Taking the higher of the two can only ever move
+    `upstream_newer_than_verified` toward true, so reconciliation can add an alarm
+    but never silence one.
+
+    Disagreement in either direction is recorded — a probe that reports lower than
+    the registry is itself the interesting signal (pinned channel, stale cache) and
+    is not something a monitoring run should swallow.
+
+    Only the first probe declaring `latest_version_key` is consulted; an agent has
+    one authoritative self-report, and picking silently among several would be the
+    same class of hidden choice this function exists to remove.
+    """
+    for pr in probe_results:
+        if not isinstance(pr, dict):
+            continue
+        key = pr.get("latest_version_key")
+        if not isinstance(key, str) or not key:
+            continue
+
+        probe_version: str | None = None
+        probe_error: str | None = None
+        if not pr.get("ok"):
+            # A failed probe already fails the run through `probe_failed`; it must not
+            # also get a vote on the version number.
+            probe_error = "probe_failed"
+        else:
+            parsed = pr.get("parsed")
+            raw = parsed.get(key) if isinstance(parsed, dict) else None
+            if not isinstance(raw, str) or not raw:
+                probe_error = "missing_version_key"
+            else:
+                probe_version = _extract_semver(raw)
+                if probe_version is None:
+                    probe_error = "unparseable_version"
+
+        source_version = upstream
+        if probe_version and source_version:
+            cmp = _compare_semver(probe_version, source_version)
+            if cmp == 1:
+                chosen, provenance = probe_version, "cli_probe"
+            elif cmp == 0:
+                chosen, provenance = source_version, "both_agree"
+            else:
+                # cmp == -1, or None when the registry value is not semver-parseable.
+                # Either way the configured source stands and the divergence is
+                # reported rather than resolved by guessing.
+                chosen, provenance = source_version, "upstream_source"
+        elif probe_version:
+            chosen, provenance = probe_version, "cli_probe"
+        elif source_version:
+            chosen, provenance = source_version, "upstream_source"
+        else:
+            chosen, provenance = None, "none"
+
+        return {
+            "probe_label": pr.get("label") or "probe",
+            "probe_version_key": key,
+            "probe_version": probe_version,
+            "probe_error": probe_error,
+            "upstream_source_version": source_version,
+            "chosen_version": chosen,
+            "provenance": provenance,
+            "sources_disagree": bool(
+                probe_version and source_version and probe_version != source_version
+            ),
+        }
+    return None
+
+
+def _apply_stale_override(
+    *,
+    severity: str,
+    recommendation: str,
+    installed_newer_than_verified: bool,
+    schema_matches_baseline: bool | None,
+    sample_freshness: dict[str, Any] | None,
+    probe_failed: bool,
+) -> tuple[str, str]:
+    """Spec §3.3: block auto-downgrade when the weekly sample is stale.
+
+    Mirrors the bump_verified_version auto-downgrade guards — only fires
+    when the downgrade would have fired (severity is low/medium, probe
+    succeeded, installed > verified, schema matches baseline) AND the
+    sample is stale. Preserves high severity and probe-failure
+    recommendations untouched.
+    """
+    if severity not in ("low", "medium"):
+        return severity, recommendation
+    if probe_failed:
+        return severity, recommendation
+    if not installed_newer_than_verified:
+        return severity, recommendation
+    if schema_matches_baseline is not True:
+        return severity, recommendation
+    if not isinstance(sample_freshness, dict):
+        return severity, recommendation
+    if sample_freshness.get("is_stale") is not True:
+        return severity, recommendation
+    return "medium", "run_prebump_validator"
+
+
+def _latest_successful_prebump_evidence(
+    *,
+    agent_name: str,
+    reports_root: Path,
+    cli_binary_mtime: float | None,
+) -> dict[str, Any] | None:
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
+    for report_path in reports_root.glob("*-prebump/report.json"):
+        try:
+            report_mtime = report_path.stat().st_mtime
+        except OSError:
+            continue
+        if cli_binary_mtime is not None and report_mtime < cli_binary_mtime:
+            continue
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        results = report.get("results")
+        if not isinstance(results, dict):
+            continue
+        entry = results.get(agent_name)
+        if not isinstance(entry, dict) or entry.get("ok") is not True:
+            continue
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        if evidence.get("fresh_session_matches_baseline") is not True:
+            continue
+        sample_freshness = evidence.get("sample_freshness")
+        if not isinstance(sample_freshness, dict) or sample_freshness.get("is_stale") is True:
+            continue
+        candidates.append((report_mtime, report_path, entry))
+
+    if not candidates:
+        return None
+
+    report_mtime, report_path, entry = max(candidates, key=lambda item: item[0])
+    evidence = dict(entry.get("evidence") or {})
+    evidence["source"] = "latest_prebump_report"
+    evidence["report"] = _safe_relpath(report_path)
+    evidence["report_mtime_epoch"] = report_mtime
+    evidence["session_path"] = entry.get("session_path")
+    return evidence
+
+
+def _classify_prebump_failure(entry: dict[str, Any]) -> str:
+    error = str(entry.get("error") or "").lower()
+    # Structured safety failures outrank noisy model diagnostics. Never retry them.
+    for marker, category in (("sandbox_breach", "sandbox_breach"),
+                             ("auth_failed", "auth_failed"), ("timeout", "timeout"),
+                             ("quota_failed", "quota_failed"),
+                             ("discovery_contract", "discovery_contract_failed"),
+                             ("config_gate", "config_error"), ("hygiene", "config_error")):
+        if marker in error:
+            return category
+    detail_parts = [error]
+    for key in ("stderr_file", "stdout_file"):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            with Path(value).open("rb") as handle:
+                head = handle.read(4000)
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(4000, size - 4000) if size > 4000 else size)
+                tail = handle.read(4000)
+            text = (head + b"\n" + tail).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        detail_parts.append(text.lower())
+    detail = "\n".join(detail_parts)
+    if re.search(r"\bhttp\s*429\b", detail):
+        return "quota_failed"
+    if any(token in detail for token in ("not logged in", "not signed in", "session expired", "session has expired",
+                                         "no authentication", "authentication_failed", "/login", "auth login",
+                                         "oauth token refresh failed", "refresh_token_reused")):
+        return "auth_failed"
+    if any(token in detail for token in ("model_unavailable", "model is no longer available", "unknown model",
+                                         "modelnotfounderror", "model not found", "model has been removed")):
+        return "model_unavailable"
+    if "timeout" in detail:
+        return "timeout"
+    if "not_found" in detail or "not found" in detail:
+        return "cli_missing"
+    if "discovery" in detail or "contract" in detail:
+        return "discovery_contract_failed"
+    if "config_gate" in detail or "hygiene" in detail:
+        return "config_error"
+    if "sandbox_breach" in detail:
+        return "sandbox_breach"
+    return "driver_failed"
+
+
+def _latest_failed_prebump_evidence(
+    *,
+    agent_name: str,
+    reports_root: Path,
+    cli_binary_mtime: float | None,
+) -> dict[str, Any] | None:
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
+    for report_path in reports_root.glob("*-prebump/report.json"):
+        try:
+            report_mtime = report_path.stat().st_mtime
+        except OSError:
+            continue
+        if cli_binary_mtime is not None and report_mtime < cli_binary_mtime:
+            continue
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        results = report.get("results")
+        if not isinstance(results, dict):
+            continue
+        entry = results.get(agent_name)
+        if not isinstance(entry, dict):
+            continue
+        evidence = entry.get("evidence")
+        schema_mismatch = (
+            isinstance(evidence, dict)
+            and evidence.get("fresh_session_matches_baseline") is False
+        )
+        if entry.get("ok") is True and not schema_mismatch:
+            continue
+        candidates.append((report_mtime, report_path, entry))
+
+    if not candidates:
+        return None
+
+    report_mtime, report_path, entry = max(candidates, key=lambda item: item[0])
+    entry_evidence = entry.get("evidence")
+    schema_mismatch = (
+        isinstance(entry_evidence, dict)
+        and entry_evidence.get("fresh_session_matches_baseline") is False
+    )
+    failure_class = "schema_drift" if schema_mismatch else _classify_prebump_failure(entry)
+    result = {
+        "source": "latest_failed_prebump_report",
+        "report": _safe_relpath(report_path),
+        "report_mtime_epoch": report_mtime,
+        "failure_class": failure_class,
+        "error": entry.get("error"),
+        "session_path": entry.get("session_path"),
+        "stdout_file": entry.get("stdout_file"),
+        "stderr_file": entry.get("stderr_file"),
+    }
+    if schema_mismatch:
+        schema_diff = entry_evidence.get("schema_diff")
+        if isinstance(schema_diff, dict):
+            result["schema_diff"] = schema_diff
+    return result
+
+
+def _latest_prebump_evidence(
+    *,
+    agent_name: str,
+    reports_root: Path,
+    cli_binary_mtime: float | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return exactly one newest usable prebump outcome.
+
+    Success and failure helpers intentionally filter different report shapes. Comparing
+    their mtimes here prevents an older clean run from hiding a newer driver failure or
+    schema mismatch, while still allowing a later clean rerun to supersede the failure.
+    """
+    successful = _latest_successful_prebump_evidence(
+        agent_name=agent_name,
+        reports_root=reports_root,
+        cli_binary_mtime=cli_binary_mtime,
+    )
+    failed = _latest_failed_prebump_evidence(
+        agent_name=agent_name,
+        reports_root=reports_root,
+        cli_binary_mtime=cli_binary_mtime,
+    )
+    if successful is None:
+        return None, failed
+    if failed is None:
+        return successful, None
+
+    success_mtime = float(successful.get("report_mtime_epoch") or 0)
+    failure_mtime = float(failed.get("report_mtime_epoch") or 0)
+    if failure_mtime >= success_mtime:
+        return None, failed
+    return successful, None
+
+
+def _format_summary_line(
+    *,
+    agent_name: str,
+    severity: str,
+    verified: str | None,
+    installed: str | None,
+    upstream: str | None,
+    recommendation: str,
+    sample_freshness: dict[str, Any] | None,
+    compatibility: dict[str, Any] | None = None,
+    upstream_reconciliation: dict[str, Any] | None = None,
+) -> str:
+    base = (
+        f"{agent_name}: severity={severity} "
+        f"verified={verified or 'unknown'} "
+        f"installed={installed or 'unknown'} "
+        f"upstream={upstream or 'unknown'} "
+        f"rec={recommendation}"
+    )
+    # Two latest-version sources disagreeing is never allowed to be a report-only
+    # detail: the printed weekly summary is what a human actually reads, and
+    # "upstream=1.0.5" alone hides that the registry still says 1.0.3.
+    if isinstance(upstream_reconciliation, dict) and upstream_reconciliation.get("sources_disagree"):
+        base = (
+            f"{base} latest_disagree=probe:{upstream_reconciliation.get('probe_version')}"
+            f"/source:{upstream_reconciliation.get('upstream_source_version')}"
+            f"/used:{upstream_reconciliation.get('chosen_version')}"
+        )
+    if isinstance(compatibility, dict):
+        verdict = compatibility.get("verdict")
+        scope = compatibility.get("scope")
+        if isinstance(verdict, str) and verdict:
+            base = f"{base} verdict={verdict}"
+        if isinstance(scope, str) and scope:
+            base = f"{base} scope={scope}"
+    if not isinstance(sample_freshness, dict):
+        return base
+    is_stale = sample_freshness.get("is_stale")
+    reason = sample_freshness.get("stale_reason")
+    token = "stale=true" if is_stale else "stale=false"
+    if isinstance(reason, str) and reason:
+        token = f"{token}({reason})"
+    return f"{base} {token}"
+
+
+def _compatibility_evidence_source(
+    *,
+    schema_matches_baseline: bool | None,
+    sample_freshness: dict[str, Any] | None,
+    fresh_evidence_source: str | None,
+) -> str:
+    if isinstance(fresh_evidence_source, str) and fresh_evidence_source:
+        return fresh_evidence_source
+    if not isinstance(sample_freshness, dict):
+        return "no_sample_freshness"
+    if sample_freshness.get("is_stale") is True:
+        return "stale_local_sample"
+    if schema_matches_baseline is None:
+        return "fresh_sample_without_baseline"
+    return "fresh_local_sample"
+
+
+def _sample_is_thin(schema_diff: dict[str, Any] | None) -> bool:
+    """True when a sample was BOTH narrow and tiny, so it evidenced nothing either way.
+
+    Low coverage alone is NOT thin: a baseline deliberately contains rare
+    interactive-only families (claude's ai-title, pr-link, permission-mode) that a
+    perfectly good 1000-event session will never contain.
+    """
+    if not isinstance(schema_diff, dict):
+        return False
+    coverage_ratio = schema_diff.get("coverage_ratio")
+    observed_events = schema_diff.get("observed_event_count")
+    return (
+        isinstance(coverage_ratio, (int, float))
+        and coverage_ratio < _MIN_SAMPLE_COVERAGE_RATIO
+        and isinstance(observed_events, int)
+        and observed_events < _MIN_SAMPLE_EVENT_COUNT
+    )
+
+
+def _build_compatibility_assessment(
+    *,
+    verified: str | None,
+    installed: str | None,
+    upstream: str | None,
+    upstream_sources_configured: bool,
+    upstream_errors: list[dict[str, Any]],
+    installed_newer_than_verified: bool,
+    upstream_newer_than_verified: bool,
+    monitoring_failed: bool,
+    schema_matches_baseline: bool | None,
+    schema_diff: dict[str, Any] | None,
+    sample_freshness: dict[str, Any] | None,
+    fresh_evidence_source: str | None,
+    probe_failed: bool,
+    real_session_driver_configured: bool,
+    failed_prebump_evidence: dict[str, Any] | None = None,
+    upstream_source_status: str | None = None,
+    weekly_schema_diff: dict[str, Any] | None = None,
+    fresh_schema_diff: dict[str, Any] | None = None,
+    fresh_schema_required: bool = False,
+) -> dict[str, Any]:
+    """Answer whether current AS code supports the latest available agent format.
+
+    `severity` remains useful for legacy notification behavior, but it is too coarse
+    for support claims. This object is deliberately explicit about version scope,
+    evidence freshness, and blockers.
+    """
+    blockers: list[str] = []
+    next_action = "none"
+    supports_latest: bool | None = None
+    supports_installed: bool | None = None
+
+    latest_status: str
+    if upstream and upstream_source_status == "cached_prior_report":
+        latest_status = "cached_latest"
+    elif upstream:
+        latest_status = "current_fetch_known"
+    elif upstream_sources_configured:
+        latest_status = "unknown_fetch_failed" if upstream_errors else "unknown_no_version"
+    else:
+        latest_status = "unknown_not_configured"
+
+    evidence_source = _compatibility_evidence_source(
+        schema_matches_baseline=schema_matches_baseline,
+        sample_freshness=sample_freshness,
+        fresh_evidence_source=fresh_evidence_source,
+    )
+    sample_is_stale = isinstance(sample_freshness, dict) and sample_freshness.get("is_stale") is True
+    cli_binary_unresolved = (
+        isinstance(sample_freshness, dict)
+        and sample_freshness.get("stale_reason") == "cli_binary_unresolved"
+    )
+    fresh_schema_evidence = (
+        schema_matches_baseline is True
+        and not sample_is_stale
+        and (fresh_evidence_source == "latest_prebump_report" or not cli_binary_unresolved)
+    )
+    latest_real_session_evidence = (
+        fresh_evidence_source == "latest_prebump_report"
+        and installed is not None
+        and upstream is not None
+        and installed == upstream
+        and latest_status == "current_fetch_known"
+        and not monitoring_failed
+    )
+    selected_schema_drift = (
+        schema_matches_baseline is False
+        and isinstance(schema_diff, dict)
+        and schema_diff.get("unknown_only_is_empty") is False
+    )
+    weekly_schema_drift = (
+        isinstance(weekly_schema_diff, dict)
+        and weekly_schema_diff.get("unknown_only_is_empty") is False
+    )
+    # A sample that exercised almost none of the known format proves nothing. This
+    # is not hypothetical: a "Say hello" prebump session landed in the real store,
+    # became the newest sample, and flipped antigravity from format_drift_detected
+    # to clean without a single parser change.
+    # Judge thinness across EVERY sample we have, not just whichever diff was
+    # substituted last. A passing prebump replaces `schema_diff` with its own
+    # one-line-prompt session, so scoring that alone let a fresh prebump DOWNGRADE an
+    # agent that also had a rich, clean weekly union: on 2026-08-13 codex reported
+    # blocked_thin_sample off a 20-event prebump while its weekly union carried 2808
+    # clean events. Adding evidence must never make the verdict worse.
+    failed_prebump_schema_drift = (
+        isinstance(failed_prebump_evidence, dict)
+        and failed_prebump_evidence.get("failure_class") == "schema_drift"
+        and isinstance(failed_prebump_evidence.get("schema_diff"), dict)
+        and failed_prebump_evidence["schema_diff"].get("unknown_only_is_empty") is False
+    )
+    unknown_schema_drift = (
+        selected_schema_drift or weekly_schema_drift or failed_prebump_schema_drift
+    )
+    # Unreadable records (invalid JSON, non-object rows, rows missing fields
+    # the reader needs) can hide drift. They block support claims on their own,
+    # whatever an older clean prebump says: the evidence-source string alone
+    # must not turn a failing current sample into supports_latest.
+    unreadable_records = any(
+        isinstance(d, dict) and isinstance(d.get("parse_errors"), int) and d["parse_errors"] > 0
+        for d in (schema_diff, weekly_schema_diff)
+    )
+    # A store or file that could not be read at all (locked or corrupt SQLite,
+    # OS error) says nothing about the format: it is a monitoring failure.
+    sample_read_failed = any(
+        isinstance(d, dict) and d.get("read_failed") is True
+        for d in (schema_diff, weekly_schema_diff)
+    )
+    if unreadable_records or sample_read_failed:
+        fresh_schema_evidence = False
+        latest_real_session_evidence = False
+    if fresh_schema_required:
+        thin_sample = (
+            isinstance(fresh_schema_diff, dict)
+            and _sample_is_thin(fresh_schema_diff)
+            and not unknown_schema_drift
+        )
+    else:
+        thin_sample = all(
+            _sample_is_thin(d) for d in (schema_diff, weekly_schema_diff) if isinstance(d, dict)
+        ) and isinstance(schema_diff, dict) and not unknown_schema_drift
+
+    if monitoring_failed:
+        blockers.append("latest_source_failed")
+    elif latest_status == "cached_latest" and upstream_errors:
+        blockers.append("latest_source_degraded")
+    if probe_failed:
+        blockers.append("probe_or_discovery_failed")
+    if sample_read_failed:
+        blockers.append("sample_read_failed")
+    if unknown_schema_drift:
+        blockers.append("schema_unknowns_detected")
+    if unreadable_records:
+        blockers.append("sample_unreadable_records")
+    if not (unknown_schema_drift or unreadable_records or sample_read_failed) and schema_matches_baseline is None:
+        blockers.append("schema_baseline_not_checked")
+    if sample_is_stale:
+        blockers.append(str(sample_freshness.get("stale_reason") or "stale_sample"))
+    elif cli_binary_unresolved:
+        blockers.append("cli_binary_unresolved")
+    if thin_sample:
+        blockers.append("sample_coverage_too_thin")
+    if latest_status.startswith("unknown"):
+        blockers.append(latest_status)
+    if not real_session_driver_configured:
+        blockers.append("no_real_session_driver_configured")
+    if upstream and not installed:
+        blockers.append("installed_version_unknown")
+
+    if real_session_driver_configured:
+        prebump_action = "run prebump validator for the affected agent"
+        latest_action = "run prebump/latest-build validation before claiming latest support"
+        fresh_sample_action = "generate a fresh session with the configured driver and compare against the fixture baseline"
+    else:
+        prebump_action = "capture a fresh native session or configure a prebump driver, then rerun weekly"
+        latest_action = "no prebump driver is configured; capture a session from the latest build or configure a driver before claiming latest support"
+        fresh_sample_action = "no prebump driver is configured; capture a fresh native session or add a driver before claiming support"
+    failed_prebump_class = None
+    if isinstance(failed_prebump_evidence, dict) and not latest_real_session_evidence:
+        value = failed_prebump_evidence.get("failure_class")
+        failed_prebump_class = value if isinstance(value, str) and value else "driver_failed"
+        blockers.append(f"real_session_{failed_prebump_class}")
+
+    if installed and fresh_schema_evidence and not probe_failed and not unknown_schema_drift and not thin_sample:
+        supports_installed = True
+    elif installed:
+        supports_installed = False
+
+    if monitoring_failed or probe_failed or sample_read_failed:
+        verdict = "monitoring_broken"
+        scope = "none"
+        next_action = (
+            "fix monitoring/probe/discovery failure before making support claims"
+            if monitoring_failed or probe_failed
+            else "the session store could not be read (see weekly.local_schema.error, e.g. a locked "
+            "database); rerun weekly once it is readable"
+        )
+        supports_installed = False if installed else None
+        supports_latest = False if upstream else None
+        confidence = "high"
+    elif unknown_schema_drift or unreadable_records:
+        verdict = "format_drift_detected"
+        scope = "none"
+        next_action = (
+            "triage schema unknowns, update fixtures/parsers, then rerun weekly/prebump"
+            if unknown_schema_drift
+            else "inspect the sample's unreadable records (parse_errors, required_field_violations), "
+            "fix the parser or fingerprint, then rerun weekly/prebump"
+        )
+        supports_latest = False if upstream else None
+        supports_installed = False if installed else None
+        confidence = "high"
+    elif sample_is_stale and (installed_newer_than_verified or upstream_newer_than_verified):
+        verdict = "blocked_stale_sample"
+        scope = "none"
+        next_action = prebump_action
+        supports_latest = False if upstream else None
+        supports_installed = False if installed_newer_than_verified else supports_installed
+        confidence = "high"
+    elif thin_sample:
+        verdict = "blocked_thin_sample"
+        scope = "none"
+        next_action = (
+            "sample exercised too little of the known format to evidence anything; "
+            "generate a richer real session (tool calls, not a one-line prompt) and rerun"
+        )
+        supports_latest = False if upstream else None
+        supports_installed = False if installed else None
+        confidence = "high"
+    elif (installed_newer_than_verified or upstream_newer_than_verified) and not fresh_schema_evidence:
+        verdict = "blocked_no_fresh_evidence"
+        scope = "none"
+        next_action = fresh_sample_action
+        supports_latest = False if upstream else None
+        supports_installed = False if installed_newer_than_verified else supports_installed
+        confidence = "high"
+    elif latest_status.startswith("unknown"):
+        verdict = "latest_unknown"
+        scope = "installed" if supports_installed else "none"
+        next_action = "configure or repair latest-version source for this agent"
+        supports_latest = None
+        confidence = "high"
+    elif upstream and not installed:
+        verdict = "blocked_no_fresh_evidence"
+        scope = "none"
+        next_action = "resolve installed version before making installed/latest support claims"
+        supports_installed = None
+        supports_latest = False
+        confidence = "high"
+    elif upstream_newer_than_verified and installed == upstream and latest_real_session_evidence and latest_status == "current_fetch_known":
+        verdict = "supports_latest"
+        scope = "latest"
+        next_action = "none"
+        supports_latest = True
+        confidence = "high"
+    elif upstream_newer_than_verified and installed == upstream and fresh_schema_evidence:
+        verdict = "supports_installed_only"
+        scope = "installed"
+        next_action = latest_action
+        supports_latest = False
+        confidence = "medium"
+    elif upstream_newer_than_verified:
+        verdict = "supports_installed_only" if supports_installed else "blocked_no_fresh_evidence"
+        scope = "installed" if supports_installed else "none"
+        next_action = latest_action
+        supports_latest = False
+        confidence = "high"
+    elif upstream and installed == upstream and latest_real_session_evidence and latest_status == "current_fetch_known":
+        verdict = "supports_latest"
+        scope = "latest"
+        next_action = "none"
+        supports_latest = True
+        confidence = "high"
+    elif fresh_schema_evidence:
+        verdict = "supports_installed_only" if upstream else "latest_unknown"
+        scope = "installed"
+        next_action = (
+            latest_action
+            if upstream
+            else "configure or repair latest-version source for this agent"
+        )
+        supports_latest = False if upstream else None
+        confidence = "medium"
+    else:
+        verdict = "blocked_no_fresh_evidence"
+        scope = "none"
+        next_action = "collect local schema evidence or add fixtures"
+        supports_latest = False if upstream else None
+        confidence = "medium"
+
+    if failed_prebump_class == "auth_failed" and verdict not in ("format_drift_detected", "monitoring_broken"):
+        next_action = "restore agent auth, then rerun prebump"
+
+    return {
+        "question": "Can current Agent Sessions code support the latest available session/storage/usage format for this agent?",
+        "verdict": verdict,
+        "scope": scope,
+        "confidence": confidence,
+        "latest_status": latest_status,
+        "verified_version": verified,
+        "installed_version": installed,
+        "latest_available_version": upstream,
+        "supports_installed": supports_installed,
+        "supports_latest": supports_latest,
+        "evidence_source": evidence_source,
+        "fresh_schema_evidence": fresh_schema_evidence,
+        "fresh_schema_diff": fresh_schema_diff,
+        "latest_real_session_evidence": latest_real_session_evidence,
+        "real_session_driver_configured": real_session_driver_configured,
+        "latest_real_session_failure": failed_prebump_evidence,
+        "blockers": blockers,
+        "next_action": next_action,
+    }
+
+
+def _apply_compatibility_to_legacy_status(
+    *,
+    severity: str,
+    recommendation: str,
+    compatibility: dict[str, Any],
+) -> tuple[str, str]:
+    """Keep legacy severity/recommendation from hiding compatibility blockers."""
+    verdict = compatibility.get("verdict")
+    latest_status = compatibility.get("latest_status")
+    if verdict in ("monitoring_broken", "format_drift_detected"):
+        return "high", "prepare_hotfix"
+    if verdict in ("blocked_stale_sample", "blocked_no_fresh_evidence"):
+        if compatibility.get("real_session_driver_configured") is True:
+            return "medium", "run_prebump_validator"
+        return "medium", "monitor"
+    if verdict == "latest_unknown":
+        if latest_status == "unknown_fetch_failed":
+            return "medium", "monitor"
+        return "low", "monitor"
+    if verdict == "supports_installed_only":
+        if (
+            recommendation == "bump_verified_version"
+            and compatibility.get("evidence_source") != "latest_prebump_report"
+        ):
+            if compatibility.get("real_session_driver_configured") is True:
+                return severity, "run_prebump_validator"
+            return severity, "monitor"
+        if severity == "none":
+            return "low", "monitor"
+    return severity, recommendation
+
+
+def _build_prebump_report_entry(
+    *,
+    agent_name: str,
+    driver_name: str,
+    ok: bool,
+    session_path: Path | None,
+    stdout_file: Path | None,
+    stderr_file: Path | None,
+    error: str | None,
+    schema_diff: dict[str, Any] | None,
+    fresh_session_matches_baseline: bool | None,
+    sample_freshness: dict[str, Any] | None,
+    auth_warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "agent": agent_name,
+        "driver": driver_name,
+        "ok": ok,
+        "session_path": str(session_path) if session_path else None,
+        "stdout_file": str(stdout_file) if stdout_file else None,
+        "stderr_file": str(stderr_file) if stderr_file else None,
+        "error": error,
+        "evidence": {
+            "schema_matches_baseline": fresh_session_matches_baseline,
+            "fresh_session_matches_baseline": fresh_session_matches_baseline,
+            # Spec §3.1: true ONLY when prebump produced fresh evidence
+            # AND it matched baseline.
+            "fresh_evidence_available": fresh_session_matches_baseline is True,
+            "schema_diff": schema_diff,
+            "sample_freshness": sample_freshness,
+            "auth_warnings": list(auth_warnings or []),
+        },
+    }
+
+
+def _exit_code_for_prebump(entries: list[dict[str, Any]]) -> int:
+    worst = 0
+    for e in entries:
+        if e.get("fatal") == "config":
+            worst = max(worst, 4)
+            continue
+        if not e.get("ok"):
+            worst = max(worst, 3)
+            continue
+        ev = e.get("evidence") or {}
+        if ev.get("fresh_session_matches_baseline") is False:
+            worst = max(worst, 2)
+    return worst
+
+
+class _DiscoveryViolation(Exception):
+    """Raised when a driver result violates discover_session contract."""
+
+
+def _session_path_matches_glob(session_path: Path, root: Path, pattern: str) -> bool:
+    """Match one resolved candidate against a root-relative glob without walking.
+
+    Both paths are resolved before deriving the relative path, so a symlinked
+    candidate cannot use lexical containment to escape the declared root. A
+    whole-segment ``**`` matches zero or more path components, matching the
+    recursive layouts accepted by ``Path.glob`` without enumerating siblings.
+    """
+    try:
+        session_resolved = session_path.resolve()
+        root_resolved = root.resolve()
+        relative_parts = session_resolved.relative_to(root_resolved).parts
+    except (OSError, RuntimeError):
+        return False
+    except ValueError:
+        return False
+
+    pattern_path = Path(pattern)
+    if pattern_path.is_absolute():
+        return False
+    pattern_parts = pattern_path.parts
+
+    positions = {0}
+    for part_pattern in pattern_parts:
+        if part_pattern == "**":
+            positions = set(range(min(positions), len(relative_parts) + 1))
+            continue
+        positions = {
+            index + 1
+            for index in positions
+            if index < len(relative_parts)
+            and fnmatch.fnmatchcase(relative_parts[index], part_pattern)
+        }
+        if not positions:
+            return False
+
+    return len(relative_parts) in positions
+
+
+def _validate_session_discovery(
+    session_path: Path, contract: dict, sandbox: Path, *, session_id: str | None = None
+) -> None:
+    """F4: validate session_path against the agent's discover_session contract.
+
+    Checks (each failure raises _DiscoveryViolation):
+      1. session_path is under one of contract['roots'], where each root
+         is interpreted relative to *sandbox* (sandbox-HOME substitution).
+      2. session_path's root-relative path matches one of the declared
+         (root, glob) pairs — see _session_path_matches_glob.
+      3. The file parses as JSONL and contains at least one line per
+         type in contract['required_types'] (matched on the per-line
+         'type' field). For OpenClaw's shared SQLite store the check runs
+         on the records of `session_id`, the session the driver named.
+
+    Discovery violations are mapped to exit 3 (driver-failed) by the
+    caller — the driver produced the wrong artifact.
+
+    Note on key tolerance: this runtime validator accepts BOTH modern
+    ("roots"/"globs") and legacy ("roots_relative_to_sandbox"/"glob")
+    config keys so older on-disk configs keep validating cleanly. The
+    config gate in _run_prebump deliberately only accepts the modern
+    form — the asymmetry is intentional; do not "fix" it.
+    """
+    if not isinstance(contract, dict):
+        return  # no contract declared → skip (see residual risk note)
+    try:
+        session_path = session_path.resolve()
+    except OSError as exc:
+        raise _DiscoveryViolation(f"cannot resolve session_path: {exc}") from exc
+
+    roots = contract.get("roots") or contract.get("roots_relative_to_sandbox") or []
+    # Resolve the declared roots to absolute sandbox-relative paths once.
+    resolved_roots: list[Path] = []
+    for root_spec in roots:
+        resolved_roots.append((sandbox / str(root_spec).lstrip("/")).resolve())
+    if resolved_roots:
+        ok = False
+        for root in resolved_roots:
+            try:
+                session_path.relative_to(root)
+                ok = True
+                break
+            except ValueError:
+                continue
+        if not ok:
+            raise _DiscoveryViolation(
+                f"session {session_path} is not under any declared root in {roots}"
+            )
+
+    globs = contract.get("globs")
+    if not globs:
+        single = contract.get("glob")
+        globs = [single] if single else []
+    if globs and resolved_roots:
+        # Iterate every (root, glob) pair; succeed on the first match.
+        matched = False
+        for root in resolved_roots:
+            for pattern in globs:
+                if _session_path_matches_glob(session_path, root, pattern):
+                    matched = True
+                    break
+            if matched:
+                break
+        if not matched:
+            raise _DiscoveryViolation(
+                f"session {session_path} does not match any (root, glob) pair "
+                f"in roots={roots} globs={globs}"
+            )
+
+    required_types = list(contract.get("required_types") or [])
+    if required_types:
+        seen: set[str] = set()
+        if session_path.name == _OPENCLAW_SQLITE_DB_NAME:
+            # A shared per-agent store: the required types must be in the one
+            # session the driver named, not anywhere in the database.
+            if not session_id:
+                raise _DiscoveryViolation(
+                    f"session {session_path} is a shared OpenClaw store but the driver named no session"
+                )
+            fingerprint = _openclaw_sqlite_schema_fingerprint(session_path, session_ids=[session_id])
+            if fingerprint.get("read_failed") or fingerprint.get("required_field_violations"):
+                raise _DiscoveryViolation(
+                    f"session {session_path} is not a readable OpenClaw store: "
+                    f"{fingerprint.get('error') or fingerprint.get('required_field_violations')}"
+                )
+            seen.update((fingerprint.get("type_counts") or {}).keys())
+        elif session_path.name.endswith(".jsonl.zstd"):
+            fingerprint = _deepseek_harness_schema_fingerprint(
+                session_path, max_lines=5000
+            )
+            if fingerprint.get("error"):
+                raise _DiscoveryViolation(
+                    f"session {session_path} failed DSH validation: "
+                    f"{fingerprint['error']}"
+                )
+            seen.update((fingerprint.get("type_counts") or {}).keys())
+        else:
+            try:
+                with session_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise _DiscoveryViolation(
+                                f"session {session_path} is not valid JSONL: {exc}"
+                            ) from exc
+                        t = obj.get("type") if isinstance(obj, dict) else None
+                        if isinstance(t, str):
+                            seen.add(t)
+            except OSError as exc:
+                raise _DiscoveryViolation(f"cannot read session: {exc}") from exc
+        missing = [t for t in required_types if t not in seen]
+        if missing:
+            raise _DiscoveryViolation(
+                f"session {session_path} missing required types {missing}; saw {sorted(seen)}"
+            )
+
+
+def _run_prebump(
+    args,
+    cfg: dict[str, Any],
+    *,
+    report_dir: Path,
+    verified_map: dict[str, str | None],
+    evidence: dict[str, list[str]],
+) -> int:
+    import agent_watch_prebump_drivers as drv_mod
+
+    prebump_dir = report_dir.parent / (report_dir.name + "-prebump")
+    prebump_dir.mkdir(parents=True, exist_ok=True)
+
+    agents_cfg = cfg.get("agents") or {}
+    configured_prebump_agents = {
+        name for name, acfg in agents_cfg.items()
+        if isinstance(acfg, dict) and isinstance(acfg.get("prebump"), dict)
+    }
+    requested = list(args.agent or [])
+    if requested:
+        unknown = [a for a in requested if a not in configured_prebump_agents]
+        if unknown:
+            import sys as _sys
+            _sys.stderr.write(
+                "agent_watch --mode prebump: rejected agent(s) "
+                f"{unknown}: not in configured prebump set "
+                f"{sorted(configured_prebump_agents)}\n"
+            )
+            return 4
+        selected = set(requested)
+    else:
+        selected = set(configured_prebump_agents)
+
+    prebump_agents = {name: agents_cfg[name] for name in selected}
+    if not prebump_agents:
+        return 0
+
+    # F1/A: discovery-contract config gate. Every selected agent must
+    # declare a well-formed prebump.discover_session contract using the
+    # modern roots/globs keys. Collect ALL failures across the selected
+    # set before bailing so the user can fix everything in one pass.
+    gate_failures: list[dict[str, Any]] = []
+    for _name, _acfg in prebump_agents.items():
+        _pb = _acfg.get("prebump") or {}
+        _ds = _pb.get("discover_session")
+        if not isinstance(_ds, dict):
+            gate_failures.append({
+                "agent": _name,
+                "driver": _pb.get("driver"),
+                "ok": False,
+                "error": f"config_gate:{_name}: prebump.discover_session missing or not a dict",
+                "fatal": "config",
+                "evidence": {},
+            })
+            continue
+        _roots = _ds.get("roots")
+        _globs = _ds.get("globs")
+        _req = _ds.get("required_types", [])
+        _required_schema_buckets = _pb.get("required_schema_buckets", [])
+        _required_evidence_buckets = _pb.get("required_evidence_buckets", [])
+        _reasons: list[str] = []
+        if not isinstance(_roots, list) or len(_roots) < 1:
+            _reasons.append("roots must be a non-empty list")
+        if not isinstance(_globs, list) or len(_globs) < 1:
+            _reasons.append("globs must be a non-empty list")
+        # required_types is OPTIONAL: missing key or empty list is fine
+        # (Copilot declares required_types: [] by design).
+        if "required_types" in _ds and not isinstance(_req, list):
+            _reasons.append("required_types must be a list when present")
+        if "required_schema_buckets" in _pb and (
+            not isinstance(_required_schema_buckets, list)
+            or any(not isinstance(item, str) or not item for item in _required_schema_buckets)
+        ):
+            _reasons.append("required_schema_buckets must be a list of non-empty strings")
+        _by_store = _pb.get("required_schema_buckets_by_store")
+        if "required_schema_buckets_by_store" in _pb and (
+            not isinstance(_by_store, dict)
+            or not _by_store
+            or any(
+                not isinstance(store, str) or not store
+                or not isinstance(buckets, list)
+                or any(not isinstance(item, str) or not item for item in buckets)
+                for store, buckets in _by_store.items()
+            )
+        ):
+            _reasons.append(
+                "required_schema_buckets_by_store must map store names to lists of non-empty strings"
+            )
+        if "required_schema_buckets_by_store" in _pb and "required_schema_buckets" in _pb:
+            # The map silently wins in _required_schema_buckets_for; refuse the
+            # ambiguity instead of ignoring one of the lists.
+            _reasons.append(
+                "use either required_schema_buckets or required_schema_buckets_by_store, not both"
+            )
+        if "required_evidence_buckets" in _pb and (
+            not isinstance(_required_evidence_buckets, list)
+            or any(
+                not isinstance(item, str) or not item
+                for item in _required_evidence_buckets
+            )
+        ):
+            _reasons.append(
+                "required_evidence_buckets must be a list of non-empty strings"
+            )
+        if _reasons:
+            import sys as _sys
+            _msg = f"config_gate:{_name}: " + "; ".join(_reasons)
+            _sys.stderr.write(
+                f"agent_watch --mode prebump: {_msg}\n"
+            )
+            gate_failures.append({
+                "agent": _name,
+                "driver": _pb.get("driver"),
+                "ok": False,
+                "error": _msg,
+                "fatal": "config",
+                "evidence": {},
+            })
+    if gate_failures:
+        # Do not run any driver; let the user fix all config errors at
+        # once. Write a report entry per failing agent and exit 4.
+        report = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "prebump",
+            "report_dir": _safe_relpath(prebump_dir),
+            "results": {e["agent"]: e for e in gate_failures},
+        }
+        (prebump_dir / "report.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return 4
+
+    entries: list[dict[str, Any]] = []
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    real_home = Path(os.environ.get("HOME", str(Path.home())))
+
+    for agent_name, agent_cfg in prebump_agents.items():
+        pb = agent_cfg["prebump"]
+        driver_name = pb.get("driver")
+        driver = drv_mod.DRIVERS.get(driver_name) if isinstance(driver_name, str) else None
+        agent_out = prebump_dir / agent_name
+        agent_out.mkdir(parents=True, exist_ok=True)
+
+        if driver is None:
+            entries.append({
+                "agent": agent_name,
+                "driver": driver_name,
+                "ok": False,
+                "error": f"unknown_driver:{driver_name}",
+                "fatal": "config",
+                "evidence": {},
+            })
+            continue
+
+        try:
+            sandbox = drv_mod.make_sandbox(parent=agent_out, label=agent_name)
+        except Exception as exc:
+            entries.append({
+                "agent": agent_name,
+                "driver": driver_name,
+                "ok": False,
+                "error": f"sandbox_create_failed:{exc}",
+                "fatal": "config",
+                "evidence": {},
+            })
+            continue
+
+        # F2: prepare_auth is the only auth path. Drivers receive env.
+        try:
+            env, auth_warnings = drv_mod.prepare_auth(
+                prebump_cfg=pb, sandbox=sandbox, real_home=real_home,
+            )
+        except drv_mod.HygieneError as exc:
+            entries.append({
+                "agent": agent_name,
+                "driver": driver_name,
+                "ok": False,
+                "error": f"hygiene_failed:{exc}",
+                "fatal": "config",
+                "evidence": {},
+            })
+            drv_mod.teardown_sandbox(sandbox, keep=args.keep_sandbox)
+            continue
+
+        # P2: surface prepare_auth advisory warnings (e.g. 90-day stale
+        # credential) to stderr immediately so operators see them at
+        # emit-time. They are also threaded into evidence.auth_warnings
+        # below for the report audit trail.
+        for _warn in auth_warnings:
+            import sys as _sys
+            _sys.stderr.write(f"agent_watch prebump [{agent_name}]: {_warn}\n")
+
+        prompt = str(pb.get("prompt") or "")
+        model_override = pb.get("model")
+        if isinstance(model_override, str) and model_override:
+            env["AGENT_WATCH_MODEL"] = model_override
+        # Endpoint/provider come from config too, so a driver never bakes in a
+        # vendor URL: a CLI whose provider points at a different region, gateway
+        # or self-hosted proxy would otherwise be probed against a backend the
+        # user does not actually use.
+        for cfg_key, env_key in (
+            ("model_base_url", "AGENT_WATCH_MODEL_BASE_URL"),
+            ("model_provider_type", "AGENT_WATCH_MODEL_PROVIDER_TYPE"),
+        ):
+            val = pb.get(cfg_key)
+            if isinstance(val, str) and val:
+                env[env_key] = val
+        if args.allow_real_home and pb.get("real_home_session") is True:
+            env["HOME"] = str(real_home)
+            env["AGENT_WATCH_SESSION_HOME"] = str(real_home)
+        # F6: CLI flag wins by default; fall back to per-agent config; then global default.
+        if args.timeout_seconds is not None:
+            timeout = int(args.timeout_seconds)
+        else:
+            timeout = int(pb.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
+
+        try:
+            from agent_watch_workflow import guarded_driver_run, run_with_fallback
+            def run_model(model):
+                if model:
+                    env["AGENT_WATCH_MODEL"] = model
+                return guarded_driver_run(Path(__file__).resolve().parents[1],
+                                          lambda: driver.run(sandbox, env, prompt, timeout))
+            result, model_attempts = run_with_fallback(
+                run_model, model_override, pb.get("fallback_models") or [], _classify_prebump_failure)
+        except drv_mod.HygieneError as exc:
+            entries.append({
+                "agent": agent_name,
+                "driver": driver_name,
+                "ok": False,
+                "error": f"hygiene_failed:{exc}",
+                "fatal": "config",
+                "evidence": {},
+            })
+            drv_mod.teardown_sandbox(sandbox, keep=args.keep_sandbox)
+            continue
+        except Exception as exc:
+            entries.append({
+                "agent": agent_name,
+                "driver": driver_name,
+                "ok": False,
+                "error": f"driver_exception:{exc}",
+                "evidence": {},
+            })
+            drv_mod.teardown_sandbox(sandbox, keep=args.keep_sandbox)
+            continue
+
+        # Copilot hermeticity gate: sandbox_breach → fatal=config (exit 4)
+        # unless --allow-real-home was explicitly passed.
+        if (
+            not result.ok
+            and isinstance(result.error, str)
+            and result.error.startswith("sandbox_breach")
+        ):
+            if not args.allow_real_home or result.error == "sandbox_breach:repository_changed":
+                entries.append({
+                    "agent": agent_name,
+                    "driver": driver_name,
+                    "ok": False,
+                    "error": result.error,
+                    "fatal": "config",
+                    "stdout_file": str(result.stdout_file),
+                    "stderr_file": str(result.stderr_file),
+                    "evidence": {"auth_warnings": list(auth_warnings)},
+                })
+                drv_mod.teardown_sandbox(sandbox, keep=True)
+                continue
+            # --allow-real-home: re-run the driver with real HOME so the
+            # session lands under the user's actual home directory.
+            import sys as _sys
+            _sys.stderr.write(
+                f"agent_watch prebump [{agent_name}]: sandbox_breach detected, "
+                f"--allow-real-home set, re-running with real HOME\n"
+            )
+            drv_mod.teardown_sandbox(sandbox, keep=args.keep_sandbox)
+            env["HOME"] = str(real_home)
+            try:
+                result = guarded_driver_run(Path(__file__).resolve().parents[1],
+                                            lambda: driver.run(sandbox, env, prompt, timeout))
+            except drv_mod.HygieneError as exc:
+                entries.append({
+                    "agent": agent_name,
+                    "driver": driver_name,
+                    "ok": False,
+                    "error": f"hygiene_failed:{exc}",
+                    "fatal": "config",
+                    "evidence": {},
+                })
+                continue
+            except Exception as exc:
+                entries.append({
+                    "agent": agent_name,
+                    "driver": driver_name,
+                    "ok": False,
+                    "error": f"driver_exception:{exc}",
+                    "evidence": {},
+                })
+                continue
+            env["AGENT_WATCH_SESSION_HOME"] = str(real_home)
+
+        # P1: ok=True must be backed by an actual session file. A driver
+        # that returns ok=True with session_path=None or a path that does
+        # not exist has silently failed — treat as driver-failed so
+        # _exit_code_for_prebump returns 3 instead of letting the run
+        # pass the gate on no fresh evidence.
+        if result.ok and (result.session_path is None or not result.session_path.exists()):
+            entries.append({
+                "agent": agent_name,
+                "driver": driver_name,
+                "ok": False,
+                "error": "no_session_produced",
+                "evidence": {
+                    "auth_warnings": list(auth_warnings),
+                },
+            })
+            drv_mod.teardown_sandbox(sandbox, keep=(args.keep_sandbox or True))
+            continue
+
+        # F4: validate the session against the discover_session contract.
+        if result.ok and result.session_path and result.session_path.exists():
+            try:
+                _validate_session_discovery(
+                    result.session_path,
+                    pb.get("discover_session") or {},
+                    Path(env.get("AGENT_WATCH_SESSION_HOME", str(sandbox))),
+                    session_id=getattr(result, "session_id", None),
+                )
+            except _DiscoveryViolation as exc:
+                entries.append({
+                    "agent": agent_name,
+                    "driver": driver_name,
+                    "ok": False,
+                    "error": f"discovery_violation:{exc}",
+                    "evidence": {},
+                })
+                drv_mod.teardown_sandbox(sandbox, keep=(args.keep_sandbox or True))
+                continue
+
+        schema_diff: dict[str, Any] | None = None
+        fresh_matches: bool | None = None
+        if result.ok and result.session_path and result.session_path.exists():
+            matrix_key = MATRIX_KEY_FOR_AGENT.get(agent_name)
+            baseline_paths = evidence.get(matrix_key or "", []) if matrix_key else []
+            baseline_type_keys = _baseline_type_keys_for_agent(agent_name, baseline_paths)
+            if agent_name == "antigravity":
+                if result.session_path.suffix == ".jsonl":
+                    fp = _schema_fingerprint_for_agent(agent_name, result.session_path, max_lines=5000)
+                else:
+                    fp = _antigravity_markdown_schema_fingerprint(result.session_path, max_lines=5000)
+            elif agent_name == "hermes":
+                if result.session_path.name == "state.db":
+                    fp = _hermes_state_db_latest_session_schema_fingerprint(result.session_path, max_messages=5000)
+                else:
+                    fp = _hermes_session_json_schema_fingerprint(result.session_path, max_messages=5000)
+            elif agent_name == "opencode":
+                if result.session_path.name == "opencode.db":
+                    fp = _opencode_sqlite_latest_session_schema_fingerprint(
+                        result.session_path, max_messages=250, max_parts=2500
+                    )
+                else:
+                    fp = _opencode_storage_session_tree_schema_fingerprint(
+                        result.session_path, max_messages=250, max_parts=2500
+                    )
+            elif agent_name == "cursor":
+                fp = _cursor_transcript_schema_fingerprint(result.session_path, max_lines=5000)
+            elif agent_name == "openclaw" and result.session_path.name == _OPENCLAW_SQLITE_DB_NAME:
+                # The store is shared by every session; fingerprint only the one
+                # this run wrote. No id means the driver could not name it: fail.
+                session_id = getattr(result, "session_id", None)
+                fp = _openclaw_sqlite_schema_fingerprint(
+                    result.session_path, session_ids=[session_id] if session_id else ["<unknown>"]
+                )
+            elif agent_name == "cline":
+                # Same manifest+transcript fingerprint as the baseline and weekly paths;
+                # the generic JSONL fallback would read zero events from pretty JSON.
+                fp = _cline_session_schema_fingerprint(result.session_path)
+            else:
+                fp = _schema_fingerprint_for_agent(agent_name, result.session_path, max_lines=5000)
+            schema_diff, fresh_matches = _prebump_schema_check(
+                fingerprint=fp,
+                baseline_type_keys=baseline_type_keys,
+                required_schema_buckets=_required_schema_buckets_for(pb, fp),
+                required_evidence_buckets=pb.get("required_evidence_buckets"),
+                agent_name=agent_name,
+            )
+
+        cli_path, cli_mtime = _resolve_cli_binary_mtime(
+            agent_cfg.get("installed_version_cmd") if isinstance(agent_cfg.get("installed_version_cmd"), list) else None
+        )
+        sample_mtime = None
+        if result.session_path and result.session_path.exists():
+            try:
+                sample_mtime = float(result.session_path.stat().st_mtime)
+            except OSError:
+                sample_mtime = None
+        window_days = int(((agent_cfg.get("weekly") or {}).get("freshness_window_days") or 14))
+        sf = _compute_sample_freshness(
+            sample_mtime=sample_mtime,
+            cli_binary_path=cli_path,
+            cli_binary_mtime=cli_mtime,
+            freshness_window_seconds=window_days * 86400,
+            now_epoch=now_epoch,
+            mode_context="normal",
+            force_fresh=bool(getattr(args, "force_fresh", False)),
+        )
+
+        entry = _build_prebump_report_entry(
+            agent_name=agent_name,
+            driver_name=driver_name,
+            ok=bool(result.ok),
+            session_path=result.session_path,
+            stdout_file=result.stdout_file,
+            stderr_file=result.stderr_file,
+            error=result.error,
+            schema_diff=schema_diff,
+            fresh_session_matches_baseline=fresh_matches,
+            sample_freshness=sf,
+            auth_warnings=auth_warnings,
+        )
+        entry["model_attempts"] = model_attempts
+        entries.append(entry)
+        # A successful CLI invocation can still produce schema drift. Preserve that
+        # sandbox so the report's session_path remains inspectable; otherwise the
+        # most important prebump evidence is deleted immediately after we record it.
+        drv_mod.teardown_sandbox(
+            sandbox,
+            keep=(args.keep_sandbox or not result.ok or fresh_matches is False),
+        )
+
+    report = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "prebump",
+        "report_dir": _safe_relpath(prebump_dir),
+        "results": {e["agent"]: e for e in entries},
+    }
+    (prebump_dir / "report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    rc = _exit_code_for_prebump(entries)
+    print(f"Agent watch (prebump) report: {prebump_dir / 'report.json'}")
+    for e in entries:
+        ev = e.get("evidence") or {}
+        fsmb = ev.get("fresh_session_matches_baseline")
+        print(f"{e['agent']}: driver={e.get('driver')} ok={e.get('ok')} fresh_matches_baseline={fsmb} error={e.get('error')}")
+    return rc
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["daily", "weekly", "prebump", "preflight", "update"])
+    parser.add_argument("--summary", metavar="REPORT", help="Render the per-agent table from a final report.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--timeout", type=int, default=12)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--skip-update", action="store_true",
+                        help="Skip installed-version and upstream-fetch checks (agents already updated locally)")
+    parser.add_argument("--force-fresh", action="store_true",
+                        help="Suppress staleness for this run; records stale_reason=forced_fresh")
+    parser.add_argument("--agent", action="append", default=[], help="Repeatable. Restricts prebump to the listed agents.")
+    parser.add_argument("--keep-sandbox", action="store_true", help="Keep prebump sandbox directories for debugging.")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Per-driver timeout for prebump runs (seconds). Precedence: "
+            "CLI flag overrides per-agent config; falls back to "
+            "agents.<name>.prebump.timeout_seconds, then DEFAULT_TIMEOUT_SECONDS."
+        ),
+    )
+    parser.add_argument("--allow-real-home", action="store_true", help="Allow copilot (and other home_override agents) to fall back to real HOME after an explicit sandbox-leak diagnostic.")
+    args = parser.parse_args(argv)
+
+    import agent_watch_workflow as workflow
+    if args.summary:
+        print(workflow.summary(_read_json(Path(args.summary))))
+        return 0
+    if not args.mode:
+        parser.error("--mode or --summary is required")
+
+    cfg_path = Path(args.config)
+    cfg = _read_json(cfg_path)
+    report_root = Path(cfg.get("report_root") or "scripts/probe_scan_output/agent_watch")
+    report_dir = report_root / _now_utc_slug()
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode in ("preflight", "update"):
+        selected = cfg.get("agents", {})
+        if args.agent:
+            if any(name not in selected for name in args.agent):
+                parser.error("unknown agent")
+            selected = {name: agent for name, agent in selected.items() if name in args.agent}
+        if args.mode == "preflight":
+            report = workflow.preflight({"agents": selected}, timeout=args.timeout)
+            print("Owner actions: " + json.dumps(report["owner_actions"], sort_keys=True))
+        else:
+            # Codex last: the running harness keeps its original executable.
+            ordered = sorted(selected, key=lambda name: (name == "codex", name))
+            report = {"mode": "update", "results": {}}
+            for name in ordered:
+                agent = selected[name]
+                if not isinstance(agent.get("install"), dict):
+                    report["results"][name] = {"ok": False, "error": "install_not_configured"}
+                    continue
+                report["results"][name] = workflow.update_agent(
+                    agent, target=workflow.latest(agent, args.timeout), timeout=args.timeout_seconds or 600)
+        report["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+        path = report_dir / "report.json"
+        path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        print(f"Agent watch ({args.mode}) report: {path}")
+        if args.mode == "update":
+            for name, row in report["results"].items():
+                print(f"{name}: {row.get('old_version')} -> {row.get('new_version')} {row.get('error') or 'ok'}")
+            return int(any(not row.get("ok") and row.get("error") not in ("not_installed", "install_not_configured")
+                           for row in report["results"].values()))
+        return 0
+
+    matrix_versions = _read_verified_versions_from_matrix(Path("docs/agent-support/agent-support-matrix.yml"))
+    matrix_obj = Path("docs/agent-support/agent-support-matrix.yml").read_text(encoding="utf-8", errors="replace")
+    verified_map = _verified_versions_by_agent(matrix_versions)
+
+    # Extract evidence fixtures from matrix YAML (minimal parser for `agents.*.evidence_fixtures:` lists).
+    evidence: dict[str, list[str]] = {}
+    in_agents = False
+    current_agent: str | None = None
+    in_evidence = False
+    for raw in matrix_obj.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith("agents:"):
+            in_agents = True
+            current_agent = None
+            in_evidence = False
+            continue
+        if not in_agents:
+            continue
+        m_agent = re.match(r"^\s{2}([a-zA-Z0-9_]+):\s*$", line)
+        if m_agent:
+            current_agent = m_agent.group(1)
+            in_evidence = False
+            continue
+        if current_agent is None:
+            continue
+        if re.match(r"^\s{4}evidence_fixtures:\s*$", line):
+            in_evidence = True
+            evidence[current_agent] = []
+            continue
+        if in_evidence:
+            m_item = re.match(r'^\s{6}-\s+"?(.*?)"?\s*$', line)
+            if m_item:
+                evidence[current_agent].append(m_item.group(1))
+                continue
+            # Exit evidence block when indentation changes back to 4 spaces (new field) or 2 (new agent).
+            if re.match(r"^\s{4}\w+:", line) or re.match(r"^\s{2}\w+:", line):
+                in_evidence = False
+
+    if args.mode == "prebump":
+        return _run_prebump(args, cfg, report_dir=report_dir, verified_map=verified_map, evidence=evidence)
+
+    results: dict[str, Any] = {}
+    summary_lines: list[str] = []
+    any_actionable = False
+
+    for agent_name, agent_cfg in (cfg.get("agents") or {}).items():
+        if args.agent and agent_name not in args.agent:
+            continue
+        cadence = (agent_cfg.get("cadence") or {})
+        if args.mode == "daily" and not cadence.get("daily", False):
+            continue
+        if args.mode == "weekly" and not cadence.get("weekly", False):
+            continue
+
+        agent_out = report_dir / agent_name
+        agent_out.mkdir(parents=True, exist_ok=True)
+
+        verified = verified_map.get(agent_name)
+        verified_semver = (
+            _extract_dsh_semver(verified or "") if agent_name == "deepseek_harness"
+            else _extract_semver(verified or "")
+        ) if verified else None
+
+        installed_cmd = agent_cfg.get("installed_version_cmd")
+        effective_installed_cmd = installed_cmd if isinstance(installed_cmd, list) else None
+        installed_rc, installed_stdout, installed_stderr = (0, "", "skipped")
+        installed: str | None = None
+        if not args.skip_update:
+            (
+                effective_installed_cmd,
+                installed_rc,
+                installed_stdout,
+                installed_stderr,
+                installed,
+            ) = _run_installed_version_cmds(agent_cfg)
+            if agent_name == "deepseek_harness" and installed_rc == 0:
+                installed = _extract_dsh_semver(installed_stdout) or installed
+
+        upstream_sources = agent_cfg.get("upstream") or []
+        upstream: str | None = None
+        upstream_source_used: dict[str, Any] | None = None
+        upstream_source_status: str | None = None
+        upstream_errors: list[dict[str, Any]] = []
+
+        if not args.skip_update and isinstance(upstream_sources, list):
+            for s in upstream_sources:
+                if not isinstance(s, dict):
+                    continue
+                res = _fetch_upstream(s, timeout=args.timeout)
+                if res.get("ok"):
+                    upstream = res.get("version")
+                    upstream_source_used = res
+                    upstream_source_status = "current_fetch"
+                    break
+                upstream_errors.append(res)
+
+        if (
+            not args.skip_update
+            and upstream_sources
+            and upstream is None
+            and _upstream_fetch_degraded(upstream_errors)
+        ):
+            cached_upstream = _latest_cached_upstream_evidence(
+                agent_name=agent_name,
+                reports_root=report_dir.parent,
+            )
+            if cached_upstream is not None:
+                upstream = cached_upstream.get("version")
+                upstream_source_used = cached_upstream
+                upstream_source_status = "cached_prior_report"
+
+        schema_keywords = list((agent_cfg.get("risk_keywords") or {}).get("schema") or [])
+        usage_keywords = list((agent_cfg.get("risk_keywords") or {}).get("usage") or [])
+        notes_text = json.dumps(upstream_source_used, ensure_ascii=False) if upstream_source_used else ""
+
+        schema_hits = _keyword_hits(notes_text, schema_keywords)
+        usage_hits = _keyword_hits(notes_text, usage_keywords)
+
+        upstream_newer_than_verified = False
+        installed_newer_than_verified = False
+        if verified_semver and upstream:
+            upstream_newer_than_verified = _upstream_newer_than_verified(
+                agent_name, upstream, verified_semver
+            )
+        if verified_semver and installed:
+            cmp_iv = (_compare_dsh_semver if agent_name == "deepseek_harness" else _compare_semver)(
+                installed, verified_semver
+            )
+            installed_newer_than_verified = (cmp_iv == 1)
+
+        monitoring_failed = False
+        if not args.skip_update and upstream_sources and upstream is None:
+            monitoring_failed = not _upstream_fetch_degraded(upstream_errors)
+
+        weekly_details: dict[str, Any] | None = None
+        upstream_reconciliation: dict[str, Any] | None = None
+        probe_failed = False
+        probe_failed_but_upstream_degraded = False
+        discovery_contract_failed = False
+        schema_matches_baseline: bool | None = None
+        schema_diff: dict[str, Any] | None = None
+        weekly_schema_diff: dict[str, Any] | None = None
+        dsh_fresh_schema_diff: dict[str, Any] | None = None
+        if args.mode == "weekly":
+            weekly_details = {}
+            local_schema_cfg = (agent_cfg.get("weekly") or {}).get("local_schema")
+            if isinstance(local_schema_cfg, dict):
+                weekly_details["price_coverage"] = workflow.price_coverage(
+                    agent_name, local_schema_cfg, _read_json(Path("docs/prices-v2.json")))
+            discovery_contract_cfg = (agent_cfg.get("weekly") or {}).get("discovery_path_contract")
+            if isinstance(local_schema_cfg, dict):
+                kind = local_schema_cfg.get("kind")
+                roots = list(local_schema_cfg.get("roots") or [])
+                glob = str(local_schema_cfg.get("glob") or "**/*")
+                matrix_key = MATRIX_KEY_FOR_AGENT.get(agent_name)
+                baseline_paths = evidence.get(matrix_key or "", []) if matrix_key else []
+                baseline_type_keys = _baseline_type_keys_for_agent(agent_name, baseline_paths)
+
+                local_fp: dict[str, Any] | None = None
+                newest: Path | None = None
+                dsh_integrity_contract: dict[str, Any] | None = None
+
+                # OpenClaw 2026.10.5 keeps transcripts in agents/<id>/agent/
+                # openclaw-agent.sqlite. Sample that store when one exists; an install
+                # that never migrated still has only JSONL, sampled as before.
+                if kind == "openclaw_latest_session":
+                    local_fp = _openclaw_weekly_sqlite_fingerprint(local_schema_cfg)
+                    if local_fp is None:
+                        kind = "jsonl_newest"
+                    else:
+                        newest = Path(str(local_fp.get("file")))
+
+                # `kimi_wire_newest` selects the same way as `jsonl_newest` but
+                # fingerprints the nested loop-event structure as well.
+                if kind == "deepseek_harness_sessions":
+                    local_fp, dsh_integrity_contract = _dsh_weekly_scan(
+                        local_schema_cfg,
+                        sample_count=int(local_schema_cfg.get("sample_count") or 5),
+                        max_lines=int(local_schema_cfg.get("max_lines") or 5000),
+                    )
+                    roots = [str(dsh_integrity_contract.get("root"))] if dsh_integrity_contract.get("root") else roots
+                elif kind in ("jsonl_newest", "kimi_wire_newest"):
+                    max_lines = int(local_schema_cfg.get("max_lines") or 2500)
+                    required_types = list(local_schema_cfg.get("required_types") or [])
+                    exclude_globs_cfg = local_schema_cfg.get("exclude_globs")
+                    exclude_globs = [g for g in exclude_globs_cfg if isinstance(g, str)] if isinstance(exclude_globs_cfg, list) else None
+                    # Union the newest few sessions into one fingerprint so one thin
+                    # session cannot decide the verdict on its own, and skip the ones a
+                    # real-home prebump run wrote while enough real sessions exist.
+                    if required_types:
+                        pool = _newest_files_with_types(
+                            roots, glob, required_types, _PREBUMP_CANDIDATE_POOL,
+                            max_lines=400, exclude_globs=exclude_globs,
+                        )
+                    else:
+                        pool = _newest_files(
+                            roots, glob, _PREBUMP_CANDIDATE_POOL, exclude_globs=exclude_globs
+                        )
+                    prompt_needles = _prebump_prompt_needles(agent_cfg)
+                    recent, prebump_stats = _prefer_real_sessions(
+                        pool,
+                        _LOCAL_SCHEMA_SAMPLE_COUNT,
+                        lambda p: _is_prebump_session_file(p, prompt_needles),
+                    )
+                    newest = recent[0] if recent else None
+                    if newest:
+                        def _fp(p: Path) -> dict[str, Any]:
+                            if kind == "kimi_wire_newest":
+                                return _kimi_wire_schema_fingerprint(p, max_lines=max_lines)
+                            return _schema_fingerprint_for_agent(agent_name, p, max_lines=max_lines)
+
+                        # A sample that fails to read (a truncated or corrupt `.jsonl.zst`
+                        # can pass the head-only type check above) is skipped; the next
+                        # readable one leads the fingerprint.
+                        sampled_fps = _readable_fingerprints(recent, _fp)
+                        local_fp = sampled_fps[0] if sampled_fps else None
+                        if local_fp is not None:
+                            local_fp.update(prebump_stats)
+                            _set_sampled_total_parsed_lines(local_fp, sampled_fps)
+                        if len(sampled_fps) > 1:
+                            local_fp["type_keys"] = _merge_type_keys(sampled_fps)
+                            merged_counts: dict[str, int] = {}
+                            for fp in sampled_fps:
+                                for t, n in (fp.get("type_counts") or {}).items():
+                                    merged_counts[t] = merged_counts.get(t, 0) + int(n)
+                            local_fp["type_counts"] = dict(sorted(merged_counts.items()))
+                            _merge_sampled_parse_errors(local_fp, sampled_fps)
+                        if local_fp is not None:
+                            local_fp["sampled_files"] = [str(fp.get("file")) for fp in sampled_fps]
+                elif kind == "antigravity_markdown_newest":
+                    max_lines = int(local_schema_cfg.get("max_lines") or 2500)
+                    newest = _newest_file(roots, glob)
+                    if newest:
+                        local_fp = _antigravity_markdown_schema_fingerprint(newest, max_lines=max_lines)
+                elif kind == "hermes_session_json_newest":
+                    max_messages = int(local_schema_cfg.get("max_messages") or 2500)
+                    newest = _newest_file(roots, glob)
+                    if newest:
+                        local_fp = _hermes_session_json_schema_fingerprint(newest, max_messages=max_messages)
+                elif kind == "hermes_latest_session":
+                    max_messages = int(local_schema_cfg.get("max_messages") or 2500)
+                    db_roots_cfg = local_schema_cfg.get("db_roots") or []
+                    db_roots = [_expand_path(p) for p in db_roots_cfg if isinstance(p, str)]
+                    for db_path in db_roots:
+                        if db_path.exists():
+                            newest = db_path
+                            local_fp = _hermes_weekly_schema_fingerprint(
+                                db_path,
+                                max_messages=max_messages,
+                                prompt_needles=_prebump_prompt_needles(agent_cfg),
+                            )
+                            break
+                    if local_fp is None:
+                        newest = _newest_file(roots, glob)
+                        if newest:
+                            local_fp = _hermes_session_json_schema_fingerprint(newest, max_messages=max_messages)
+                elif kind == "opencode_storage_latest_session":
+                    max_messages = int(local_schema_cfg.get("max_messages") or 250)
+                    max_parts = int(local_schema_cfg.get("max_parts") or 2500)
+                    newest = _newest_file(roots, glob)
+                    if newest:
+                        local_fp = _opencode_storage_session_tree_schema_fingerprint(
+                            newest, max_messages=max_messages, max_parts=max_parts
+                        )
+                elif kind == "opencode_latest_session":
+                    max_messages = int(local_schema_cfg.get("max_messages") or 250)
+                    max_parts = int(local_schema_cfg.get("max_parts") or 2500)
+                    db_roots = list(local_schema_cfg.get("db_roots") or ["~/.local/share/opencode/opencode.db"])
+                    db_candidates = [_expand_path(str(p)) for p in db_roots if isinstance(p, str)]
+                    db_candidates = [p for p in db_candidates if p.exists()]
+                    if db_candidates:
+                        newest = max(db_candidates, key=lambda p: p.stat().st_mtime)
+                        local_fp = _opencode_sqlite_latest_session_schema_fingerprint(
+                            newest, max_messages=max_messages, max_parts=max_parts
+                        )
+                    else:
+                        newest = _newest_file(roots, glob)
+                        if newest:
+                            local_fp = _opencode_storage_session_tree_schema_fingerprint(
+                                newest, max_messages=max_messages, max_parts=max_parts
+                            )
+                elif kind == "devin_latest_session":
+                    max_nodes = int(local_schema_cfg.get("max_nodes") or 500)
+                    db_roots = list(local_schema_cfg.get("db_roots") or ["~/.local/share/devin/cli/sessions.db"])
+                    db_candidates = [_expand_path(str(x)) for x in db_roots if isinstance(x, str)]
+                    db_candidates = [x for x in db_candidates if x.exists()]
+                    if db_candidates:
+                        newest = max(db_candidates, key=lambda x: x.stat().st_mtime)
+                        local_fp = _devin_sqlite_latest_session_schema_fingerprint(newest, max_nodes=max_nodes)
+                elif kind == "fx_latest_session":
+                    # Per-directory selection, not the glob: a store can mix
+                    # schema-3 checkpoints and schema-4 event logs, and a
+                    # schema-3 directory also has an events.jsonl that is not a
+                    # transcript. Union the newest few, as for other agents.
+                    recent = _fx_newest_session_files(roots, _LOCAL_SCHEMA_SAMPLE_COUNT)
+                    if recent:
+                        newest = recent[0]
+                        sampled_fps = [_fx_session_schema_fingerprint(path) for path in recent]
+                        local_fp = sampled_fps[0]
+                        local_fp["type_keys"] = _merge_type_keys(sampled_fps)
+                        merged_counts: dict[str, int] = {}
+                        for fingerprint in sampled_fps:
+                            for event_type, count in (fingerprint.get("type_counts") or {}).items():
+                                merged_counts[event_type] = merged_counts.get(event_type, 0) + int(count)
+                        local_fp["type_counts"] = dict(sorted(merged_counts.items()))
+                        local_fp["parse_errors"] = sum(
+                            int(fingerprint.get("parse_errors") or 0) for fingerprint in sampled_fps
+                        )
+                        local_fp["sampled_files"] = [str(path) for path in recent]
+                elif kind == "cline_latest_session":
+                    roots = _cline_effective_roots(roots)
+                    exclude_cfg = local_schema_cfg.get("exclude_globs")
+                    exclude_globs = [g for g in exclude_cfg if isinstance(g, str)] if isinstance(exclude_cfg, list) else None
+                    # The manifest records the prebump sandbox as its `cwd`.
+                    prompt_needles = _prebump_prompt_needles(agent_cfg)
+                    recent, prebump_stats = _prefer_real_sessions(
+                        _newest_cline_files(
+                            roots, glob, _PREBUMP_CANDIDATE_POOL, exclude_globs=exclude_globs
+                        ),
+                        _LOCAL_SCHEMA_SAMPLE_COUNT,
+                        lambda p: _is_prebump_session_file(p, prompt_needles),
+                    )
+                    if recent:
+                        newest = recent[0]
+                        sampled_fps = [_cline_session_schema_fingerprint(path) for path in recent]
+                        local_fp = sampled_fps[0]
+                        local_fp.update(prebump_stats)
+                        local_fp["type_keys"] = _merge_type_keys(sampled_fps)
+                        merged_counts: dict[str, int] = {}
+                        for fingerprint in sampled_fps:
+                            for event_type, count in (fingerprint.get("type_counts") or {}).items():
+                                merged_counts[event_type] = merged_counts.get(event_type, 0) + int(count)
+                        local_fp["type_counts"] = dict(sorted(merged_counts.items()))
+                        local_fp["parse_errors"] = sum(
+                            int(fingerprint.get("parse_errors") or 0) for fingerprint in sampled_fps
+                        )
+                        local_fp["sampled_files"] = [str(path) for path in recent]
+                        logical_stat = _cline_pair_stat(newest)
+                        if logical_stat is not None:
+                            local_fp["logical_mtime_epoch"] = logical_stat[0]
+                            local_fp["logical_size"] = logical_stat[1]
+                elif kind == "cursor_transcript_newest":
+                    max_lines = int(local_schema_cfg.get("max_lines") or 2500)
+                    exclude_cfg = local_schema_cfg.get("exclude_globs")
+                    exclude_globs = (
+                        [g for g in exclude_cfg if isinstance(g, str)]
+                        if isinstance(exclude_cfg, list)
+                        else None
+                    )
+                    local_fp = _cursor_recent_schema_fingerprint(
+                        roots,
+                        glob,
+                        max_lines=max_lines,
+                        exclude_globs=exclude_globs,
+                        exclude_prebump=True,
+                        prompt_needles=_prebump_prompt_needles(agent_cfg),
+                    )
+                    if isinstance(local_fp, dict) and isinstance(local_fp.get("file"), str):
+                        newest = Path(local_fp["file"])
+
+                if local_fp is not None:
+                    workflow.add_sampling_contract(agent_name, local_schema_cfg, local_fp)
+                    compressed_glob = local_schema_cfg.get("compressed_glob")
+                    if isinstance(compressed_glob, str) and compressed_glob:
+                        # Codex rollout compression replaces cold `.jsonl` files with
+                        # `.jsonl.zst`; a non-zero count is the signal that it has
+                        # reached this machine.
+                        local_fp["compressed_files"] = sum(
+                            1
+                            for r in roots
+                            if _expand_path(r).exists()
+                            for p in _expand_path(r).rglob(compressed_glob)
+                            if p.is_file()
+                        )
+                    weekly_details["local_schema"] = local_fp
+                    if baseline_type_keys:
+                        if kind == "deepseek_harness_sessions":
+                            schema_diff = _dsh_schema_diff(
+                                fingerprint=local_fp,
+                                baseline_type_keys=baseline_type_keys,
+                            )
+                        else:
+                            schema_diff = _schema_diff(
+                                observed_type_keys=local_fp.get("type_keys") or {},
+                                baseline_type_keys=baseline_type_keys,
+                                observed_event_count=_observed_event_count(local_fp),
+                            )
+                        schema_matches_baseline = _weekly_schema_matches(schema_diff, local_fp)
+                        if kind == "deepseek_harness_sessions":
+                            weekly_schema_diff = schema_diff
+                        weekly_details["baseline_schema"] = {
+                            "fixtures": [p for p in baseline_paths if isinstance(p, str) and "schema_drift" not in p],
+                            "type_keys": baseline_type_keys,
+                        }
+                        weekly_details["schema_diff"] = schema_diff
+                else:
+                    weekly_details["local_schema"] = {"error": "no_files_found", "roots": roots, "glob": glob, "kind": kind}
+                    workflow.add_sampling_contract(agent_name, local_schema_cfg, weekly_details["local_schema"])
+
+                if kind == "deepseek_harness_sessions" and local_fp is not None and dsh_integrity_contract is not None:
+                    local_fp["store_sessions"] = dsh_integrity_contract.get("candidate_sessions", 0)
+
+                if isinstance(discovery_contract_cfg, dict):
+                    local_file = None
+                    if isinstance(local_fp, dict):
+                        local_file_value = local_fp.get("file")
+                        if isinstance(local_file_value, str):
+                            local_file = local_file_value
+                    contract_result = _check_discovery_path_contract(local_file, discovery_contract_cfg)
+                    if kind == "deepseek_harness_sessions" and dsh_integrity_contract is not None:
+                        path_ok = bool(contract_result.get("ok"))
+                        integrity_ok = bool(dsh_integrity_contract.get("ok"))
+                        contract_result["path_ok"] = path_ok
+                        contract_result["session_integrity"] = dsh_integrity_contract
+                        contract_result["ok"] = path_ok and integrity_ok
+                        discovery_contract_failed = bool(
+                            dsh_integrity_contract.get("failure_is_actionable")
+                        ) or (bool(local_file) and not path_ok)
+                    weekly_details["discovery_path_contract"] = contract_result
+                    if kind != "deepseek_harness_sessions":
+                        discovery_contract_failed = bool(local_file) and not bool(contract_result.get("ok"))
+                    if (weekly_details.get("local_schema") or {}).get("sampling_contract_error"):
+                        contract_result["sampling_ok"] = False
+                        contract_result["ok"] = False
+                        discovery_contract_failed = True
+
+            probes_cfg = (agent_cfg.get("weekly") or {}).get("probes") or []
+            probe_results: list[dict[str, Any]] = []
+            if isinstance(probes_cfg, list):
+                for p in probes_cfg:
+                    if not isinstance(p, dict):
+                        continue
+                    probe_results.append(_run_probe_script(p, agent_out, verbose=args.verbose))
+            if probe_results:
+                weekly_details["probes"] = probe_results
+                probe_failed = any(not pr.get("ok") for pr in probe_results)
+            probe_failed = probe_failed or discovery_contract_failed
+            if agent_name == "claude":
+                status = next((pr for pr in probe_results if pr.get("label") == "claude_status"), None)
+                usage = next((pr for pr in probe_results if pr.get("label") == "claude_usage_probe"), None)
+                status_parsed = (status or {}).get("parsed") if isinstance(status, dict) else None
+                if isinstance(status_parsed, dict):
+                    indicator = status_parsed.get("indicator")
+                    incidents = status_parsed.get("incidents_count")
+                    degraded = (isinstance(indicator, str) and indicator not in ("none", "unknown")) or (
+                        isinstance(incidents, int) and incidents > 0
+                    )
+                    usage_ok = bool((usage or {}).get("ok")) if isinstance(usage, dict) else True
+                    if degraded and not usage_ok:
+                        probe_failed_but_upstream_degraded = True
+
+            # Version reconciliation has to run HERE, after the probes: `upstream` and
+            # `upstream_newer_than_verified` were computed from the configured registry
+            # source long before any CLI was asked what it thinks the latest build is.
+            upstream_reconciliation = _reconcile_latest_version_from_probes(
+                upstream=upstream, probe_results=probe_results
+            )
+            if isinstance(upstream_reconciliation, dict):
+                weekly_details["latest_version_reconciliation"] = upstream_reconciliation
+                chosen = upstream_reconciliation.get("chosen_version")
+                if isinstance(chosen, str) and chosen and chosen != upstream:
+                    upstream = chosen
+                    # Recompute the drift flag against the version we actually adopted;
+                    # leaving it derived from the superseded value is the whole defect.
+                    upstream_newer_than_verified = _upstream_newer_than_verified(
+                        agent_name, upstream, verified_semver
+                    )
+                    # `monitoring_failed` is deliberately NOT cleared here. If the
+                    # configured source failed outright, that source is still broken and
+                    # must stay reported as broken; a CLI self-report is better data for
+                    # the version, not a repair of the monitoring path.
+
+        severity, recommendation = _pick_severity(
+            upstream_newer_than_verified=upstream_newer_than_verified,
+            installed_newer_than_verified=installed_newer_than_verified,
+            monitoring_failed=monitoring_failed,
+            schema_hits=schema_hits,
+            usage_hits=usage_hits,
+            probe_failed=probe_failed,
+            probe_failed_but_upstream_degraded=probe_failed_but_upstream_degraded,
+        )
+
+        sample_freshness: dict[str, Any] | None = None
+        fresh_evidence_available = False
+        fresh_evidence_source: str | None = None
+        prebump_evidence: dict[str, Any] | None = None
+        failed_prebump_evidence: dict[str, Any] | None = None
+        if args.mode == "weekly":
+            window_days_cfg = int(((agent_cfg.get("weekly") or {}).get("freshness_window_days") or 14))
+            window_seconds = window_days_cfg * 86400
+            sample_mtime_epoch: float | None = None
+            if isinstance(weekly_details, dict):
+                local_schema_obj = weekly_details.get("local_schema")
+                if isinstance(local_schema_obj, dict):
+                    logical_mtime = local_schema_obj.get("logical_mtime_epoch")
+                    if isinstance(logical_mtime, (int, float)):
+                        sample_mtime_epoch = float(logical_mtime)
+                    fpath = local_schema_obj.get("file")
+                    if sample_mtime_epoch is None and isinstance(fpath, str):
+                        try:
+                            st = os.stat(fpath)
+                            sample_mtime_epoch = float(st.st_mtime)
+                            local_schema_obj["mtime_epoch"] = sample_mtime_epoch
+                            local_schema_obj["mtime_utc"] = _epoch_to_utc_iso(sample_mtime_epoch)
+                        except OSError:
+                            pass
+            cli_path, cli_mtime = _resolve_cli_binary_mtime(effective_installed_cmd)
+            mode_context = "skip_update" if args.skip_update else "normal"
+            sample_freshness = _compute_sample_freshness(
+                sample_mtime=sample_mtime_epoch,
+                cli_binary_path=cli_path,
+                cli_binary_mtime=cli_mtime,
+                freshness_window_seconds=window_seconds,
+                now_epoch=datetime.now(timezone.utc).timestamp(),
+                mode_context=mode_context,
+                force_fresh=(
+                    bool(getattr(args, "force_fresh", False))
+                    and agent_name != "deepseek_harness"
+                ),
+            )
+            if agent_name == "deepseek_harness" and isinstance(weekly_details, dict):
+                local_schema_obj = weekly_details.get("local_schema")
+                samples = (
+                    local_schema_obj.get("sample_evidence")
+                    if isinstance(local_schema_obj, dict)
+                    else None
+                )
+                now_epoch = datetime.now(timezone.utc).timestamp()
+                fresh_samples: list[dict[str, Any]] = []
+                newest_sample_freshness: dict[str, Any] | None = None
+                if isinstance(samples, list):
+                    for sample in samples:
+                        if not isinstance(sample, dict):
+                            continue
+                        freshness = _dsh_source_sample_freshness(
+                            sample,
+                            cli_binary_path=cli_path,
+                            cli_binary_mtime=cli_mtime,
+                            freshness_window_seconds=window_seconds,
+                            now_epoch=now_epoch,
+                        )
+                        freshness["force_fresh_requested"] = bool(
+                            getattr(args, "force_fresh", False)
+                        )
+                        sample["freshness"] = freshness
+                        if newest_sample_freshness is None:
+                            newest_sample_freshness = freshness
+                        if freshness.get("fresh_for_compatibility") is True:
+                            fresh_samples.append(sample)
+
+                fresh_fingerprints = [
+                    {
+                        key: sample.get(key)
+                        for key in (
+                            "file",
+                            "generation",
+                            "source_created_at_epoch",
+                            "source_created_at_utc",
+                            "artifact_mtime_epoch",
+                            "artifact_mtime_utc",
+                            "parsed_lines",
+                            "type_counts",
+                            "type_keys",
+                            "catalog_known_event_types",
+                            "accepted_unknown_ignorable_types",
+                            "unsupported_required_event_types",
+                        )
+                    }
+                    for sample in fresh_samples
+                ]
+                fresh_local_schema = _dsh_merge_fingerprints(fresh_fingerprints)
+                weekly_details["fresh_local_schema"] = fresh_local_schema
+                weekly_details["fresh_sampled_sessions"] = len(fresh_samples)
+                if fresh_local_schema is not None and isinstance(
+                    weekly_details.get("baseline_schema"), dict
+                ):
+                    baseline = weekly_details["baseline_schema"].get("type_keys")
+                    if isinstance(baseline, dict):
+                        dsh_fresh_schema_diff = _dsh_schema_diff(
+                            fingerprint=fresh_local_schema,
+                            baseline_type_keys=baseline,
+                        )
+                        weekly_details["fresh_schema_diff"] = dsh_fresh_schema_diff
+                        schema_diff = dsh_fresh_schema_diff
+                        schema_matches_baseline = bool(
+                            dsh_fresh_schema_diff.get("unknown_only_is_empty")
+                        )
+                if fresh_samples:
+                    sample_freshness = fresh_samples[0]["freshness"]
+                elif newest_sample_freshness is not None:
+                    sample_freshness = newest_sample_freshness
+                    schema_matches_baseline = None
+                else:
+                    sample_freshness = {
+                        "is_stale": True,
+                        "stale_reason": "no_parseable_dsh_sample",
+                        "mode_context": "dsh_source_reported_created_at",
+                        "cli_binary_path": cli_path,
+                        "cli_binary_mtime_utc": _epoch_to_utc_iso(cli_mtime),
+                        "freshness_window_seconds": int(window_seconds),
+                        "fresh_for_compatibility": False,
+                        "force_fresh_requested": bool(
+                            getattr(args, "force_fresh", False)
+                        ),
+                    }
+            if isinstance(agent_cfg.get("prebump"), dict):
+                prebump_evidence, failed_prebump_evidence = _latest_prebump_evidence(
+                    agent_name=agent_name,
+                    reports_root=report_dir.parent,
+                    cli_binary_mtime=cli_mtime,
+                )
+                if prebump_evidence is not None:
+                    # Keep the weekly union's own diff: the substitution below swaps in
+                    # the prebump's tiny one-prompt session, and the thin-sample gate
+                    # must still see the richer sample we already collected.
+                    weekly_schema_diff = schema_diff if isinstance(schema_diff, dict) else None
+                    prebump_sample = prebump_evidence.get("sample_freshness")
+                    if isinstance(prebump_sample, dict):
+                        sample_freshness = dict(prebump_sample)
+                        sample_freshness["mode_context"] = "latest_prebump_report"
+                    if prebump_evidence.get("schema_matches_baseline") is True and _prebump_may_replace_weekly_verdict(
+                        weekly_schema_diff
+                    ):
+                        schema_matches_baseline = True
+                        schema_diff = prebump_evidence.get("schema_diff") if isinstance(prebump_evidence.get("schema_diff"), dict) else schema_diff
+                    fresh_evidence_available = True
+                    fresh_evidence_source = "latest_prebump_report"
+
+        # If we have concrete evidence that the newest local schema matches our fixture baseline,
+        # downgrade "installed newer" to low and suggest bumping verified version.
+        if (
+            args.mode == "weekly"
+            and severity in ("medium", "low")
+            and installed_newer_than_verified
+            and schema_matches_baseline is True
+            and not probe_failed
+        ):
+            severity = "low"
+            recommendation = "bump_verified_version"
+
+        if args.mode == "weekly":
+            severity, recommendation = _apply_stale_override(
+                severity=severity,
+                recommendation=recommendation,
+                installed_newer_than_verified=installed_newer_than_verified,
+                schema_matches_baseline=schema_matches_baseline,
+                sample_freshness=sample_freshness,
+                probe_failed=probe_failed,
+            )
+
+        if args.mode == "weekly":
+            compatibility = _build_compatibility_assessment(
+                verified=verified,
+                installed=installed,
+                upstream=upstream,
+                upstream_source_status=upstream_source_status,
+                upstream_sources_configured=bool(upstream_sources),
+                upstream_errors=upstream_errors,
+                installed_newer_than_verified=installed_newer_than_verified,
+                upstream_newer_than_verified=upstream_newer_than_verified,
+                monitoring_failed=monitoring_failed,
+                schema_matches_baseline=schema_matches_baseline,
+                schema_diff=schema_diff,
+                weekly_schema_diff=weekly_schema_diff,
+                fresh_schema_diff=dsh_fresh_schema_diff,
+                fresh_schema_required=agent_name == "deepseek_harness",
+                sample_freshness=sample_freshness,
+                fresh_evidence_source=fresh_evidence_source,
+                probe_failed=probe_failed,
+                real_session_driver_configured=isinstance(agent_cfg.get("prebump"), dict),
+                failed_prebump_evidence=failed_prebump_evidence,
+            )
+            severity, recommendation = _apply_compatibility_to_legacy_status(
+                severity=severity,
+                recommendation=recommendation,
+                compatibility=compatibility,
+            )
+        else:
+            compatibility = {
+                "question": "Can current Agent Sessions code support the latest available session/storage/usage format for this agent?",
+                "verdict": "not_evaluated_daily",
+                "scope": "none",
+                "confidence": "none",
+                "latest_status": (
+                    "cached_latest"
+                    if upstream and upstream_source_status == "cached_prior_report"
+                    else (
+                        "current_fetch_known"
+                        if upstream
+                        else ("unknown_fetch_failed" if upstream_errors else "unknown_not_configured")
+                    )
+                ),
+                "verified_version": verified,
+                "installed_version": installed,
+                "latest_available_version": upstream,
+                "supports_installed": None,
+                "supports_latest": None,
+                "evidence_source": "not_collected_daily",
+                "fresh_schema_evidence": False,
+                "blockers": [],
+                "next_action": "run weekly mode for compatibility verdict",
+            }
+
+        # Daily runs should only bother the user when something looks risky/urgent.
+        # Low severity (newer version with no risk signal) is recorded silently.
+        if args.mode == "weekly":
+            actionable = severity != "none"
+        else:
+            actionable = severity in ("medium", "high")
+        any_actionable = any_actionable or actionable
+
+        results[agent_name] = {
+            "tier": workflow.tiers().get(agent_name, "unrecorded"),
+            "hold": workflow.matrix_hold(agent_name),
+            "verified_version": verified,
+            "installed": {
+                "argv": effective_installed_cmd,
+                "exit_code": installed_rc,
+                "stdout": installed_stdout,
+                "stderr": installed_stderr,
+                "parsed_version": installed,
+            },
+            "upstream": {
+                "parsed_version": upstream,
+                # Where the number above actually came from. Without this a reader
+                # cannot tell a registry answer from a CLI self-report from a cached
+                # value carried over from a prior run, and all three lead to different
+                # conclusions when the version looks surprising.
+                "parsed_version_provenance": (
+                    upstream_reconciliation.get("provenance")
+                    if isinstance(upstream_reconciliation, dict)
+                    else (
+                        "cached_prior_report"
+                        if upstream and upstream_source_status == "cached_prior_report"
+                        else ("upstream_source" if upstream else "none")
+                    )
+                ),
+                "reconciliation": upstream_reconciliation,
+                "source_used": upstream_source_used,
+                "source_status": upstream_source_status,
+                "errors": upstream_errors[:3],
+            },
+            "diff": {
+                "upstream_newer_than_verified": upstream_newer_than_verified,
+                "installed_newer_than_verified": installed_newer_than_verified,
+            },
+            "risk": {
+                "schema_keyword_hits": schema_hits,
+                "usage_keyword_hits": usage_hits,
+                "monitoring_failed": monitoring_failed,
+            },
+            "weekly": weekly_details,
+            "evidence": {
+                "schema_matches_baseline": schema_matches_baseline,
+                "schema_diff": schema_diff,
+                "sample_freshness": sample_freshness,
+                "fresh_evidence_available": fresh_evidence_available,
+                "fresh_evidence_source": fresh_evidence_source,
+                "prebump_evidence": prebump_evidence,
+                "failed_prebump_evidence": failed_prebump_evidence,
+            },
+            "compatibility": compatibility,
+            "severity": severity,
+            "recommendation": recommendation,
+        }
+
+        if args.mode == "weekly" or severity != "none":
+            summary_lines.append(
+                _format_summary_line(
+                    agent_name=agent_name,
+                    severity=severity,
+                    verified=verified,
+                    installed=installed,
+                    upstream=upstream,
+                    recommendation=recommendation,
+                    sample_freshness=sample_freshness,
+                    compatibility=compatibility,
+                    upstream_reconciliation=upstream_reconciliation,
+                ) + workflow.sampling_summary((weekly_details or {}).get("local_schema") or {})
+            )
+
+    report = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": args.mode,
+        "config": _safe_relpath(cfg_path),
+        "report_dir": _safe_relpath(report_dir),
+        "results": results,
+    }
+
+    report_path = report_dir / "report.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # Output policy:
+    # - daily: print only when actionable
+    # - weekly: always print a short summary
+    if args.mode == "weekly" or any_actionable:
+        print(f"Agent watch ({args.mode}) report: {report_path}")
+        for line in summary_lines[:40]:
+            print(line)
+
+    if args.mode == "daily" and not any_actionable:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

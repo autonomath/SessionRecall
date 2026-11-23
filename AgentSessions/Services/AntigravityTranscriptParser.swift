@@ -1,0 +1,263 @@
+import Foundation
+import CryptoKit
+
+/// Parser for Antigravity CLI JSONL transcripts.
+/// Layout: ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl
+enum AntigravityTranscriptParser {
+    static func parse(at url: URL, forcedID: String?, includeEvents: Bool) -> Session? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        guard !lines.isEmpty else { return nil }
+        // Only claim JSONL that is actually an antigravity-cli transcript. Every
+        // antigravity-cli record carries a top-level `step_index`; other JSONL
+        // session formats (e.g. legacy Gemini CLI transcripts) do not, so we leave
+        // them for their own parsers instead of mis-claiming them here.
+        guard isAntigravityTranscript(lines) else { return nil }
+
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.intValue ?? -1
+        let mtime = (attrs[.modificationDate] as? Date) ?? Date()
+        let ctime = (attrs[.creationDate] as? Date) ?? mtime
+        let sid = forcedID ?? conversationID(for: url) ?? sha256(path: url.path)
+
+        let iso = ISO8601DateFormatter()
+        var events: [SessionEvent] = []
+        var firstUserText: String? = nil
+        var model: String? = nil
+        var lastToolName: String? = nil
+        // Tool results follow their PLANNER_RESPONSE in call order, so the names of
+        // the calls not yet answered pair each result with the call that made it.
+        // Each entry also holds the synthesized call id ("ag:<step_index>:<k>") and the agent's label,
+        // so the result takes the same id and label as its call.
+        var pendingToolNames: [(name: String?, id: String, label: String?)] = []
+        var firstDate: Date? = nil
+        var lastDate: Date? = nil
+        var count = 0
+
+        for (idx, line) in lines.enumerated() {
+            guard let data = line.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let type = obj["type"] as? String else { continue }
+            count += 1
+            let ts = (obj["created_at"] as? String).flatMap { iso.date(from: $0) }
+            if let ts { if firstDate == nil { firstDate = ts }; lastDate = ts }
+            let content = obj["content"] as? String
+            // The CLI clips long payloads upstream and names the clipped fields in
+            // `truncated_fields`. Without surfacing it the transcript looks complete
+            // when it is not, so mark the text we hand on.
+            let contentTruncated = (obj["truncated_fields"] as? [Any])?
+                .contains { ($0 as? String) == "content" } ?? false
+            let raw = line
+
+            switch type {
+            case "USER_INPUT":
+                let unwrapped = unwrapUserRequest(content ?? "")
+                if firstUserText == nil { firstUserText = unwrapped }
+                // `Session.model` is the current (last selected) model, matching the
+                // descriptor: "current model comes from loaded Session metadata".
+                if let selected = modelName(fromUserInput: content ?? "") { model = selected }
+                if includeEvents {
+                    events.append(makeEvent(sid, eventID(idx), ts, .user, "user", unwrapped, nil, nil, nil, raw))
+                }
+            case "PLANNER_RESPONSE":
+                if includeEvents {
+                    // A PLANNER_RESPONSE may carry the model's actual answer in `content`
+                    // and/or internal reasoning in `thinking`. Prefer the answer.
+                    let thinking = obj["thinking"] as? String
+                    let assistantText = content ?? thinking ?? ""
+                    // `truncated_fields` names `content` specifically, so only mark when
+                    // that is what we rendered — falling back to `thinking` must not
+                    // inherit a truncation flag that was never about it.
+                    events.append(makeEvent(sid, eventID(idx), ts, .assistant, "assistant",
+                                            markTruncated(assistantText, contentTruncated && content != nil),
+                                            nil, nil, nil, raw))
+                    if let calls = obj["tool_calls"] as? [[String: Any]] {
+                        let stepIndex = (obj["step_index"] as? Int) ?? idx
+                        pendingToolNames = calls.enumerated().map { ci, call in
+                            (name: call["name"] as? String,
+                             id: "ag:\(stepIndex):\(ci)",
+                             label: toolSummaryLabel(call["args"] as? [String: Any]))
+                        }
+                        for (ci, call) in calls.enumerated() {
+                            let name = call["name"] as? String
+                            lastToolName = name
+                            let input = (call["args"] as? [String: Any]).map {
+                                ToolJSON.string(from: $0, pretty: false) ?? ""
+                            }
+                            events.append(makeEvent(sid, "\(eventID(idx))-t\(ci)", ts, .tool_call, "assistant", nil, name, input, nil, raw,
+                                                    toolCallID: pendingToolNames[ci].id,
+                                                    toolSidecar: ToolSidecar(agentLabel: pendingToolNames[ci].label).orNilIfEmpty))
+                        }
+                    }
+                }
+            // Every step the model's tool calls produce carries the same MODEL-sourced
+            // result envelope (`source`/`status`/`step_index`/`content`), so it renders
+            // as a tool result whatever its type. CODE_ACTION and SEARCH_WEB were once
+            // left to `default:` as system meta; GENERIC (the result of run_command,
+            // view_file, replace_file_content, and every tool of the desktop app) and
+            // GREP_SEARCH were too, and they are most of the tool results on disk.
+            case _ where isToolResult(type: type, source: obj["source"] as? String):
+                if includeEvents {
+                    let paired = pendingToolNames.isEmpty ? nil : pendingToolNames.removeFirst()
+                    let name = paired?.name ?? lastToolName
+                    events.append(makeEvent(sid, eventID(idx), ts, .tool_result, "tool", nil, name, nil,
+                                            markTruncated(content, contentTruncated), raw,
+                                            toolCallID: paired?.id,
+                                            toolSidecar: ToolSidecar(agentLabel: paired?.label).orNilIfEmpty))
+                }
+            default: // CHECKPOINT, CONVERSATION_HISTORY, SYSTEM_MESSAGE, unknown SYSTEM records
+                if includeEvents {
+                    events.append(makeEvent(sid, eventID(idx), ts, .meta, "system",
+                                            markTruncated(content, contentTruncated), nil, nil, nil, raw))
+                }
+            }
+        }
+
+        guard count > 0 else { return nil }
+
+        let title = firstUserText?.split(separator: "\n").first.map(String.init)
+            ?? url.deletingLastPathComponent().lastPathComponent
+
+        return Session(id: sid,
+                       source: .antigravity,
+                       startTime: firstDate ?? ctime,
+                       endTime: lastDate ?? mtime,
+                       model: model,
+                       filePath: url.path,
+                       fileSizeBytes: size >= 0 ? size : nil,
+                       eventCount: count,
+                       events: includeEvents ? events : [],
+                       cwd: nil,
+                       repoName: nil,
+                       lightweightTitle: title)
+    }
+
+    /// Named result types are tool results even without a `source`. Any other record
+    /// written by the model (`source: MODEL`) that is not a PLANNER_RESPONSE is the
+    /// output of a tool call too: all 200 such records on disk (both brain roots,
+    /// 2026-10-21) follow a call.
+    /// SYSTEM-sourced records (CHECKPOINT, CONVERSATION_HISTORY, SYSTEM_MESSAGE)
+    /// stay meta.
+    static func isToolResult(type: String, source: String?) -> Bool {
+        switch type {
+        case "RUN_COMMAND", "VIEW_FILE", "LIST_DIRECTORY", "CODE_ACTION", "SEARCH_WEB", "GREP_SEARCH", "GENERIC":
+            return true
+        case "USER_INPUT", "PLANNER_RESPONSE", "CHECKPOINT", "CONVERSATION_HISTORY", "SYSTEM_MESSAGE":
+            return false
+        default:
+            return source == "MODEL"
+        }
+    }
+
+    /// Antigravity-cli transcripts tag every record with a top-level `step_index`
+    /// alongside a string `type`. Require at least one such record so foreign JSONL
+    /// formats are not mis-claimed as antigravity sessions.
+    static func isAntigravityTranscript(_ lines: [String]) -> Bool {
+        for line in lines {
+            guard let data = line.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            if obj["step_index"] != nil, obj["type"] is String { return true }
+        }
+        return false
+    }
+
+    static func unwrapUserRequest(_ content: String) -> String {
+        // Prefer the inside of <USER_REQUEST>…</USER_REQUEST>.
+        if let r = content.range(of: "<USER_REQUEST>"),
+           let e = content.range(of: "</USER_REQUEST>"),
+           r.upperBound <= e.lowerBound {
+            return String(content[r.upperBound..<e.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Otherwise drop any metadata blocks and return the remainder.
+        var out = content
+        for tag in ["<ADDITIONAL_METADATA>", "<USER_SETTINGS_CHANGE>"] {
+            if let r = out.range(of: tag) { out = String(out[..<r.lowerBound]) }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static let settingsChangeOpenTag = "<USER_SETTINGS_CHANGE>"
+    private static let settingsChangeCloseTag = "</USER_SETTINGS_CHANGE>"
+
+    /// Matches "`Model Selection` from <old> to <new>" inside a settings block and
+    /// captures <new>. `.` does not cross lines, so the capture stops at a newline;
+    /// it also stops at the first period that ends a sentence (followed by
+    /// whitespace, a tag, or the end) or at a tag. Version dots such as "3.5"
+    /// survive, and the trailing instructions are not stored as the model.
+    private static let modelSelectionRegex = try? NSRegularExpression(
+        pattern: "`Model Selection`\\s+from\\s+.+?\\s+to\\s+(.+?)(?:\\.(?=\\s|<|$)|(?=<)|(?=\\n)|$)")
+
+    static func modelName(fromUserInput content: String) -> String? {
+        // The selection is embedded in a USER_INPUT record's content as a
+        // <USER_SETTINGS_CHANGE> block: "...`Model Selection` from <old> to <new>."
+        // followed by more prompt text. The user's own request comes first in the
+        // same content and may mention "Model Selection" in prose, so read only the
+        // last settings block (to the end of content when it is not closed).
+        guard let open = content.range(of: settingsChangeOpenTag, options: .backwards) else { return nil }
+        let afterOpen = content[open.upperBound...]
+        let block = afterOpen.range(of: settingsChangeCloseTag)
+            .map { String(afterOpen[..<$0.lowerBound]) } ?? String(afterOpen)
+        guard let rx = modelSelectionRegex else { return nil }
+        let ns = block as NSString
+        guard let m = rx.firstMatch(in: block, range: NSRange(location: 0, length: ns.length)),
+              m.numberOfRanges > 1 else { return nil }
+        let name = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    static func conversationID(for url: URL) -> String? {
+        // .../brain/<id>/.system_generated/logs/transcript.jsonl  → <id>
+        let comps = url.pathComponents
+        if let i = comps.firstIndex(of: "brain"), i + 1 < comps.count {
+            return comps[i + 1]
+        }
+        // Otherwise derive <id> from the conversation folder that holds
+        // .system_generated/logs/transcript.jsonl.
+        if let i = comps.firstIndex(of: ".system_generated"), i > 0 {
+            return comps[i - 1]
+        }
+        return nil
+    }
+
+    /// Zero-padded id stem for a line's primary event. Line events get this stem
+    /// directly; tool-call events append a `-t<ci>` suffix so their ids never collide
+    /// with a later line's stem (e.g. line 1's first tool call must not equal line 100).
+    private static func eventID(_ idx: Int) -> String { String(format: "%04d", idx) }
+
+    /// Appends a marker when the CLI reported `content` in `truncated_fields`. The
+    /// clipping happens upstream, so this is the only signal that what we show is
+    /// partial; silently rendering it would misrepresent the transcript.
+    static let truncationMarker = "\n\n[content truncated by Antigravity CLI]"
+
+    private static func markTruncated(_ text: String?, _ truncated: Bool) -> String? {
+        guard truncated, let text, !text.isEmpty else { return text }
+        return text + truncationMarker
+    }
+
+    private static func makeEvent(_ sid: String, _ idSuffix: String, _ ts: Date?, _ kind: SessionEventKind,
+                                  _ role: String, _ text: String?, _ tool: String?, _ input: String?,
+                                  _ output: String?, _ raw: String,
+                                  toolCallID: String? = nil, toolSidecar: ToolSidecar? = nil) -> SessionEvent {
+        SessionEvent(id: "\(sid)-\(idSuffix)", timestamp: ts, kind: kind, role: role,
+                     text: text, toolName: tool, toolInput: input, toolOutput: output,
+                     toolCallID: toolCallID, toolSidecar: toolSidecar,
+                     messageID: nil, parentID: nil, isDelta: false, rawJSON: raw)
+    }
+
+    /// `args.toolSummary` is itself a JSON string ("\"Run date command\""); decode it once.
+    /// A value that is not a JSON string is used as written.
+    private static func toolSummaryLabel(_ args: [String: Any]?) -> String? {
+        guard let summary = args?["toolSummary"] as? String else { return nil }
+        var text = summary
+        if let data = summary.data(using: .utf8),
+           let decoded = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? String {
+            text = decoded
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func sha256(path: String) -> String {
+        SHA256.hash(data: Data(path.utf8)).compactMap { String(format: "%02x", $0) }.joined()
+    }
+}

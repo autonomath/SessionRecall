@@ -1,0 +1,565 @@
+import Foundation
+
+/// Per-session token-activity signal for Claude sessions.
+///
+/// Claude transcripts do not log account rate limits (those come from the OAuth/
+/// web usage API), so — unlike Codex — there is no per-session "direct" burn
+/// signal. What Claude logs *does* carry is per-turn `message.usage` token
+/// counts with ISO timestamps. We turn that into a tokens/sec rate per session
+/// and let `CodexRunwayTokenActivityParser`'s sibling math distribute the
+/// account-wide burn proportionally (always `.mixed` confidence).
+///
+/// Two Claude-specific wrinkles vs. the Codex token parser:
+/// - usage is **per-call incremental**, not a cumulative counter, so we *sum*
+///   token increments across a contiguous burst instead of taking a delta.
+/// - streaming emits duplicate rows that share a `message.id`; we dedupe on it.
+struct ClaudeRunwayTokenActivitySample: Equatable, Sendable {
+    let logPath: String
+    let capturedAt: Date
+    let tokens: Double
+    /// Timestamp of the transcript line immediately preceding this usage line —
+    /// i.e. when this turn started. Used for a provisional single-sample rate
+    /// before a two-sample diff is available. nil when unknown.
+    var turnStartedAt: Date?
+    /// Per-turn (incremental) per-type counts for $ pricing (Phase 2). Claude's
+    /// `message.usage` is per-call, so these are summed across a burst (not delta'd).
+    var input: Double = 0
+    var output: Double = 0
+    /// Cache writes split by TTL, because they bill differently: a 5-minute write is
+    /// 1.25× base input, a 1-hour write is 2×. A record with no `cache_creation`
+    /// sub-object puts its flat total in `cacheCreation5m`, which is the rate the
+    /// single pre-split column always meant.
+    var cacheCreation5m: Double = 0
+    var cacheCreation1h: Double = 0
+    var cacheRead: Double = 0
+    var modelSlug: String? = nil
+    /// Billing tier from `usage.speed`. Fast mode bills Opus 5 / 4.8 at double.
+    var speed: RunwaySpeedTier = .standard
+    var inferenceGeo: String? = nil
+    var eventID: String? = nil
+}
+
+enum ClaudeRunwayTokenActivityParser {
+    /// How recent the latest token sample must be to show a live burn rate + EQ
+    /// fill (vs. a spinner). Independent of row presence (the scanner keeps the
+    /// row visible longer): when this lapses the row stays put but its rate
+    /// falls back to "waiting", so a stopped session's number/EQ clears quickly
+    /// without the whole row flickering away.
+    static let maximumSampleAge: TimeInterval = 30
+    static let minimumPairInterval: TimeInterval = 10
+    static let maximumPairInterval: TimeInterval = 30 * 60
+    /// Cache reads are billed at a steep discount; down-weight them so a session
+    /// re-reading a huge context doesn't dominate attribution.
+    static let cacheReadWeight: Double = 0.10
+    /// Bounds for the provisional single-turn rate (used until a real two-sample
+    /// diff exists). The max doubles as a resume-gap guard: if the latest turn's
+    /// duration exceeds it, the preceding line is across an idle boundary, so we
+    /// skip the provisional rather than emit a fake near-zero rate.
+    static let provisionalMinTurnDuration: TimeInterval = 2
+    static let provisionalMaxTurnDuration: TimeInterval = 120
+    static let weeklyWindow: TimeInterval = 5 * 60
+    static let weeklyMinimumCoverage: TimeInterval = 60
+
+    private static let sampleCache = RunwayFileParseCache<[ClaudeRunwayTokenActivitySample]>()
+
+    /// Once-per-cycle prune: keep only the small in-window path set so the sample
+    /// cache tracks active sessions rather than all history. The loader calls this
+    /// for every presentation — `burns()` (the quota path) is no longer the only
+    /// caller, or $/token/weekly users would accumulate an entry per session ever
+    /// parsed. Mirrors `CodexRunwayTokenActivityParser.retainCache`.
+    static func retainCache(paths: Set<String>) {
+        sampleCache.retain(paths: paths)
+    }
+
+    #if DEBUG
+    static var sampleCacheMissCountForTesting: Int { sampleCache.missCount }
+    static func resetSampleCacheForTesting() { sampleCache.removeAllForTesting() }
+    #endif
+
+    /// Incremental usage events for the weekly calibration ledger. Claude's
+    /// `message.usage` is per-call, so these are events rather than cumulative
+    /// counters; the ledger dedupes them by path+timestamp across overlapping
+    /// tail reads.
+    static func ledgerEvents(identities: [RunwaySessionIdentity],
+                             now: Date = Date()) -> [WeeklyQuotaTokenEvent] {
+        var seen: Set<String> = []
+        var result: [WeeklyQuotaTokenEvent] = []
+        for path in identities.flatMap(\.logPaths) where !seen.contains(path) {
+            seen.insert(path)
+            for sample in recentSamples(fromLogPath: path, now: now) {
+                result.append(WeeklyQuotaTokenEvent(
+                    logPath: path,
+                    eventID: sample.eventID,
+                    capturedAt: sample.capturedAt,
+                    input: sample.input,
+                    cachedInput: sample.cacheRead,
+                    output: sample.output,
+                    cacheCreation: sample.cacheCreation5m,
+                    cacheCreation1h: sample.cacheCreation1h,
+                    modelSlug: sample.modelSlug,
+                    speed: sample.speed,
+                    inferenceGeo: sample.inferenceGeo
+                ))
+            }
+        }
+        return result
+    }
+
+    static func recentSamples(fromLogPath path: String,
+                              maxBytes: Int = 1024 * 1024,
+                              now: Date = Date()) -> [ClaudeRunwayTokenActivitySample] {
+        // The expensive tail read + JSON parse is a pure function of the bytes,
+        // so cache it per (path, mtime, size). The only `now`-dependency in a
+        // sample list — the future-timestamp skip — is deferred to the filter
+        // below so a cached parse stays byte-identical to a fresh one for any
+        // `now`. Dedupe consumes a message id even for a future line (see
+        // `parseLine`), so re-admitting that line at a later `now` matches the
+        // un-cached path exactly.
+        let unfiltered: [ClaudeRunwayTokenActivitySample]
+        if let signature = RunwayFileSignature.read(path: path) {
+            unfiltered = sampleCache.value(path: path, signature: signature) {
+                parseSamples(fromLogPath: path, maxBytes: maxBytes)
+            }
+        } else {
+            unfiltered = parseSamples(fromLogPath: path, maxBytes: maxBytes)
+        }
+        return unfiltered
+            .filter { $0.capturedAt <= now.addingTimeInterval(5) }
+            .sorted { $0.capturedAt < $1.capturedAt }
+    }
+
+    /// File-order, `now`-independent parse of every usage sample in the tail.
+    /// Dedupe-by-message-id and turn-start tracking are pure functions of the
+    /// bytes; the future-timestamp skip and the final sort are applied by
+    /// `recentSamples`, matching the original order of operations exactly.
+    private static func parseSamples(fromLogPath path: String,
+                                     maxBytes: Int) -> [ClaudeRunwayTokenActivitySample] {
+        guard let data = ClaudeRunwayLog.tailData(path: path, maxBytes: maxBytes),
+              let text = String(data: data, encoding: .utf8) else {
+            return []
+        }
+        var seenMessageIDs = Set<String>()
+        var samples: [ClaudeRunwayTokenActivitySample] = []
+        // Transcript lines are appended chronologically, so the previously seen
+        // timestamp is the start of the current turn.
+        var previousTimestamp: Date?
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let (lineTimestamp, sample) = parseLine(String(line),
+                                                    logPath: path,
+                                                    turnStartedAt: previousTimestamp,
+                                                    seenMessageIDs: &seenMessageIDs)
+            if let sample { samples.append(sample) }
+            if let lineTimestamp { previousTimestamp = lineTimestamp }
+        }
+        return samples
+    }
+
+    static func activity(identity: RunwaySessionIdentity,
+                         now: Date = Date()) -> RunwaySessionActivity? {
+        scoredActivity(identity: identity, now: now)?.activity
+    }
+
+    /// Cross-SESSION companion to the per-path clamp inside `scoredActivity`.
+    ///
+    /// That clamp compares a provisional path against the best *measured* path in
+    /// the same session, so it cannot fire on turn one: a brand-new session has no
+    /// measured path at all. The first turn is cache-heavy (~100k cache-read
+    /// tokens) and `provisionalMinTurnDuration` allows a 2-second denominator, so
+    /// the raw estimate can reach tens of thousands of tok/s — surfacing as an
+    /// absurd headline rate that "corrects itself" seconds later once a real
+    /// two-sample burst lands. A number that wrong is worse than no number.
+    ///
+    /// So: a provisional session is capped at the fastest MEASURED session this
+    /// cycle, and dropped entirely when nothing at all is measured yet. Callers
+    /// that drop it render the row as not-currently-burning, and the weekly rate
+    /// hold fills it in as soon as a real rate exists.
+    static func activitiesClampingProvisional(identities: [RunwaySessionIdentity],
+                                              now: Date = Date()) -> [RunwaySessionActivity] {
+        let scored = identities.compactMap { scoredActivity(identity: $0, now: now) }
+        let maxMeasured = scored.filter { !$0.provisional }
+            .map(\.activity.tokensPerSecond)
+            .max()
+        return scored.compactMap { entry -> RunwaySessionActivity? in
+            guard entry.provisional else { return entry.activity }
+            guard let maxMeasured, maxMeasured > 0 else { return nil }
+            let rate = entry.activity.tokensPerSecond
+            guard rate > maxMeasured, rate > 0 else { return entry.activity }
+            // Components scale with the clamp so pricing describes the same token
+            // volume as the clamped rate (matching `scoredActivity`).
+            let scale = maxMeasured / rate
+            return RunwaySessionActivity(
+                identity: entry.activity.identity,
+                tokensPerSecond: maxMeasured,
+                sampleStart: entry.activity.sampleStart,
+                sampleEnd: entry.activity.sampleEnd,
+                components: entry.activity.components.map { rescaled($0, by: scale) }
+            )
+        }
+    }
+
+    static func weeklyProfile(identities: [RunwaySessionIdentity],
+                              now: Date = Date())
+        -> (activities: [RunwaySessionActivity], measuringIDs: Set<String>) {
+        var activities: [RunwaySessionActivity] = []
+        var measuringIDs: Set<String> = []
+        for identity in identities {
+            let paths = identity.logPaths.map { recentSamples(fromLogPath: $0, now: now) }
+            let pathActivities = paths.compactMap {
+                weeklyActivity(identity: identity, samples: $0, now: now)
+            }
+            if !pathActivities.isEmpty {
+                activities.append(RunwaySessionActivity(
+                    identity: identity,
+                    tokensPerSecond: pathActivities.reduce(0) { $0 + $1.tokensPerSecond },
+                    sampleStart: pathActivities.map(\.sampleStart).min() ?? now,
+                    sampleEnd: pathActivities.map(\.sampleEnd).max() ?? now,
+                    components: pathActivities.flatMap(\.components)
+                ))
+            } else if paths.contains(where: { weeklyEvidenceIsMeasuring($0, now: now) }) {
+                measuringIDs.insert(identity.id)
+            }
+        }
+        return (activities, measuringIDs)
+    }
+
+    /// Session token-rate plus whether it rests *only* on a provisional
+    /// single-turn estimate (no contributing path has formed a real two-sample
+    /// burst yet). `burns` uses the flag to keep an unverified provisional rate
+    /// from dominating the cross-session split.
+    static func scoredActivity(identity: RunwaySessionIdentity,
+                               now: Date = Date()) -> (activity: RunwaySessionActivity, provisional: Bool)? {
+        let rawPathActivities = identity.logPaths.compactMap { path -> (activity: RunwaySessionActivity, provisional: Bool)? in
+            let samples = recentSamples(fromLogPath: path, now: now)
+            return pathActivity(identity: identity, samples: samples, now: now)
+        }
+        guard !rawPathActivities.isEmpty else { return nil }
+        // A subagent-heavy session keeps spawning fresh paths whose first turn
+        // yields a steep provisional spike (a few seconds of cache-heavy setup
+        // reads as thousands of tok/s). The session-level cap in `burns` never
+        // fires for such a session — some path is always measured — so clamp at
+        // path granularity too: no provisional path may claim more than the
+        // session's best *measured* path. Components scale with the clamp so
+        // the $ pricing describes the same token volume as the clamped rate.
+        let maxMeasured = rawPathActivities.filter { !$0.provisional }
+            .map { $0.activity.tokensPerSecond }
+            .max()
+        let pathActivities = rawPathActivities.map { entry -> (activity: RunwaySessionActivity, provisional: Bool) in
+            guard entry.provisional,
+                  let maxMeasured,
+                  entry.activity.tokensPerSecond > maxMeasured,
+                  entry.activity.tokensPerSecond > 0 else {
+                return entry
+            }
+            let scale = maxMeasured / entry.activity.tokensPerSecond
+            let activity = entry.activity
+            return (RunwaySessionActivity(
+                identity: activity.identity,
+                tokensPerSecond: maxMeasured,
+                sampleStart: activity.sampleStart,
+                sampleEnd: activity.sampleEnd,
+                components: activity.components.map { rescaled($0, by: scale) }
+            ), entry.provisional)
+        }
+        let tokensPerSecond = pathActivities.reduce(0) { $0 + $1.activity.tokensPerSecond }
+        guard tokensPerSecond > 0, tokensPerSecond.isFinite else { return nil }
+        // Provisional only if NO contributing path produced a measured burst — a
+        // real two-sample burst on any path makes the session's rate verified.
+        let provisional = !pathActivities.contains { !$0.provisional }
+        let activity = RunwaySessionActivity(
+            identity: identity,
+            tokensPerSecond: tokensPerSecond,
+            sampleStart: pathActivities.map(\.activity.sampleStart).min() ?? now,
+            sampleEnd: pathActivities.map(\.activity.sampleEnd).max() ?? now,
+            // Subagent transcripts fold into the parent identity as extra paths and
+            // routinely run a cheaper model than the orchestrator, so each path keeps
+            // its own model for pricing rather than being blended into the parent's.
+            // Totals derive from these.
+            components: pathActivities.flatMap(\.activity.components)
+        )
+        return (activity, provisional)
+    }
+
+    /// Distribute the provider's account-wide burn across active sessions in
+    /// proportion to their recent token rate. Mirrors
+    /// `CodexRunwayTokenActivityParser.burns` so both feed the same calculator.
+    static func burns(identities: [RunwaySessionIdentity],
+                      baseline: RunwayProviderBaseline,
+                      now: Date = Date()) -> [RunwaySessionBurn] {
+        // The prune is the loader's job now (it runs once per cycle for every
+        // presentation), so this path no longer repeats it with the same paths.
+        let currentSeconds = baseline.currentRunoutAt.timeIntervalSince(baseline.observedAt)
+        guard currentSeconds > 0, baseline.remainingPercent > 0 else { return [] }
+        let providerRate = baseline.remainingPercent / currentSeconds
+        guard providerRate > 0, providerRate.isFinite else { return [] }
+
+        let scored = identities.compactMap { scoredActivity(identity: $0, now: now) }
+        // A provisional single-turn rate is an unverified guess: a steep
+        // cache-heavy first turn can read tens of thousands of tok/s and, via the
+        // proportional split below, transiently starve every other session. Cap
+        // any provisional session at the largest *measured* burst among peers so
+        // it can never claim more than the busiest verified session. With no
+        // measured burst yet (every session just started) leave them as-is.
+        let maxBurst = scored.filter { !$0.provisional }
+            .map { $0.activity.tokensPerSecond }
+            .max()
+        let activities = scored.map { entry -> RunwaySessionActivity in
+            guard entry.provisional,
+                  let maxBurst,
+                  entry.activity.tokensPerSecond > maxBurst else {
+                return entry.activity
+            }
+            return RunwaySessionActivity(
+                identity: entry.activity.identity,
+                tokensPerSecond: maxBurst,
+                sampleStart: entry.activity.sampleStart,
+                sampleEnd: entry.activity.sampleEnd
+            )
+        }
+        let totalTokenRate = activities.reduce(0) { $0 + $1.tokensPerSecond }
+        guard totalTokenRate > 0, totalTokenRate.isFinite else { return [] }
+
+        return activities.map { activity in
+            RunwaySessionBurn(
+                identity: activity.identity,
+                percentPerSecond: providerRate * (activity.tokensPerSecond / totalTokenRate),
+                confidence: .mixed,
+                sampleStart: activity.sampleStart,
+                sampleEnd: activity.sampleEnd
+            )
+        }
+    }
+
+    /// Scale one slice's token rates by the clamp factor, preserving everything that
+    /// identifies how it is priced (model and billing tier).
+    ///
+    /// Both clamp paths rebuild components by hand, and a field left out of such a
+    /// rebuild is silently defaulted rather than caught by the compiler — a dropped
+    /// `speed` would quietly reprice a clamped fast session at half. One shared
+    /// helper means there is only one place that can forget.
+    private static func rescaled(_ c: RunwayModelComponent, by scale: Double) -> RunwayModelComponent {
+        RunwayModelComponent(modelSlug: c.modelSlug,
+                             inputPerSecond: c.inputPerSecond * scale,
+                             cachedInputPerSecond: c.cachedInputPerSecond * scale,
+                             outputPerSecond: c.outputPerSecond * scale,
+                             cacheCreationPerSecond: c.cacheCreationPerSecond * scale,
+                             cacheCreation1hPerSecond: c.cacheCreation1hPerSecond * scale,
+                             speed: c.speed,
+                             inferenceGeo: c.inferenceGeo,
+                             contextInputTokens: c.contextInputTokens)
+    }
+
+    /// Accumulator for one burst's tokens within a single (model, speed) slice.
+    private struct BurstTokens {
+        var input = 0.0, output = 0.0
+        var cacheCreation5m = 0.0, cacheCreation1h = 0.0, cacheRead = 0.0
+        mutating func add(_ s: ClaudeRunwayTokenActivitySample) {
+            input += s.input; output += s.output
+            cacheCreation5m += s.cacheCreation5m; cacheCreation1h += s.cacheCreation1h
+            cacheRead += s.cacheRead
+        }
+    }
+
+    /// A burst is bucketed by model AND billing tier: a session that switches either
+    /// mid-window must price each half at what it actually cost.
+    private struct BurstKey: Hashable {
+        let modelSlug: String?
+        let speed: RunwaySpeedTier
+        let inferenceGeo: String?
+    }
+
+    private static func pathActivity(identity: RunwaySessionIdentity,
+                                     samples: [ClaudeRunwayTokenActivitySample],
+                                     now: Date) -> (activity: RunwaySessionActivity, provisional: Bool)? {
+        guard let last = samples.last else { return nil }
+        guard now.timeIntervalSince(last.capturedAt) <= maximumSampleAge else { return nil }
+
+        // Walk backward over a contiguous burst, summing each later turn's tokens
+        // until a long idle gap. The earliest turn is the window boundary; its
+        // tokens predate the span and are excluded.
+        var windowStart = last.capturedAt
+        var consumed = 0.0
+        // A burst can straddle a model switch — or a fast-mode switch — so keep each
+        // turn's tokens under the (model, tier) that actually produced them. Pricing
+        // the whole burst at the newest turn's would misprice every earlier turn in
+        // it. These buckets are the only per-type accumulator — the activity's totals
+        // derive from them.
+        var bySlice: [BurstKey: BurstTokens] = [:]
+        var previous = last
+        for sample in samples.dropLast().reversed() {
+            let gap = previous.capturedAt.timeIntervalSince(sample.capturedAt)
+            if gap > maximumPairInterval { break }
+            consumed += previous.tokens
+            let key = BurstKey(modelSlug: previous.modelSlug, speed: previous.speed,
+                               inferenceGeo: previous.inferenceGeo)
+            var bucket = bySlice[key] ?? BurstTokens()
+            bucket.add(previous)
+            bySlice[key] = bucket
+            windowStart = sample.capturedAt
+            previous = sample
+        }
+
+        let span = last.capturedAt.timeIntervalSince(windowStart)
+        if span >= minimumPairInterval, consumed > 0 {
+            // Sorted so the component order (and thus Equatable) is deterministic;
+            // the $ sum itself is order-independent. Tier breaks the tie when one
+            // model appears at both speeds.
+            let components = bySlice
+                .sorted {
+                    ($0.key.modelSlug ?? "", $0.key.speed.rawValue, $0.key.inferenceGeo ?? "")
+                        < ($1.key.modelSlug ?? "", $1.key.speed.rawValue, $1.key.inferenceGeo ?? "")
+                }
+                .map { key, t in
+                    RunwayModelComponent(modelSlug: key.modelSlug,
+                                         inputPerSecond: t.input / span,
+                                         cachedInputPerSecond: t.cacheRead / span,
+                                         outputPerSecond: t.output / span,
+                                         cacheCreationPerSecond: t.cacheCreation5m / span,
+                                         cacheCreation1hPerSecond: t.cacheCreation1h / span,
+                                         speed: key.speed,
+                                         inferenceGeo: key.inferenceGeo)
+                }
+            return (RunwaySessionActivity(
+                identity: identity,
+                tokensPerSecond: consumed / span,
+                sampleStart: windowStart,
+                sampleEnd: last.capturedAt,
+                components: components
+            ), false)
+        }
+
+        // Not enough spread for a true diff yet (just started / first turn).
+        // Show a provisional rate from the latest turn's own duration so a number
+        // appears at the first completed turn, then converges to the burst rate
+        // above once a second sample lands. The duration clamp rejects turns that
+        // follow an idle/resume gap (which would otherwise read as a fake ~0).
+        if let started = last.turnStartedAt {
+            let turnDuration = last.capturedAt.timeIntervalSince(started)
+            if turnDuration >= provisionalMinTurnDuration,
+               turnDuration <= provisionalMaxTurnDuration,
+               last.tokens > 0 {
+                return (RunwaySessionActivity(
+                    identity: identity,
+                    tokensPerSecond: last.tokens / turnDuration,
+                    sampleStart: started,
+                    sampleEnd: last.capturedAt,
+                    inputPerSecond: last.input / turnDuration,
+                    cachedInputPerSecond: last.cacheRead / turnDuration,
+                    outputPerSecond: last.output / turnDuration,
+                    cacheCreationPerSecond: last.cacheCreation5m / turnDuration,
+                    cacheCreation1hPerSecond: last.cacheCreation1h / turnDuration,
+                    modelSlug: last.modelSlug,
+                    speed: last.speed,
+                    inferenceGeo: last.inferenceGeo
+                ), true)
+            }
+        }
+        return nil
+    }
+
+    private static func weeklyEvidenceIsMeasuring(_ samples: [ClaudeRunwayTokenActivitySample],
+                                                   now: Date) -> Bool {
+        let cutoff = now.addingTimeInterval(-weeklyWindow)
+        guard let first = samples.first(where: { $0.capturedAt >= cutoff }) else { return false }
+        let start = max(cutoff, first.turnStartedAt ?? first.capturedAt)
+        return now.timeIntervalSince(start) < weeklyMinimumCoverage
+    }
+
+    static func weeklyActivity(identity: RunwaySessionIdentity,
+                               samples: [ClaudeRunwayTokenActivitySample],
+                               now: Date) -> RunwaySessionActivity? {
+        let cutoff = now.addingTimeInterval(-weeklyWindow)
+        let recent = samples.filter { $0.capturedAt >= cutoff && $0.capturedAt <= now }
+        guard let first = recent.first, let last = recent.last else { return nil }
+        let start = max(cutoff, first.turnStartedAt ?? first.capturedAt)
+        let coverage = now.timeIntervalSince(start)
+        guard coverage >= weeklyMinimumCoverage, coverage <= weeklyWindow else { return nil }
+        let normalization = coverage - (coverage * coverage) / (2 * weeklyWindow)
+        guard normalization > 0 else { return nil }
+
+        let weighted = recent.compactMap { sample -> (sample: ClaudeRunwayTokenActivitySample, weight: Double)? in
+            let weight = max(0, 1 - now.timeIntervalSince(sample.capturedAt) / weeklyWindow)
+            return weight > 0 ? (sample, weight) : nil
+        }
+        let components = weighted.map { item in
+            RunwayModelComponent(
+                modelSlug: item.sample.modelSlug,
+                inputPerSecond: item.sample.input * item.weight / normalization,
+                cachedInputPerSecond: item.sample.cacheRead * item.weight / normalization,
+                outputPerSecond: item.sample.output * item.weight / normalization,
+                cacheCreationPerSecond: item.sample.cacheCreation5m * item.weight / normalization,
+                cacheCreation1hPerSecond: item.sample.cacheCreation1h * item.weight / normalization,
+                speed: item.sample.speed,
+                inferenceGeo: item.sample.inferenceGeo
+            )
+        }
+        let total = weighted.reduce(0) { $0 + $1.sample.tokens * $1.weight }
+        guard total > 0 else { return nil }
+        return RunwaySessionActivity(
+            identity: identity,
+            tokensPerSecond: total / normalization,
+            sampleStart: start,
+            sampleEnd: last.capturedAt,
+            components: components
+        )
+    }
+
+    /// Returns this line's timestamp (for turn-start tracking, regardless of
+    /// type) and, when the line is a fresh non-duplicate usage record, the
+    /// parsed sample. The dedupe insert precedes the tokens check exactly as
+    /// before; the future-timestamp skip now lives in `recentSamples`, so a
+    /// future line still consumes its message id here (matching the un-cached
+    /// path) and its sample is dropped downstream by `now`.
+    private static func parseLine(_ line: String,
+                                  logPath: String,
+                                  turnStartedAt: Date?,
+                                  seenMessageIDs: inout Set<String>) -> (timestamp: Date?, sample: ClaudeRunwayTokenActivitySample?) {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (nil, nil)
+        }
+        let timestamp = ClaudeRunwayLog.date(obj["timestamp"])
+        guard let message = obj["message"] as? [String: Any],
+              let usage = message["usage"] as? [String: Any] else {
+            return (timestamp, nil)
+        }
+        let messageID = message["id"] as? String
+        if let messageID {
+            if seenMessageIDs.contains(messageID) { return (timestamp, nil) }
+            seenMessageIDs.insert(messageID)
+        }
+        guard let capturedAt = timestamp else {
+            return (timestamp, nil)
+        }
+        let tokens = weightedTokens(usage)
+        guard tokens > 0 else { return (timestamp, nil) }
+        func v(_ key: String) -> Double { ClaudeRunwayLog.double(usage[key]) ?? 0 }
+        let model = (message["model"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let writes = ClaudeRunwayLog.cacheCreation(usage: usage)
+        return (timestamp, ClaudeRunwayTokenActivitySample(
+            logPath: logPath,
+            capturedAt: capturedAt,
+            tokens: tokens,
+            turnStartedAt: turnStartedAt,
+            input: v("input_tokens"),
+            output: v("output_tokens"),
+            cacheCreation5m: writes.fiveMinute,
+            cacheCreation1h: writes.oneHour,
+            cacheRead: v("cache_read_input_tokens"),
+            modelSlug: model,
+            speed: RunwaySpeedTier(usageValue: usage["speed"]),
+            inferenceGeo: ClaudeRunwayLog.inferenceGeo(usage: usage),
+            eventID: messageID
+        ))
+    }
+
+    private static func weightedTokens(_ usage: [String: Any]) -> Double {
+        func value(_ key: String) -> Double { ClaudeRunwayLog.double(usage[key]) ?? 0 }
+        // Resolved the same way as pricing, so a record carrying only the sub-object
+        // still registers throughput instead of reading as a zero-token turn.
+        let writes = ClaudeRunwayLog.cacheCreation(usage: usage)
+        return value("input_tokens")
+            + value("output_tokens")
+            + writes.fiveMinute + writes.oneHour
+            + cacheReadWeight * value("cache_read_input_tokens")
+    }
+}

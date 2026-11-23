@@ -1,0 +1,1345 @@
+import XCTest
+@testable import AgentSessions
+
+final class ClaudeRunwayParserTests: XCTestCase {
+
+    // MARK: - Token activity parser
+
+    func testTokenActivityParserExtractsIncrementalTokenRate() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let log = dir.appendingPathComponent("session.jsonl")
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let t2 = t0.addingTimeInterval(60)
+        let text = """
+        \(assistantLine(id: "A", at: t0, inputTokens: 1000))
+        \(assistantLine(id: "B", at: t1, inputTokens: 2000))
+        \(assistantLine(id: "C", at: t2, inputTokens: 3000))
+        """
+        try text.write(to: log, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(id: "session", displayName: "session", isGoal: false, logPaths: [log.path])
+        let activity = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: t2.addingTimeInterval(1))
+
+        // consumed = tokens of B + C (anchor t0 excluded) = 5000 over a 60s span.
+        XCTAssertEqual(activity?.tokensPerSecond ?? 0, 5000.0 / 60.0, accuracy: 0.001)
+    }
+
+    func testTokenActivityParserDedupesByMessageID() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-dedupe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let log = dir.appendingPathComponent("session.jsonl")
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let t2 = t0.addingTimeInterval(60)
+        // The final turn (id C) is emitted twice — streaming duplicates.
+        let text = """
+        \(assistantLine(id: "A", at: t0, inputTokens: 1000))
+        \(assistantLine(id: "B", at: t1, inputTokens: 2000))
+        \(assistantLine(id: "C", at: t2, inputTokens: 3000))
+        \(assistantLine(id: "C", at: t2, inputTokens: 3000))
+        """
+        try text.write(to: log, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(id: "session", displayName: "session", isGoal: false, logPaths: [log.path])
+        let activity = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: t2.addingTimeInterval(1))
+
+        // Dedupe collapses the duplicate C, so the rate matches the 3-turn case.
+        XCTAssertEqual(activity?.tokensPerSecond ?? 0, 5000.0 / 60.0, accuracy: 0.001)
+    }
+
+    func testTokenActivityParserIgnoresStaleActivity() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-stale-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let log = dir.appendingPathComponent("session.jsonl")
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let text = """
+        \(assistantLine(id: "A", at: t0, inputTokens: 1000))
+        \(assistantLine(id: "B", at: t1, inputTokens: 2000))
+        """
+        try text.write(to: log, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(id: "session", displayName: "session", isGoal: false, logPaths: [log.path])
+        let staleNow = t1.addingTimeInterval(ClaudeRunwayTokenActivityParser.maximumSampleAge + 1)
+        XCTAssertNil(ClaudeRunwayTokenActivityParser.activity(identity: identity, now: staleNow))
+    }
+
+    // MARK: - Recent session scanner
+
+    func testRecentSessionScannerDiscoversActiveLogAndSkipsStale() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-scan-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+
+        let activeLog = projectDir.appendingPathComponent("active.jsonl")
+        let activeText = """
+        \(userLine(sessionID: "sess-active", cwd: "/tmp/proj", text: "build the thing", at: now.addingTimeInterval(-40)))
+        \(assistantLine(id: "x1", at: now.addingTimeInterval(-5), inputTokens: 1200, sessionID: "sess-active", cwd: "/tmp/proj"))
+        """
+        try activeText.write(to: activeLog, atomically: true, encoding: .utf8)
+
+        let staleLog = projectDir.appendingPathComponent("stale.jsonl")
+        let staleText = """
+        \(userLine(sessionID: "sess-stale", cwd: "/tmp/proj", text: "older task", at: now.addingTimeInterval(-400)))
+        \(assistantLine(id: "y1", at: now.addingTimeInterval(-300), inputTokens: 800, sessionID: "sess-stale", cwd: "/tmp/proj"))
+        """
+        try staleText.write(to: staleLog, atomically: true, encoding: .utf8)
+
+        let identities = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+
+        XCTAssertEqual(identities.count, 1)
+        XCTAssertEqual(identities.first?.id, "sess-active")
+        XCTAssertEqual(identities.first?.displayName, "build the thing")
+        let resolvedPaths = (identities.first?.logPaths ?? []).map {
+            URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
+        }
+        XCTAssertEqual(resolvedPaths, [activeLog.resolvingSymlinksInPath().path])
+    }
+
+    func testRecentSessionScannerPrefersAITitleOverFirstPrompt() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-aititle-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let log = projectDir.appendingPathComponent("session.jsonl")
+        let text = """
+        \(userLine(sessionID: "sess-1", cwd: "/tmp/proj", text: "do Now — 1.0 release blockers — the long detailed prompt", at: now.addingTimeInterval(-30)))
+        {"type":"ai-title","aiTitle":"1.0 release blockers","sessionId":"sess-1"}
+        \(assistantLine(id: "z1", at: now.addingTimeInterval(-5), inputTokens: 900, sessionID: "sess-1", cwd: "/tmp/proj"))
+        """
+        try text.write(to: log, atomically: true, encoding: .utf8)
+
+        let identities = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        XCTAssertEqual(identities.first?.displayName, "1.0 release blockers")
+    }
+
+    func testRecentSessionScannerFoldsSubagentsIntoParentSession() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-subagent-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        let subagentDir = projectDir.appendingPathComponent("sess-parent/subagents", isDirectory: true)
+        try FileManager.default.createDirectory(at: subagentDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        // Parent main transcript carries the session title.
+        let parentLog = projectDir.appendingPathComponent("sess-parent.jsonl")
+        try """
+        {"type":"ai-title","aiTitle":"ship the release","sessionId":"sess-parent"}
+        \(assistantLine(id: "p1", at: now.addingTimeInterval(-8), inputTokens: 1000, sessionID: "sess-parent", cwd: "/tmp/proj"))
+        """.write(to: parentLog, atomically: true, encoding: .utf8)
+
+        // Subagent transcript shares the parent sessionId; its first prompt is an
+        // internal task that must NOT become the row name.
+        let subagentLog = subagentDir.appendingPathComponent("agent-abc.jsonl")
+        try """
+        \(userLine(sessionID: "sess-parent", cwd: "/tmp/proj", text: "You are a subagent: grep the repo", at: now.addingTimeInterval(-6)))
+        \(assistantLine(id: "s1", at: now.addingTimeInterval(-3), inputTokens: 2000, sessionID: "sess-parent", cwd: "/tmp/proj"))
+        """.write(to: subagentLog, atomically: true, encoding: .utf8)
+
+        let identities = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+
+        XCTAssertEqual(identities.count, 1, "parent + subagent should collapse to one session")
+        XCTAssertEqual(identities.first?.id, "sess-parent")
+        XCTAssertEqual(identities.first?.displayName, "ship the release", "parent title wins, never the subagent task")
+        XCTAssertEqual(identities.first?.logPaths.count, 2, "both transcripts contribute to cumulative burn")
+    }
+
+    func testRecentSessionScannerCapsDistinctSessionsNotSubagentFiles() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-subagent-cap-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        let subagentDir = projectDir.appendingPathComponent("sess-parent/subagents", isDirectory: true)
+        try FileManager.default.createDirectory(at: subagentDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let parentLog = projectDir.appendingPathComponent("sess-parent.jsonl")
+        try """
+        {"type":"ai-title","aiTitle":"parent work","sessionId":"sess-parent"}
+        \(assistantLine(id: "parent", at: now.addingTimeInterval(-8), inputTokens: 1000, sessionID: "sess-parent", cwd: "/tmp/proj"))
+        """.write(to: parentLog, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-100)], ofItemAtPath: parentLog.path)
+
+        for index in 0..<85 {
+            let log = subagentDir.appendingPathComponent("agent-\(index).jsonl")
+            try """
+            \(assistantLine(id: "sub-\(index)", at: now.addingTimeInterval(-4), inputTokens: 1000, sessionID: "sess-parent", cwd: "/tmp/proj"))
+            """.write(to: log, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(TimeInterval(-index))], ofItemAtPath: log.path)
+        }
+
+        let otherLog = projectDir.appendingPathComponent("sess-other.jsonl")
+        try """
+        \(userLine(sessionID: "sess-other", cwd: "/tmp/proj", text: "other active work", at: now.addingTimeInterval(-12)))
+        \(assistantLine(id: "other", at: now.addingTimeInterval(-5), inputTokens: 900, sessionID: "sess-other", cwd: "/tmp/proj"))
+        """.write(to: otherLog, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-90)], ofItemAtPath: otherLog.path)
+
+        let identities = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+
+        XCTAssertEqual(identities.map(\.id), ["sess-parent", "sess-other"])
+        XCTAssertEqual(identities.first?.logPaths.count, 86)
+    }
+
+    func testDesktopSessionTitlesMapKeysByCliSessionId() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-desktop-titles-\(UUID().uuidString)")
+        let convoDir = root.appendingPathComponent("convoA/sessionB", isDirectory: true)
+        try FileManager.default.createDirectory(at: convoDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try """
+        {"sessionId":"local_abc","cliSessionId":"f1d39390-aaaa","title":"Quota meter and runway polish","titleSource":"auto"}
+        """.write(to: convoDir.appendingPathComponent("local_abc.json"), atomically: true, encoding: .utf8)
+        // A record with an empty title is ignored.
+        try """
+        {"sessionId":"local_def","cliSessionId":"99999999-bbbb","title":""}
+        """.write(to: convoDir.appendingPathComponent("local_def.json"), atomically: true, encoding: .utf8)
+        // A non-local file is ignored.
+        try "{\"cliSessionId\":\"zzz\",\"title\":\"nope\"}"
+            .write(to: convoDir.appendingPathComponent("other.json"), atomically: true, encoding: .utf8)
+
+        let map = ClaudeDesktopSessionTitles.map(root: root)
+        XCTAssertEqual(map["f1d39390-aaaa"], "Quota meter and runway polish")
+        XCTAssertNil(map["99999999-bbbb"])
+        XCTAssertNil(map["zzz"])
+    }
+
+    // MARK: - Loader: burn without a fresh projection (P1)
+
+    func testLoaderShowsBurnWithoutFreshProjection() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-nogate-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let log = projectDir.appendingPathComponent("sess-burn.jsonl")
+        try """
+        \(assistantLine(id: "b1", at: now.addingTimeInterval(-25), inputTokens: 1000, sessionID: "sess-burn", cwd: "/tmp/proj"))
+        \(assistantLine(id: "b2", at: now.addingTimeInterval(-5), inputTokens: 1000, sessionID: "sess-burn", cwd: "/tmp/proj"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        // Baseline with NO fresh projection: runout falls back to the reset time.
+        let baseline = RunwayProviderBaseline(
+            source: .claude,
+            remainingPercent: 50,
+            resetAt: now.addingTimeInterval(2 * 3600),
+            currentRunoutAt: now.addingTimeInterval(2 * 3600),
+            observedAt: now,
+            hasProjectedRunout: false
+        )
+        let request = CodexRunwaySnapshotRequest(
+            baseline: baseline,
+            identities: [],
+            now: now,
+            maxRows: 4,
+            recentSessionsRoot: root
+        )
+
+        let snapshot = await ClaudeRunwaySnapshotLoader.snapshot(for: request)
+        let row = snapshot?.rows.first { $0.id == "sess-burn" }
+        XCTAssertNotNil(row, "active session should produce a row")
+        XCTAssertNotEqual(row?.confidence, .waiting, "burn should render, not a waiting spinner")
+        XCTAssertGreaterThan(row?.displayRate ?? 0, 0, "a real burn rate should show without a fresh projection")
+    }
+
+    func testLoaderBurnSharpensWhenProjectionLands() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-sharpen-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let log = projectDir.appendingPathComponent("sess-sharpen.jsonl")
+        try """
+        \(assistantLine(id: "s1", at: now.addingTimeInterval(-25), inputTokens: 1000, sessionID: "sess-sharpen", cwd: "/tmp/proj"))
+        \(assistantLine(id: "s2", at: now.addingTimeInterval(-5), inputTokens: 1000, sessionID: "sess-sharpen", cwd: "/tmp/proj"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        func rate(hasProjection: Bool) async -> Double {
+            // With a projection the runout is near (fast burn); without, it falls
+            // back to the reset time (slow even-burn).
+            let runoutAt = hasProjection ? now.addingTimeInterval(10 * 60) : now.addingTimeInterval(2 * 3600)
+            let baseline = RunwayProviderBaseline(
+                source: .claude,
+                remainingPercent: 50,
+                resetAt: now.addingTimeInterval(2 * 3600),
+                currentRunoutAt: runoutAt,
+                observedAt: now,
+                hasProjectedRunout: hasProjection
+            )
+            let request = CodexRunwaySnapshotRequest(
+                baseline: baseline, identities: [], now: now, maxRows: 4, recentSessionsRoot: root
+            )
+            let snapshot = await ClaudeRunwaySnapshotLoader.snapshot(for: request)
+            return snapshot?.rows.first { $0.id == "sess-sharpen" }?.displayRate ?? 0
+        }
+
+        let withoutProjection = await rate(hasProjection: false)
+        let withProjection = await rate(hasProjection: true)
+        XCTAssertGreaterThan(withoutProjection, 0, "burn shows even without a projection")
+        XCTAssertGreaterThan(withProjection, withoutProjection, "rate sharpens to measured velocity once a projection lands")
+    }
+
+    // MARK: - RunwayBaselineMath.averageBurnRunout
+
+    /// The whole point of the fix: near reset, the derived rate reflects the
+    /// measured average (~36 m/h for 60% used over ~5h), NOT the reset-pinned
+    /// fallback (~3600 m/h) that exploded as the denominator shrank.
+    func testAverageBurnRunoutDoesNotExplodeNearReset() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let resetAt = now.addingTimeInterval(120) // 2 min to reset
+        let runout = try XCTUnwrap(RunwayBaselineMath.averageBurnRunout(
+            remainingPercent: 40,
+            resetAt: resetAt,
+            windowLength: RunwayBaselineMath.fiveHourWindow,
+            now: now))
+        let providerRate = 40.0 / runout.timeIntervalSince(now) // %/s
+        let mPerHour = providerRate * 3 * 3600
+        XCTAssertEqual(mPerHour, 36.2, accuracy: 1.0)
+        XCTAssertLessThan(mPerHour, 100)
+    }
+
+    /// The rate must stay stable as the reset approaches (it depends on
+    /// elapsed, not time-to-reset). The old fallback produced ~3600 then
+    /// ~21600 m/h for these two inputs.
+    func testAverageBurnRunoutRateStableAsResetApproaches() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        func mPerHour(secondsToReset: TimeInterval, remaining: Double) throws -> Double {
+            let resetAt = now.addingTimeInterval(secondsToReset)
+            let runout = try XCTUnwrap(RunwayBaselineMath.averageBurnRunout(
+                remainingPercent: remaining,
+                resetAt: resetAt,
+                windowLength: RunwayBaselineMath.fiveHourWindow,
+                now: now))
+            return remaining / runout.timeIntervalSince(now) * 3 * 3600
+        }
+        let near = try mPerHour(secondsToReset: 120, remaining: 40)
+        let nearer = try mPerHour(secondsToReset: 20, remaining: 40)
+        XCTAssertEqual(near, nearer, accuracy: 1.0)
+        XCTAssertLessThan(nearer, 100)
+    }
+
+    /// Nothing used yet ⇒ no measurable burn ⇒ nil (caller keeps resetAt).
+    func testAverageBurnRunoutNilWhenNothingUsed() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        XCTAssertNil(RunwayBaselineMath.averageBurnRunout(
+            remainingPercent: 100,
+            resetAt: now.addingTimeInterval(3600),
+            windowLength: RunwayBaselineMath.fiveHourWindow,
+            now: now))
+    }
+
+    /// Defensive: a reset farther out than the window length puts the window
+    /// start in the future ⇒ nil rather than a negative elapsed.
+    func testAverageBurnRunoutNilWhenWindowStartInFuture() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        XCTAssertNil(RunwayBaselineMath.averageBurnRunout(
+            remainingPercent: 40,
+            resetAt: now.addingTimeInterval(6 * 3600),
+            windowLength: RunwayBaselineMath.fiveHourWindow,
+            now: now))
+    }
+
+    /// Symmetric guard: a burst 30 s after reset (2% used) must be damped by the
+    /// elapsed floor (2%/600s → ~36 m/h), not divided by 30 s (2%/30s → ~720 m/h).
+    func testAverageBurnRunoutFloorsEarlyWindowElapsed() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let resetAt = now.addingTimeInterval(RunwayBaselineMath.fiveHourWindow - 30)
+        let runout = try XCTUnwrap(RunwayBaselineMath.averageBurnRunout(
+            remainingPercent: 98,
+            resetAt: resetAt,
+            windowLength: RunwayBaselineMath.fiveHourWindow,
+            now: now))
+        let mPerHour = 98.0 / runout.timeIntervalSince(now) * 3 * 3600
+        XCTAssertEqual(mPerHour, 36.0, accuracy: 2.0)
+    }
+
+    // MARK: - claudeRequest baseline
+
+    /// End-to-end: with no projection and ~2 min to reset, the baseline the
+    /// builder produces must imply a sane burn rate (< 100 m/h), not the
+    /// ~3600 m/h the reset-pinned fallback produced.
+    func testClaudeRequestDerivesSaneBurnRateNearReset() throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let resetAt = now.addingTimeInterval(120)
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let resetText = iso.string(from: resetAt)
+
+        let request = try XCTUnwrap(HUDRunwayRequestBuilder.claudeRequest(
+            activeRows: [],
+            projectedRunoutEnabled: true,
+            claudeAgentEnabled: true,
+            claudeUsageEnabled: true,
+            fiveHourRemainingPercent: 40,
+            fiveHourResetText: resetText,
+            fiveHourProjectedRunoutAt: nil,
+            fiveHourProjectionObservedAt: nil,
+            now: now,
+            maxRows: 4,
+            forceVisible: true))
+
+        let baseline = request.baseline
+        let providerRate = baseline.remainingPercent
+            / baseline.currentRunoutAt.timeIntervalSince(baseline.observedAt)
+        let mPerHour = providerRate * 3 * 3600
+        XCTAssertGreaterThan(mPerHour, 0)
+        XCTAssertLessThan(mPerHour, 100)
+        // Sanity: run-out is pushed well past the imminent reset.
+        XCTAssertGreaterThan(baseline.currentRunoutAt, resetAt)
+    }
+
+    // MARK: - Track 1: provisional first-burn + idle drop-fast
+
+    func testTokenActivityParserProvisionalRateFromSingleTurn() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-prov-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let log = dir.appendingPathComponent("session.jsonl")
+        let turnStart = Date(timeIntervalSince1970: 2_000_000)
+        let turnEnd = turnStart.addingTimeInterval(20)   // 20s turn
+        // One usage sample preceded by the turn-start (user) line. No second
+        // sample yet → the provisional single-turn rate should fire.
+        try """
+        \(userLine(sessionID: "s", cwd: "/tmp", text: "do it", at: turnStart))
+        \(assistantLine(id: "a1", at: turnEnd, inputTokens: 4000, sessionID: "s", cwd: "/tmp"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(id: "s", displayName: "s", isGoal: false, logPaths: [log.path])
+        let activity = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: turnEnd.addingTimeInterval(1))
+        XCTAssertEqual(activity?.tokensPerSecond ?? 0, 4000.0 / 20.0, accuracy: 0.001,
+                       "single-turn provisional rate = tokens / turn duration")
+    }
+
+    func testTokenActivityParserSkipsProvisionalAcrossResumeGap() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-prov-gap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let log = dir.appendingPathComponent("session.jsonl")
+        let oldLine = Date(timeIntervalSince1970: 2_000_000)
+        let usageAt = oldLine.addingTimeInterval(3600)   // 1h gap → resume boundary
+        try """
+        \(userLine(sessionID: "s", cwd: "/tmp", text: "earlier", at: oldLine))
+        \(assistantLine(id: "a1", at: usageAt, inputTokens: 4000, sessionID: "s", cwd: "/tmp"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(id: "s", displayName: "s", isGoal: false, logPaths: [log.path])
+        let activity = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: usageAt.addingTimeInterval(1))
+        XCTAssertNil(activity, "a turn after a long idle gap must not yield a fake near-zero provisional rate")
+    }
+
+    func testRecentSessionScannerDropsIdleSessionsSoonerThanWorking() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-idle-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        // Both last wrote 60s ago: past the 45s idle grace, within the 75s working window.
+        let idleLog = projectDir.appendingPathComponent("idle.jsonl")
+        try """
+        \(userLine(sessionID: "sess-idle", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-90)))
+        \(assistantLine(id: "i1", at: now.addingTimeInterval(-60), inputTokens: 800, sessionID: "sess-idle", cwd: "/tmp/proj", stopReason: "end_turn"))
+        """.write(to: idleLog, atomically: true, encoding: .utf8)
+
+        let workingLog = projectDir.appendingPathComponent("working.jsonl")
+        try """
+        \(userLine(sessionID: "sess-working", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-90)))
+        \(assistantLine(id: "w1", at: now.addingTimeInterval(-60), inputTokens: 800, sessionID: "sess-working", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: workingLog, atomically: true, encoding: .utf8)
+
+        let ids = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now).map(\.id)
+        XCTAssertFalse(ids.contains("sess-idle"), "idle (end_turn) session past the idle grace should drop")
+        XCTAssertTrue(ids.contains("sess-working"), "working (tool_use) session within 75s should remain")
+    }
+
+    func testPresenceSynthesizerPublishesRunwayIdentitiesWithStateHints() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-presence-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let workingLog = projectDir.appendingPathComponent("working.jsonl")
+        try """
+        \(userLine(sessionID: "sess-working", cwd: "/tmp/proj", text: "working task", at: now.addingTimeInterval(-30)))
+        \(assistantLine(id: "w1", at: now.addingTimeInterval(-20), inputTokens: 800, sessionID: "sess-working", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: workingLog, atomically: true, encoding: .utf8)
+
+        let idleLog = projectDir.appendingPathComponent("idle.jsonl")
+        try """
+        \(userLine(sessionID: "sess-idle", cwd: "/tmp/proj", text: "idle task", at: now.addingTimeInterval(-35)))
+        \(assistantLine(id: "i1", at: now.addingTimeInterval(-25), inputTokens: 800, sessionID: "sess-idle", cwd: "/tmp/proj", stopReason: "end_turn"))
+        """.write(to: idleLog, atomically: true, encoding: .utf8)
+
+        let presences = ClaudeRunwayPresenceSynthesizer.presences(
+            root: root,
+            now: now,
+            claimedLogPaths: []
+        )
+
+        let byID = Dictionary(uniqueKeysWithValues: presences.compactMap { p -> (String, CodexActivePresence)? in
+            guard let id = p.sessionId else { return nil }
+            return (id, p)
+        })
+        XCTAssertEqual(byID["sess-working"]?.publisher, "agent-sessions-runway")
+        XCTAssertEqual(byID["sess-working"]?.kind, "desktop")
+        XCTAssertEqual(byID["sess-working"]?.source, .claude)
+        XCTAssertEqual(
+            byID["sess-working"]?.sessionLogPath.map(CodexActiveSessionsModel.normalizePath),
+            CodexActiveSessionsModel.normalizePath(workingLog.path)
+        )
+        XCTAssertEqual(byID["sess-working"]?.liveStateHint, .activeWorking)
+        XCTAssertEqual(byID["sess-idle"]?.liveStateHint, .openIdle)
+    }
+
+    func testPresenceSynthesizerSkipsIdentityWhenAnyLogPathIsClaimed() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-presence-claimed-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let claimedLog = projectDir.appendingPathComponent("claimed.jsonl")
+        try """
+        \(userLine(sessionID: "sess-claimed", cwd: "/tmp/proj", text: "claimed task", at: now.addingTimeInterval(-20)))
+        \(assistantLine(id: "c1", at: now.addingTimeInterval(-5), inputTokens: 800, sessionID: "sess-claimed", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: claimedLog, atomically: true, encoding: .utf8)
+
+        let unclaimedLog = projectDir.appendingPathComponent("unclaimed.jsonl")
+        try """
+        \(userLine(sessionID: "sess-unclaimed", cwd: "/tmp/proj", text: "unclaimed task", at: now.addingTimeInterval(-20)))
+        \(assistantLine(id: "u1", at: now.addingTimeInterval(-5), inputTokens: 800, sessionID: "sess-unclaimed", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: unclaimedLog, atomically: true, encoding: .utf8)
+
+        let presences = ClaudeRunwayPresenceSynthesizer.presences(
+            root: root,
+            now: now,
+            claimedLogPaths: [claimedLog.path]
+        )
+
+        XCTAssertFalse(presences.contains { $0.sessionId == "sess-claimed" })
+        XCTAssertTrue(presences.contains { $0.sessionId == "sess-unclaimed" })
+    }
+
+    func testPresenceSynthesizerKeepsSilentWorkingSessionsThroughRecentFileWindow() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-presence-silent-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let log = projectDir.appendingPathComponent("silent.jsonl")
+        try """
+        \(userLine(sessionID: "sess-silent", cwd: "/tmp/proj", text: "long tool", at: now.addingTimeInterval(-180)))
+        \(assistantLine(id: "s1", at: now.addingTimeInterval(-120), inputTokens: 800, sessionID: "sess-silent", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        let runwayIDs = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now).map(\.id)
+        XCTAssertFalse(runwayIDs.contains("sess-silent"), "the runway UI keeps its short display window")
+
+        let presences = ClaudeRunwayPresenceSynthesizer.presences(
+            root: root,
+            now: now,
+            claimedLogPaths: []
+        )
+        let presence = try XCTUnwrap(presences.first { $0.sessionId == "sess-silent" })
+        XCTAssertEqual(presence.liveStateHint, .activeWorking)
+    }
+
+    func testPresenceSynthesizerDoesNotApplyRunwayRowCap() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-presence-cap-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        for index in 0..<15 {
+            let id = "sess-\(index)"
+            let log = projectDir.appendingPathComponent("\(id).jsonl")
+            try """
+            \(userLine(sessionID: id, cwd: "/tmp/proj", text: "task \(index)", at: now.addingTimeInterval(Double(-30 - index))))
+            \(assistantLine(id: "a\(index)", at: now.addingTimeInterval(Double(-index)), inputTokens: 800, sessionID: id, cwd: "/tmp/proj", stopReason: "tool_use"))
+            """.write(to: log, atomically: true, encoding: .utf8)
+        }
+
+        let runwayIDs = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now).map(\.id)
+        XCTAssertEqual(runwayIDs.count, ClaudeRunwayRecentSessionScanner.maximumFiles)
+
+        let presenceIDs = Set(ClaudeRunwayPresenceSynthesizer.presences(
+            root: root,
+            now: now,
+            claimedLogPaths: []
+        ).compactMap(\.sessionId))
+        XCTAssertEqual(presenceIDs.count, 15)
+    }
+
+    func testPresenceSynthesizerExcludesArchivedCoworkSession() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-presence-cowork-archive-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let coworkRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-cowork-archive-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: coworkRoot) }
+
+        let now = Date()
+        let log = projectDir.appendingPathComponent("archived.jsonl")
+        try """
+        \(userLine(sessionID: "sess-cowork-archived", cwd: "/tmp/proj", text: "archived cowork", at: now.addingTimeInterval(-15)))
+        \(assistantLine(id: "ca1", at: now.addingTimeInterval(-5), inputTokens: 800, sessionID: "sess-cowork-archived", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+        try writeDesktopSidecar(
+            root: coworkRoot,
+            cliSessionID: "sess-cowork-archived",
+            title: "Archived Cowork",
+            isArchived: true
+        )
+
+        let presences = ClaudeRunwayPresenceSynthesizer.presences(
+            root: root,
+            now: now,
+            claimedLogPaths: [],
+            desktopTitlesRoots: [coworkRoot]
+        )
+
+        XCTAssertFalse(presences.contains { $0.sessionId == "sess-cowork-archived" })
+    }
+
+    func testLoaderMarksIdleSessionRow() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-idlerow-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        // Finished its turn 40s ago: within the 45s idle grace (present), but past
+        // the 30s burn window (no rate) → a pending row marked idle ("—").
+        let log = projectDir.appendingPathComponent("sess-idle.jsonl")
+        try """
+        \(userLine(sessionID: "sess-idle", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-50)))
+        \(assistantLine(id: "i1", at: now.addingTimeInterval(-40), inputTokens: 900, sessionID: "sess-idle", cwd: "/tmp/proj", stopReason: "end_turn"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        let baseline = RunwayProviderBaseline(
+            source: .claude,
+            remainingPercent: 50,
+            resetAt: now.addingTimeInterval(2 * 3600),
+            currentRunoutAt: now.addingTimeInterval(2 * 3600),
+            observedAt: now,
+            hasProjectedRunout: false
+        )
+        let request = CodexRunwaySnapshotRequest(
+            baseline: baseline, identities: [], now: now, maxRows: 4, recentSessionsRoot: root
+        )
+        let snapshot = await ClaudeRunwaySnapshotLoader.snapshot(for: request)
+        let row = snapshot?.rows.first { $0.id == "sess-idle" }
+        XCTAssertEqual(row?.confidence, .idle, "an idle (end_turn) session with no fresh burn should render as idle, not a spinner")
+    }
+
+    // MARK: - Provisional rate must not dominate the cross-session split (F1)
+
+    func testBurnsCapProvisionalRateToMeasuredBurst() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-cap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let now = Date()
+        // Session A: a measured two-sample burst (1000 tokens over 20s = 50 tok/s).
+        let logA = dir.appendingPathComponent("a.jsonl")
+        try """
+        \(assistantLine(id: "a1", at: now.addingTimeInterval(-25), inputTokens: 1000, sessionID: "A"))
+        \(assistantLine(id: "a2", at: now.addingTimeInterval(-5), inputTokens: 1000, sessionID: "A"))
+        """.write(to: logA, atomically: true, encoding: .utf8)
+        // Session B: a single steep cache-heavy turn over the 2s clamp floor → a
+        // provisional ~50,000 tok/s that, uncapped, would claim ~99% of the split.
+        let logB = dir.appendingPathComponent("b.jsonl")
+        try """
+        \(userLine(sessionID: "B", cwd: "/tmp", text: "go", at: now.addingTimeInterval(-3)))
+        \(assistantLine(id: "b1", at: now.addingTimeInterval(-1), inputTokens: 100000, sessionID: "B"))
+        """.write(to: logB, atomically: true, encoding: .utf8)
+
+        let identityA = RunwaySessionIdentity(id: "A", displayName: "A", isGoal: false, logPaths: [logA.path])
+        let identityB = RunwaySessionIdentity(id: "B", displayName: "B", isGoal: false, logPaths: [logB.path])
+        let baseline = RunwayProviderBaseline(
+            source: .claude, remainingPercent: 50,
+            resetAt: now.addingTimeInterval(2 * 3600),
+            currentRunoutAt: now.addingTimeInterval(2 * 3600),
+            observedAt: now, hasProjectedRunout: false
+        )
+        let burns = ClaudeRunwayTokenActivityParser.burns(identities: [identityA, identityB], baseline: baseline, now: now)
+        let aBurn = try XCTUnwrap(burns.first { $0.identity.id == "A" })
+        let bBurn = try XCTUnwrap(burns.first { $0.identity.id == "B" })
+        // B is provisional and capped at A's measured burst, so it claims at most
+        // an equal share — never more than the busiest verified session.
+        XCTAssertEqual(bBurn.percentPerSecond, aBurn.percentPerSecond, accuracy: aBurn.percentPerSecond * 0.02,
+                       "a provisional rate must be capped at the measured peer burst, not dominate the split")
+    }
+
+    // MARK: - Provisional subagent path must not dominate the session rate (F3)
+
+    func testScoredActivityCapsProvisionalPathToMeasuredPeerPath() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-pathcap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let now = Date()
+        // Path 1 (e.g. the parent transcript): a measured two-sample burst —
+        // 2000 tokens over 20s = 100 tok/s.
+        let measuredLog = dir.appendingPathComponent("parent.jsonl")
+        try """
+        \(assistantLine(id: "m1", at: now.addingTimeInterval(-25), inputTokens: 1000, sessionID: "S"))
+        \(assistantLine(id: "m2", at: now.addingTimeInterval(-5), inputTokens: 2000, sessionID: "S"))
+        """.write(to: measuredLog, atomically: true, encoding: .utf8)
+        // Path 2 (a freshly-spawned subagent): one steep single turn — 100k
+        // tokens over 3s ≈ 33,333 tok/s provisional. Uncapped it would swamp
+        // the measured path and inflate the whole session's rate ~300x.
+        let spikeLog = dir.appendingPathComponent("agent-spike.jsonl")
+        try """
+        \(userLine(sessionID: "S", cwd: "/tmp", text: "go", at: now.addingTimeInterval(-4)))
+        \(assistantLine(id: "p1", at: now.addingTimeInterval(-1), inputTokens: 100000, sessionID: "S"))
+        """.write(to: spikeLog, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(
+            id: "S", displayName: "S", isGoal: false,
+            logPaths: [measuredLog.path, spikeLog.path]
+        )
+        let activity = try XCTUnwrap(ClaudeRunwayTokenActivityParser.activity(identity: identity, now: now))
+        // Provisional path capped at the measured peer's 100 tok/s → 100 + 100.
+        XCTAssertEqual(activity.tokensPerSecond, 200, accuracy: 200 * 0.02,
+                       "a provisional subagent path must be capped at the session's best measured path, not summed raw")
+    }
+
+    // MARK: - Desktop-titled idle session keeps idle confidence (F2)
+
+    func testLoaderPreservesIdleForDesktopTitledSession() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-idletitle-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let desktopRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-desktop-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: desktopRoot) }
+
+        let now = Date()
+        // Finished its turn 40s ago: within the 45s idle grace, past the 30s burn
+        // window → an idle pending row.
+        let log = projectDir.appendingPathComponent("sess-idle.jsonl")
+        try """
+        \(userLine(sessionID: "sess-titled-idle", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-50)))
+        \(assistantLine(id: "i1", at: now.addingTimeInterval(-40), inputTokens: 900, sessionID: "sess-titled-idle", cwd: "/tmp/proj", stopReason: "end_turn"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+        try writeDesktopSidecar(root: desktopRoot, cliSessionID: "sess-titled-idle", title: "Renamed In Desktop", isArchived: false)
+
+        let baseline = RunwayProviderBaseline(
+            source: .claude, remainingPercent: 50,
+            resetAt: now.addingTimeInterval(2 * 3600),
+            currentRunoutAt: now.addingTimeInterval(2 * 3600),
+            observedAt: now, hasProjectedRunout: false
+        )
+        let request = CodexRunwaySnapshotRequest(
+            baseline: baseline, identities: [], now: now, maxRows: 4, recentSessionsRoot: root
+        )
+        let snapshot = await ClaudeRunwaySnapshotLoader.snapshot(for: request, desktopTitlesRoot: desktopRoot)
+        let row = snapshot?.rows.first { $0.id == "sess-titled-idle" }
+        XCTAssertEqual(row?.displayName, "Renamed In Desktop", "Desktop title should win")
+        XCTAssertEqual(row?.confidence, .idle,
+                       "a Desktop-titled idle session must stay idle ('—'), not become a spinner")
+    }
+
+    // MARK: - Archived Desktop sessions are excluded from the runway (F5)
+
+    func testLoaderExcludesArchivedDesktopSession() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-archived-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let desktopRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-desktop-arch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: desktopRoot) }
+
+        let now = Date()
+        // A working session 5s ago that WOULD show a row — but it is archived.
+        let log = projectDir.appendingPathComponent("sess-archived.jsonl")
+        try """
+        \(userLine(sessionID: "sess-archived", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-15)))
+        \(assistantLine(id: "w1", at: now.addingTimeInterval(-5), inputTokens: 1000, sessionID: "sess-archived", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+        try writeDesktopSidecar(root: desktopRoot, cliSessionID: "sess-archived", title: "Archived Convo", isArchived: true)
+
+        let baseline = RunwayProviderBaseline(
+            source: .claude, remainingPercent: 50,
+            resetAt: now.addingTimeInterval(2 * 3600),
+            currentRunoutAt: now.addingTimeInterval(2 * 3600),
+            observedAt: now, hasProjectedRunout: false
+        )
+        let request = CodexRunwaySnapshotRequest(
+            baseline: baseline, identities: [], now: now, maxRows: 4, recentSessionsRoot: root
+        )
+        let snapshot = await ClaudeRunwaySnapshotLoader.snapshot(for: request, desktopTitlesRoot: desktopRoot)
+        XCTAssertNil(snapshot?.rows.first { $0.id == "sess-archived" },
+                     "an archived Desktop session should not burn a runway row")
+    }
+
+    // MARK: - Per-file parse cache (perf)
+
+    /// (a) A second scan of unchanged files (same mtime+size) reuses the cached
+    /// head/tail parse and does NOT re-read: the cache miss count stays flat.
+    func testScannerCacheReusesParseForUnchangedFiles() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-cache-reuse-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        for name in ["a", "b"] {
+            let log = projectDir.appendingPathComponent("\(name).jsonl")
+            try """
+            \(userLine(sessionID: "sess-\(name)", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-20)))
+            \(assistantLine(id: "\(name)1", at: now.addingTimeInterval(-10), inputTokens: 800, sessionID: "sess-\(name)", cwd: "/tmp/proj", stopReason: "tool_use"))
+            """.write(to: log, atomically: true, encoding: .utf8)
+        }
+
+        ClaudeRunwayRecentSessionScanner.resetFileCacheForTesting()
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        let afterFirst = ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting
+        XCTAssertEqual(afterFirst, 2, "first scan parses each of the two files exactly once")
+
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        let afterSecond = ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting
+        XCTAssertEqual(afterSecond, afterFirst,
+                       "a second scan of unchanged files must not re-read or re-parse")
+    }
+
+    /// (b) A changed mtime (or size) invalidates only that file's cache entry.
+    func testScannerCacheInvalidatesOnMtimeChange() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-cache-mtime-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let log = projectDir.appendingPathComponent("x.jsonl")
+        try """
+        \(userLine(sessionID: "sess-x", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-20)))
+        \(assistantLine(id: "x1", at: now.addingTimeInterval(-10), inputTokens: 800, sessionID: "sess-x", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        ClaudeRunwayRecentSessionScanner.resetFileCacheForTesting()
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        XCTAssertEqual(ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting, 1,
+                       "unchanged file parsed once across two scans")
+
+        // Touch the mtime: the (mtime,size) key changes → re-parse.
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-5)],
+                                              ofItemAtPath: log.path)
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        XCTAssertEqual(ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting, 2,
+                       "a changed mtime forces exactly one re-parse of that file")
+    }
+
+    /// (b') A changed size with an unchanged mtime still invalidates — proving
+    /// size is part of the cache key, not just the modification date.
+    func testScannerCacheInvalidatesOnSizeChangeWithFixedMtime() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-cache-size-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date()
+        let fixedMtime = now.addingTimeInterval(-120)
+        let log = projectDir.appendingPathComponent("x.jsonl")
+        try """
+        \(userLine(sessionID: "sess-x", cwd: "/tmp/proj", text: "task", at: now.addingTimeInterval(-20)))
+        \(assistantLine(id: "x1", at: now.addingTimeInterval(-10), inputTokens: 800, sessionID: "sess-x", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: log.path)
+
+        ClaudeRunwayRecentSessionScanner.resetFileCacheForTesting()
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        XCTAssertEqual(ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting, 1)
+
+        // Rewrite with longer content, then restore the SAME mtime so only size
+        // differs.
+        try """
+        \(userLine(sessionID: "sess-x", cwd: "/tmp/proj", text: "task with more bytes now", at: now.addingTimeInterval(-20)))
+        \(assistantLine(id: "x2", at: now.addingTimeInterval(-10), inputTokens: 900, sessionID: "sess-x", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: log.path)
+
+        _ = ClaudeRunwayRecentSessionScanner.identities(root: root, now: now)
+        XCTAssertEqual(ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting, 2,
+                       "a changed size with the same mtime must still invalidate the cache")
+    }
+
+    /// (c) Time-dependent state still advances with `now` on unchanged disk: a
+    /// working session drops out of its active window as `now` moves past it,
+    /// WITHOUT any re-read (the cache serves the parsed bytes, the verdict is
+    /// recomputed).
+    func testScannerCacheAdvancesActiveWindowAsNowMovesWithoutReread() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-cache-window-\(UUID().uuidString)")
+        let projectDir = root.appendingPathComponent("-tmp-proj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let base = Date()
+        let log = projectDir.appendingPathComponent("x.jsonl")
+        try """
+        \(userLine(sessionID: "sess-x", cwd: "/tmp/proj", text: "task", at: base.addingTimeInterval(-10)))
+        \(assistantLine(id: "x1", at: base, inputTokens: 800, sessionID: "sess-x", cwd: "/tmp/proj", stopReason: "tool_use"))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        ClaudeRunwayRecentSessionScanner.resetFileCacheForTesting()
+        // 10s after the last line: within the 75s working window → present.
+        let live = ClaudeRunwayRecentSessionScanner.identities(root: root, now: base.addingTimeInterval(10))
+        XCTAssertTrue(live.contains { $0.id == "sess-x" }, "session is active within its window")
+        let missAfterLive = ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting
+        XCTAssertEqual(missAfterLive, 1)
+
+        // 200s after the last line: past the 75s window → gone, from cached bytes.
+        let stale = ClaudeRunwayRecentSessionScanner.identities(root: root, now: base.addingTimeInterval(200))
+        XCTAssertFalse(stale.contains { $0.id == "sess-x" },
+                       "the active window must advance with now, dropping the stale session")
+        XCTAssertEqual(ClaudeRunwayRecentSessionScanner.fileCacheMissCountForTesting, missAfterLive,
+                       "the verdict changed without re-reading the unchanged file")
+    }
+
+    /// (a)+(c) for the token-activity cache: an unchanged file reuses its parsed
+    /// samples across calls, and the burn-rate staleness window still decays as
+    /// `now` advances from those cached samples.
+    func testTokenSampleCacheReusesParseAndDecaysWithNow() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-cache-token-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let log = dir.appendingPathComponent("session.jsonl")
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let t2 = t0.addingTimeInterval(60)
+        try """
+        \(assistantLine(id: "A", at: t0, inputTokens: 1000))
+        \(assistantLine(id: "B", at: t1, inputTokens: 2000))
+        \(assistantLine(id: "C", at: t2, inputTokens: 3000))
+        """.write(to: log, atomically: true, encoding: .utf8)
+
+        let identity = RunwaySessionIdentity(id: "session", displayName: "session", isGoal: false, logPaths: [log.path])
+        ClaudeRunwayTokenActivityParser.resetSampleCacheForTesting()
+
+        let live = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: t2.addingTimeInterval(1))
+        XCTAssertNotNil(live, "a fresh burst yields a rate")
+        let missAfterLive = ClaudeRunwayTokenActivityParser.sampleCacheMissCountForTesting
+        XCTAssertEqual(missAfterLive, 1, "the file is parsed once")
+
+        _ = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: t2.addingTimeInterval(1))
+        XCTAssertEqual(ClaudeRunwayTokenActivityParser.sampleCacheMissCountForTesting, missAfterLive,
+                       "a repeat call on the unchanged file reuses the cached samples")
+
+        // Advance now past the burn-sample window: the rate must decay to nil,
+        // recomputed from the cached samples with no further read.
+        let stale = ClaudeRunwayTokenActivityParser.activity(
+            identity: identity,
+            now: t2.addingTimeInterval(ClaudeRunwayTokenActivityParser.maximumSampleAge + 5))
+        XCTAssertNil(stale, "staleness advances with now from cached samples")
+        XCTAssertEqual(ClaudeRunwayTokenActivityParser.sampleCacheMissCountForTesting, missAfterLive,
+                       "no re-read occurs when the disk is unchanged")
+    }
+
+    // MARK: - Cache-write TTL pricing
+
+    /// Anthropic bills a 1-hour cache write at 2× base input and a 5-minute write at
+    /// 1.25×. The parser used to read only the flat `cache_creation_input_tokens`
+    /// total and charge all of it at the 5-minute rate — and measurement over the 60
+    /// newest local sessions found 100% of cache creation is 1-hour, so the `$` view
+    /// understated every Claude session.
+    func testOneHourCacheWritesPriceAtDoubleInput() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "write", at: t1, flatCacheCreation: 600_000,
+                      cacheCreation5m: 0, cacheCreation1h: 600_000)
+        ], now: t1.addingTimeInterval(1))
+
+        // 600k tokens over a 30s span = 20k/s, priced at claude-opus's $10/MTok
+        // 1-hour write rate (2× its $5 input), not the $6.25 5-minute rate.
+        XCTAssertEqual(dollars ?? 0, 20_000 * 10.0 / 1_000_000 * 3600, accuracy: 1e-6)
+    }
+
+    func testFiveMinuteCacheWritesPriceAtTheFiveMinuteRate() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        // Sub-object only, no flat total: the split alone must carry the tokens
+        // through both the throughput signal and the price.
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "write", at: t1, cacheCreation5m: 600_000, cacheCreation1h: 0)
+        ], now: t1.addingTimeInterval(1))
+
+        XCTAssertEqual(dollars ?? 0, 20_000 * 6.25 / 1_000_000 * 3600, accuracy: 1e-6)
+    }
+
+    /// Regression pin for records that predate the split — they must keep pricing at
+    /// the 5-minute rate rather than dropping out of `$` entirely.
+    func testFlatCacheCreationStillPricesWhenSubObjectAbsent() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "write", at: t1, flatCacheCreation: 600_000)
+        ], now: t1.addingTimeInterval(1))
+
+        XCTAssertEqual(dollars ?? 0, 20_000 * 6.25 / 1_000_000 * 3600, accuracy: 1e-6)
+    }
+
+    /// Real records carry BOTH the flat total and the sub-object, and the sub-object
+    /// sums to the flat total. Reading both would bill the same tokens twice.
+    func testCacheCreationSubObjectReplacesFlatTotalRatherThanAddingToIt() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "write", at: t1, flatCacheCreation: 600_000,
+                      cacheCreation5m: 200_000, cacheCreation1h: 400_000)
+        ], now: t1.addingTimeInterval(1))
+
+        let fiveMinute: Double = 200_000 / 30.0 * 6.25
+        let oneHour: Double = 400_000 / 30.0 * 10.0
+        let expected: Double = (fiveMinute + oneHour) / 1_000_000 * 3600
+        XCTAssertEqual(dollars ?? 0, expected, accuracy: 1e-6)
+        // Guard the specific failure: 600k counted flat *plus* 600k counted split.
+        let doubleCountedFlat: Double = 600_000 / 30.0 * 6.25
+        let doubleCountedSplit: Double = 600_000 / 30.0 * 10.0
+        let doubleCounted: Double = (doubleCountedFlat + doubleCountedSplit) / 1_000_000 * 3600
+        XCTAssertNotEqual(dollars ?? 0, doubleCounted, accuracy: 1e-6)
+    }
+
+    // MARK: - Fast-mode pricing
+
+    /// Fast mode bills Opus 5 / 4.8 at $10/$50 per MTok versus $5/$25 standard. The
+    /// tier is read from the observed `usage.speed` — never from the model name,
+    /// because Opus 4.6 accepts `speed:"fast"` and then bills standard.
+    func testFastModePricesAtTheFastRateSet() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "burn", at: t1, output: 300_000, speed: "fast")
+        ], now: t1.addingTimeInterval(1))
+
+        XCTAssertEqual(dollars ?? 0, 10_000 * 50.0 / 1_000_000 * 3600, accuracy: 1e-6)
+    }
+
+    func testStandardSpeedIsUnchangedByFastModeSupport() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "burn", at: t1, output: 300_000, speed: "standard")
+        ], now: t1.addingTimeInterval(1))
+
+        XCTAssertEqual(dollars ?? 0, 10_000 * 25.0 / 1_000_000 * 3600, accuracy: 1e-6)
+    }
+
+    func testUSInferenceGeoAppliesToLiveRunwayPricing() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1, inferenceGeo: "us"),
+            usageLine(id: "burn", at: t1, output: 300_000, inferenceGeo: "us")
+        ], now: t1.addingTimeInterval(1))
+        XCTAssertEqual(dollars ?? 0, 10_000 * 25.0 * 1.1 / 1_000_000 * 3600,
+                       accuracy: 1e-6)
+    }
+
+    func testUnavailableInferenceGeoUsesBaseRateForLiveRunway() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "burn", at: t1, output: 300_000,
+                      inferenceGeo: "not_available")
+        ], now: t1.addingTimeInterval(1))
+        XCTAssertEqual(dollars ?? 0, 10_000 * 25.0 / 1_000_000 * 3600,
+                       accuracy: 1e-6)
+    }
+
+    func testEmptyInferenceGeoUsesBaseRateForLiveRunway() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "burn", at: t1, output: 300_000, inferenceGeo: "")
+        ], now: t1.addingTimeInterval(1))
+        XCTAssertEqual(dollars ?? 0, 10_000 * 25.0 / 1_000_000 * 3600,
+                       accuracy: 1e-6)
+    }
+
+    func testMalformedInferenceGeoKeepsLiveRunwayUnpriceable() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "burn", at: t1, output: 300_000, inferenceGeo: "moon")
+        ], now: t1.addingTimeInterval(1))
+        XCTAssertNil(dollars)
+    }
+
+    func testLoaderKeepsUnavailableGeoInDollarAndWeeklyPresentations() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let logPath = try makeLog(lines: [
+            usageLine(id: "anchor", at: now.addingTimeInterval(-90), input: 1,
+                      inferenceGeo: "not_available"),
+            usageLine(id: "burn", at: now.addingTimeInterval(-5), output: 300_000,
+                      inferenceGeo: "not_available")
+        ])
+        let identity = RunwaySessionIdentity(
+            id: "session", displayName: "session", isGoal: false, logPaths: [logPath])
+
+        func snapshot(rateUnit: RunwayRateUnit) async -> CodexRunwaySnapshot? {
+            let resetAt = now.addingTimeInterval(7 * 24 * 60 * 60)
+            let baseline = RunwayProviderBaseline(
+                source: .claude,
+                remainingPercent: 50,
+                resetAt: resetAt,
+                currentRunoutAt: resetAt,
+                observedAt: now,
+                hasProjectedRunout: false,
+                windowMinutes: 10_080,
+                rateUnit: rateUnit
+            )
+            let request = CodexRunwaySnapshotRequest(
+                baseline: baseline,
+                identities: [identity],
+                now: now,
+                maxRows: 4,
+                weeklyResetAt: resetAt,
+                weeklyPercentPointsPerDollar: 0.5,
+                weeklyWindowAvailable: true
+            )
+            return await ClaudeRunwaySnapshotLoader.snapshot(for: request)
+        }
+
+        let dollars = await snapshot(rateUnit: .dollarsPerHour)
+        XCTAssertEqual(dollars?.baseline.rateUnit, .dollarsPerHour,
+                       "real Claude geography must not trigger the token fallback")
+        XCTAssertGreaterThan(dollars?.rows.first?.displayRate ?? 0, 0)
+
+        let weekly = await snapshot(rateUnit: .weeklyPercentPerHour)
+        XCTAssertEqual(weekly?.baseline.rateUnit, .weeklyPercentPerHour)
+        XCTAssertEqual(weekly?.rows.first?.confidence, .direct)
+        XCTAssertGreaterThan(weekly?.rows.first?.displayRate ?? 0, 0,
+                             "a calibrated weekly presentation must not become n/a")
+    }
+
+    /// A burst that straddles a speed switch must price each half at its own tier,
+    /// exactly as it already does for a model switch.
+    func testBurstStraddlingASpeedSwitchPricesEachHalf() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let t2 = t0.addingTimeInterval(60)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, input: 1),
+            usageLine(id: "fast", at: t1, output: 300_000, speed: "fast"),
+            usageLine(id: "slow", at: t2, output: 300_000, speed: "standard")
+        ], now: t2.addingTimeInterval(1))
+
+        // Both later turns land in a 60s span: 5k/s each, one at $50 one at $25.
+        let expected = (5_000 * 50.0 + 5_000 * 25.0) / 1_000_000 * 3600
+        XCTAssertEqual(dollars ?? 0, expected, accuracy: 1e-6)
+    }
+
+    /// Falling back to standard rates for a model with no fast tier would understate
+    /// by exactly the 2× this work exists to correct, so the slice is dropped instead
+    /// — the same honest-drop the calculator already applies to an unknown model.
+    func testFastSpeedOnAModelWithoutFastRatesIsUnpriceable() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let dollars = try dollarsPerHour(lines: [
+            usageLine(id: "anchor", at: t0, model: "claude-sonnet-5", input: 1),
+            usageLine(id: "burn", at: t1, model: "claude-sonnet-5", output: 300_000, speed: "fast")
+        ], now: t1.addingTimeInterval(1))
+
+        XCTAssertNil(dollars)
+    }
+
+    /// Both clamp paths rebuild every component by hand, so a forgotten field is
+    /// silently defaulted rather than caught by the compiler. A clamped session must
+    /// keep its speed tier or its fast slice reverts to standard pricing.
+    func testCrossSessionClampPreservesTheSpeedTier() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let measured = try makeLog(lines: [
+            usageLine(id: "m0", at: t0, input: 1),
+            usageLine(id: "m1", at: t1, output: 30)
+        ])
+        let provisional = try makeLog(lines: [
+            userLine(sessionID: "p", cwd: "/tmp", text: "go", at: t1.addingTimeInterval(-10)),
+            usageLine(id: "p1", at: t1, output: 300_000, speed: "fast")
+        ])
+
+        let clamped = ClaudeRunwayTokenActivityParser.activitiesClampingProvisional(
+            identities: [
+                RunwaySessionIdentity(id: "measured", displayName: "M", isGoal: false, logPaths: [measured]),
+                RunwaySessionIdentity(id: "provisional", displayName: "P", isGoal: false, logPaths: [provisional])
+            ],
+            now: t1.addingTimeInterval(1))
+
+        let p = clamped.first { $0.identity.id == "provisional" }
+        XCTAssertNotNil(p)
+        XCTAssertLessThan(p?.tokensPerSecond ?? .infinity, 100, "the provisional rate must actually be clamped")
+        XCTAssertEqual(p?.components.first?.speed, .fast, "the clamp must not drop the fast tier")
+    }
+
+    /// Same trap, the per-path clamp inside `scoredActivity`: a subagent path folded
+    /// into the parent identity is rescaled by a second hand-written rebuild.
+    func testPerPathClampPreservesTheSpeedTier() throws {
+        let t0 = Date(timeIntervalSince1970: 2_000_000)
+        let t1 = t0.addingTimeInterval(30)
+        let measured = try makeLog(lines: [
+            usageLine(id: "m0", at: t0, input: 1),
+            usageLine(id: "m1", at: t1, output: 30)
+        ])
+        let provisional = try makeLog(lines: [
+            userLine(sessionID: "p", cwd: "/tmp", text: "go", at: t1.addingTimeInterval(-10)),
+            usageLine(id: "p1", at: t1, output: 300_000, speed: "fast")
+        ])
+
+        let identity = RunwaySessionIdentity(id: "session", displayName: "S", isGoal: false,
+                                             logPaths: [measured, provisional])
+        let activity = ClaudeRunwayTokenActivityParser.activity(identity: identity,
+                                                               now: t1.addingTimeInterval(1))
+
+        XCTAssertEqual(activity?.components.filter { $0.speed == .fast }.count, 1,
+                       "the rescaled subagent path keeps its fast tier")
+    }
+
+    // MARK: - Price manifest
+
+    // Served-manifest vs bundled-table guards live in PriceManifestV2Tests.
+
+    // MARK: - Helpers
+
+    /// Writes `lines` to a throwaway JSONL and returns its path. Each call gets its
+    /// own directory so the parser's (path, mtime, size) sample cache never collides.
+    private func makeLog(lines: [String]) throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-runway-price-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let log = dir.appendingPathComponent("session.jsonl")
+        try lines.joined(separator: "\n").write(to: log, atomically: true, encoding: .utf8)
+        return log.path
+    }
+
+    /// End-to-end $/h for one session: JSONL bytes → parsed components → priced.
+    private func dollarsPerHour(lines: [String], now: Date) throws -> Double? {
+        let identity = RunwaySessionIdentity(id: "session", displayName: "session",
+                                             isGoal: false, logPaths: [try makeLog(lines: lines)])
+        guard let activity = ClaudeRunwayTokenActivityParser.activity(identity: identity, now: now) else {
+            return nil
+        }
+        return CodexRunwayCalculator.dollarsPerHour(for: activity,
+                                                    priceTable: RunwayPriceTable.makeForTesting(),
+                                                    source: .claude)
+    }
+
+    /// An assistant usage line. `flatCacheCreation` and the 5m/1h pair are emitted
+    /// independently so a test can reproduce a record carrying one, the other, or —
+    /// as real transcripts do — both.
+    private func usageLine(id: String,
+                           at date: Date,
+                           model: String = "claude-opus-5",
+                           input: Int = 0,
+                           output: Int = 0,
+                           cacheRead: Int = 0,
+                           flatCacheCreation: Int? = nil,
+                           cacheCreation5m: Int? = nil,
+                           cacheCreation1h: Int? = nil,
+                           speed: String? = nil,
+                           inferenceGeo: String? = nil) -> String {
+        var usage = "\"input_tokens\":\(input),\"output_tokens\":\(output),\"cache_read_input_tokens\":\(cacheRead)"
+        if let flatCacheCreation { usage += ",\"cache_creation_input_tokens\":\(flatCacheCreation)" }
+        if cacheCreation5m != nil || cacheCreation1h != nil {
+            usage += ",\"cache_creation\":{\"ephemeral_5m_input_tokens\":\(cacheCreation5m ?? 0)"
+            usage += ",\"ephemeral_1h_input_tokens\":\(cacheCreation1h ?? 0)}"
+        }
+        if let speed { usage += ",\"speed\":\"\(speed)\"" }
+        if let inferenceGeo { usage += ",\"inference_geo\":\"\(inferenceGeo)\"" }
+        return "{\"type\":\"assistant\",\"sessionId\":\"session\",\"timestamp\":\"\(iso(date))\","
+            + "\"message\":{\"id\":\"\(id)\",\"role\":\"assistant\",\"model\":\"\(model)\",\"usage\":{\(usage)}}}"
+    }
+
+    private func writeDesktopSidecar(root: URL, cliSessionID: String, title: String, isArchived: Bool) throws {
+        let dir = root.appendingPathComponent("convo/\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let obj: [String: Any] = ["cliSessionId": cliSessionID, "title": title, "isArchived": isArchived]
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [])
+        try data.write(to: dir.appendingPathComponent("local_\(UUID().uuidString).json"))
+    }
+
+    private func assistantLine(id: String,
+                               at date: Date,
+                               inputTokens: Int,
+                               sessionID: String = "session",
+                               cwd: String? = nil,
+                               stopReason: String? = nil) -> String {
+        let cwdField = cwd.map { "\"cwd\":\"\($0)\"," } ?? ""
+        let stopField = stopReason.map { "\"stop_reason\":\"\($0)\"," } ?? ""
+        return "{\"type\":\"assistant\",\"sessionId\":\"\(sessionID)\",\(cwdField)\"timestamp\":\"\(iso(date))\",\"message\":{\"id\":\"\(id)\",\"role\":\"assistant\",\(stopField)\"usage\":{\"input_tokens\":\(inputTokens),\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}"
+    }
+
+    private func userLine(sessionID: String, cwd: String, text: String, at date: Date) -> String {
+        return "{\"type\":\"user\",\"sessionId\":\"\(sessionID)\",\"cwd\":\"\(cwd)\",\"timestamp\":\"\(iso(date))\",\"message\":{\"role\":\"user\",\"content\":\"\(text)\"}}"
+    }
+
+    private func iso(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+}

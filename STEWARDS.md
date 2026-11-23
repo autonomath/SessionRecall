@@ -1,0 +1,152 @@
+# Stewards
+
+Agent Sessions reads local session history from a lot of coding agents. Those agents keep
+changing their file formats. A **steward** is a person who uses one of them and checks, a
+few times a year, that Agent Sessions still reads it correctly.
+
+That is the whole job. One agent, your own installation, your own sessions.
+
+## What a steward does
+
+- Looks after **one** agent.
+- Gets pinged when that agent's format needs a re-check — about 2–3 times a year.
+- Runs one command against their own sessions, and reports what it says. Roughly
+  10 minutes.
+- If the format changed, reports the differences and attaches a generated redacted
+  sample when one is available.
+
+## What we'd prefer, if you're up for it
+
+Two habits make the biggest difference. Both are preferred, not required.
+
+- **Check monthly without waiting for a ping.** Run `steward_check.py` about once a month,
+  and after a big release of your agent. Post the result, even "all good", on your
+  agent's steward issue.
+- **Send the fix as a PR.** When your agent's format or storage changes, a pull request
+  that updates its reader is the fastest path to support. You know the agent best.
+
+You can opt out of PRs and only report format checks. Say so once on your steward issue,
+and the maintainer will build the fixes from your reports.
+
+## What a steward does not do
+
+- No commit rights. No review duty.
+- No required code. Unless you choose to send PRs, you never have to open Xcode or write Swift.
+- No support rota, no response deadline. If you're busy, say so or say nothing — the agent
+  moves to best-effort and that's fine.
+- No sharing of real transcripts. The check tool redacts before anything leaves your Mac,
+  and you decide what to attach. Nothing in the job above ever publishes your session
+  content.
+
+## Sometimes asked, never expected
+
+Two things occasionally come up that are **not** part of the job. Both are one-off, both are
+opt-in, and "no" is a complete answer that changes nothing about your stewardship.
+
+- **An end-to-end resume check.** Some agents are supported from their installed help and
+  reader evidence, but nobody on the project could authenticate the CLI to confirm that
+  Resume actually reopens a session. If you can run it once and say whether it worked, that
+  closes the last hole in the support matrix. The footnotes under the table below name the
+  agents waiting on this.
+- **A screenshot for the release page.** Agent Sessions can only show an agent someone
+  actually runs, so the maintainer cannot capture a session for an agent he does not have.
+  This one is different from everything else here: **a screenshot is unredacted transcript.**
+  The redaction promise above covers the check tool, and it cannot cover a picture. So if you
+  are asked, you choose what is on screen, you take the capture, you look at it, and nothing
+  is published until you say so. Declining is genuinely fine — a release does not need it.
+
+## What a steward gets
+
+Named credit in the table below, and on the project site's support page as it is built out.
+Every verification run is a public, dated record with your handle on it. Anything from the
+optional list above is credited the same way.
+
+## Sign up
+
+Open the [steward signup form](https://github.com/jazzyalex/agent-sessions/issues/new?template=steward-signup.yml)
+and name the agent you use. If the agent you want isn't supported yet, start with the
+[new agent source form](https://github.com/jazzyalex/agent-sessions/issues/new?template=new-agent-source.yml)
+instead — see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+
+The check itself is one command:
+
+```bash
+./scripts/steward_check.py <agent>
+```
+
+It compares your agent's sessions against the recorded baseline and, if the format moved,
+reports the differences. The sample status says whether a redacted sample was generated,
+withheld by the privacy check, unavailable from automatic extraction, or disabled with
+`--no-sample`. This reporting behavior is the same for every agent.
+
+A sample is optional for reporting a change. Maintainers will decide whether the report
+provides enough evidence. Do not paste raw sessions or hand-redact records when a sample
+is missing. See `scripts/steward_check.py::_issue_body` for the shared report format.
+
+## Tiers
+
+- **Maintained** — the maintainer uses this agent daily and verifies it himself.
+- **Steward-verified** — a named steward re-checks the format and the date below is theirs.
+- **Best-effort** — no steward yet. It stays in the automated weekly format check while the
+  maintainer can run it, but nobody is on the hook for it and drift can sit unfixed.
+
+## Who looks after what
+
+| Agent | Steward | Last verified | Tier |
+|---|---|---|---|
+| Codex | @jazzyalex (maintainer) | 2026-10-27 · 0.165.0 | Maintained |
+| Claude Code | @jazzyalex (maintainer) | 2026-10-27 · 2.1.312 | Maintained |
+| Cursor Agent | steward wanted | 2026-10-27 · 2026.10.22 | Best-effort |
+| GitHub Copilot CLI | steward wanted | 2026-10-27 · 1.0.104 | Best-effort |
+| OpenCode | steward wanted | 2026-10-27 · 2.2.0 | Best-effort |
+| Antigravity CLI | steward wanted | 2026-10-27 · 1.4.8 | Best-effort |
+| Pi | steward wanted | 2026-10-27 · 1.4.0 | Best-effort |
+| Kimi Code | steward wanted | 2026-10-27 · 2.3.3 | Best-effort |
+| Grok CLI | steward wanted | 2026-10-27 · 1.0.70 | Best-effort |
+| OpenClaw | steward wanted | 2026-10-21 · 2026.10.5 | Best-effort |
+| Hermes | steward wanted | 2026-10-27 · 0.22.5 | Best-effort |
+| Qwen Code | steward wanted | 2026-08-17 · 0.14.3 (see note) | Best-effort |
+| Devin CLI | @thedavidweng | 2026-09-01 · 3000.6.7 (see note) | Steward-verified |
+| fx (vercel-labs) | @thedavidweng | 2026-09-07 · 0.0.7 (see note) | Steward-verified |
+| Cline CLI and Desktop | steward wanted | 2026-10-27 · CLI 3.0.74 / Desktop 0.0.48 (2026-10-21) | Best-effort |
+| DeepSeek Harness | steward wanted | 2026-10-21 · 0.2.1-rc.2 | Best-effort |
+
+Dates and versions come from
+[docs/agent-support/agent-support-matrix.yml](docs/agent-support/agent-support-matrix.yml),
+which is the machine-readable record. This table is the human one; if they disagree, the
+matrix is right.
+
+Droid is not in the table on purpose: it is legacy-only — existing sessions still read,
+but the agent is excluded from active format checks and takes no steward.
+
+Honest footnotes:
+
+- **Devin CLI.** Format compatibility re-verified 2026-09-01 on CLI 3000.6.7
+  (260a97c8): `steward_check.py devin` reported the newer installed build matches the
+  baseline. A separate read-only audit over 253 sessions / 394,495 message nodes found no
+  usable token or cost telemetry: `cogs_json` is configuration, `metadata.num_tokens` is
+  always null, `num_tokens_preceding` is a context cursor, and the stored cost fields are
+  uniformly zero ([#67](https://github.com/jazzyalex/agent-sessions/issues/67#issuecomment-5501897068)).
+  The original end-to-end product verification remains 2026-08-27 on CLI 3000.5.20
+  (2d902011), with a schema
+  probe over 247 visible sessions (253 total, 6 `hidden=1`) in `~/.local/share/devin/cli/sessions.db` and the 9-point checklist against a running `upstream/main` build (`issuecomment-5433779336`): list count 247, titles recognisable (1 expected `Untitled`), main-chain transcript renders `user/assistant(tool_calls)/tool_result` with no blank middle, timestamps epoch seconds (no 1970), search `Greptile` hits main chain, `has-commands` 241/6, Analytics `devin` counts, Copy Resume `devin --resume <slug>` pasteable and launch-in-terminal uses the same plan. Resume was closed the same night via `devin --resume stump-zebu -p "resume test: say hello"` (exit 0, assistant reply) with `devin auth status` `Logged in via Devin` (`user-b19f15…`). Weekly monitoring: `steward_check.py devin` `All good` (verified 3000.3.27 → 3000.5.20 drift is only the version bump, schema matches).
+- **Qwen Code.** Verified against 0.14.3 transcripts. The installed CLI is 0.21.13, but the
+  Qwen OAuth free tier was discontinued on 2026-04-15, so no newer transcript can be
+  captured on this machine without a paid plan or an alternate provider. Newer Qwen builds
+  are unverified. A steward with a working Qwen account would close this outright — it is
+  the single most useful agent to adopt.
+- **Hermes.** Verified on 0.21.5 on 2026-10-13 from a fresh driver session. The driver
+  depends on the provider set in the maintainer's Hermes config; when that provider has
+  no working credential, newer builds have no fresh evidence either way.
+- **fx (vercel-labs).** Re-verified 2026-08-27 on CLI 0.0.5 (df7e624) with 5 dirs under `~/.fx/sessions` (`178719436754…` etc., 3 with history, 2 empty `history_len 0`): `checkpoint.json` + `session.json` + `display.json` layout holds, all four `kind`s still render (live data covers `assistant` + `interrupted`; `background_command`/`compacted_summary` via fixture), `durableString` for `base64` text, `tool_calls[].arguments_json` as JSON string, `tool_result` keyed by `tool_call_id`. 9-point checklist (`issuecomment-5433779336`): count 5 (3 visible after `hideZeroMessageSessions`), titles from `display.json`/first prompt, no 1970, search `Skills: 25` hits, `has-commands` 3/2, Analytics counts, Copy `fx --resume <id>` (`--continue` only with `cwd`). `fx --help` advertises `--resume [last|<id>]`/`-c`; `fx session --id <id> --json` succeeds 3/3 non-corrupt (the fourth `178719436754…` is CLI-reported `InvalidSessionFormat` but browsable via direct `checkpoint.json`); `expect` spawning `fx --resume <id>` reaches `UnableToReadTerminalSize` not unknown-flag, so the flag is valid and the session is found — full interactive reopen needs a TTY and was not driven to a prompt. `steward_check.py fx` now runs (fixed `MATRIX_KEY` + `verified_map` + baseline `checkpoint.json` note) and reports additive 0.0.5 `unknown_keys` (`checkpoint_seq` etc.) with `format_drift_detected` but no missing render path. Format is young (3/`event_log_v1`), so drift is expected.
+
+  Source inspection of fx 0.0.7 on 2026-09-02 found the same four history kinds and
+  eight required additive `session.json` manifest fields. The fixture and steward export
+  now cover those fields, but the verified ceiling stays at 0.0.5 until a session created
+  natively by 0.0.7 passes the check; the evidence in #66 only re-read 0.0.5 sessions.
+
+  fx 0.0.8 stopped writing `checkpoint.json` (schema 4: `session.json` plus a conversation
+  `events.jsonl`), so the app and `steward_check.py fx` found no sessions (#83). On
+  2026-10-21 schema 4 support was built from upstream source at v0.0.14; it awaits a
+  steward session. The verified ceiling stays at 0.0.7 until `steward_check.py fx` passes
+  on a session written by 0.0.8 or later.

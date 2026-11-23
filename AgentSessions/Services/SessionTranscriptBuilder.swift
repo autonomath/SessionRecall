@@ -1,0 +1,955 @@
+import Foundation
+import SwiftUI
+
+// swiftlint:disable type_body_length
+struct SessionTranscriptBuilder {
+    static let outPrefix = "⟪out⟫"
+    static let toolPrefix = "› tool:"
+    static let userPrefix = "> "
+    static let errorPrefix = "! error"
+
+    struct ANSI {
+        static let reset = "\u{001B}[0m"
+        static let cyan = "\u{001B}[36m"
+        static let green = "\u{001B}[32m"
+        static let magenta = "\u{001B}[35m"
+        static let red = "\u{001B}[31m"
+        static let dim = "\u{001B}[2m"
+        static let bold = "\u{001B}[1m"
+    }
+
+    struct Options { var showTimestamps: Bool; var showMeta: Bool; var renderMode: TranscriptRenderMode; var sessionSource: SessionSource? }
+
+    // MARK: Public API
+
+    /// New plain terminal transcript builder (no truncation, no styling)
+    static func buildPlainTerminalTranscript(session: Session, filters: TranscriptFilters, mode: TranscriptRenderMode = .normal) -> String {
+        buildPlainTerminalTranscript(events: session.events, source: session.source, filters: filters, mode: mode)
+    }
+
+    /// Incremental helper that renders only a subset of events (tail appends).
+    static func buildPlainTerminalTranscript(events: ArraySlice<SessionEvent>,
+                                             source: SessionSource,
+                                             filters: TranscriptFilters,
+                                             mode: TranscriptRenderMode = .normal) -> String {
+        buildPlainTerminalTranscript(events: Array(events), source: source, filters: filters, mode: mode)
+    }
+
+    /// Incremental helper that renders only a subset of events (tail appends).
+    static func buildPlainTerminalTranscript(events: [SessionEvent],
+                                             source: SessionSource,
+                                             filters: TranscriptFilters,
+                                             mode: TranscriptRenderMode = .normal) -> String {
+        let opts = options(from: filters, mode: mode, source: source)
+        let blocks = injectedUserAsMeta(coalesce(events: events, source: source, includeMeta: opts.showMeta),
+                                        showMeta: opts.showMeta)
+        var out = ""
+        // Intentionally omit session header and divider for a cleaner transcript view.
+        for b in blocks {
+            out += render(block: b, options: opts)
+            out += "\n"
+        }
+        return out
+    }
+
+    /// Text renderings (Text view, Copy, export) show a user block that provenance marks as injected
+    /// context as metadata, never under the user prefix: kept only when meta is shown.
+    static func injectedUserAsMeta(_ blocks: [LogicalBlock], showMeta: Bool) -> [LogicalBlock] {
+        guard blocks.contains(where: { $0.kind == .user && $0.messageOrigin?.isUnresolvedMixed == true }) else {
+            return blocks
+        }
+        return blocks.compactMap { block in
+            guard block.kind == .user, block.messageOrigin?.isUnresolvedMixed == true else { return block }
+            guard showMeta else { return nil }
+            var meta = block
+            meta.kind = .meta
+            return meta
+        }
+    }
+
+    /// Returns true when rendering a tail slice independently will preserve output shape.
+    ///
+    /// If two events can coalesce across the boundary, callers should fall back to
+    /// full transcript rebuild to avoid duplicated prefixes/markers.
+    static func isAppendBoundarySafe(previous: SessionEvent, next: SessionEvent) -> Bool {
+        let lhs = block(from: previous)
+        let rhs = block(from: next)
+        return !canMerge(lhs, rhs)
+    }
+
+    /// Terminal mode helper that also returns NSRanges for command lines and user text to enable styling in the UI.
+    static func buildTerminalPlainWithRanges(session: Session, filters: TranscriptFilters) -> (String, [NSRange], [NSRange]) {
+        let opts = options(from: filters, mode: .terminal, source: session.source)
+        let blocks = injectedUserAsMeta(coalesce(session: session, includeMeta: opts.showMeta), showMeta: opts.showMeta)
+        var out = ""
+        var commandRanges: [NSRange] = []
+        var userRanges: [NSRange] = []
+        func markRange(_ s: String, into array: inout [NSRange]) {
+            let start = (out as NSString).length
+            out += s
+            let len = (s as NSString).length
+            if len > 0 { array.append(NSRange(location: start, length: len)) }
+        }
+        for b in blocks {
+            switch b.kind {
+            case .toolCall:
+                let lines = toolDisplayLines(for: b, source: opts.sessionSource)
+                for (i, line) in lines.enumerated() {
+                    markRange(line, into: &commandRanges)
+                    if i < lines.count - 1 { out += "\n" }
+                }
+            case .user:
+                // Render exactly like render(block:) but also record user text ranges (exclude prefix/timestamp)
+                let head = timestampPrefix(b.timestamp, options: opts)
+                let prefix = userPrefix
+                out += head + prefix
+                markRange(b.typedText, into: &userRanges)
+            default:
+                out += render(block: b, options: opts)
+            }
+            out += "\n"
+        }
+        return (out, commandRanges, userRanges)
+    }
+
+    static func buildANSI(session: Session, filters: TranscriptFilters) -> String {
+        let opts = options(from: filters, mode: .normal, source: session.source)
+        var out = ""
+        out += ANSI.bold + headerLine(session: session) + ANSI.reset + "\n"
+        out += String(repeating: "─", count: 80) + "\n"
+        for e in session.events {
+            if e.kind == .meta && !opts.showMeta { continue }
+            out += ansiLine(for: e, options: opts) + "\n"
+        }
+        return out
+    }
+
+    static func buildAttributed(session: Session, theme: TranscriptTheme, filters: TranscriptFilters) -> AttributedString {
+        let opts = options(from: filters, mode: .normal, source: session.source)
+        let colors = theme.colors
+        var attr = AttributedString("")
+
+        var header = AttributedString(headerLine(session: session) + "\n")
+        header.foregroundColor = colors.dim
+        header.font = .system(.body, design: .monospaced)
+        attr += header
+
+        var rule = AttributedString(String(repeating: "─", count: 80) + "\n")
+        rule.foregroundColor = colors.dim
+        rule.font = .system(.body, design: .monospaced)
+        attr += rule
+
+        for e in session.events {
+            if e.kind == .meta && !opts.showMeta { continue }
+            attr += attributedLine(for: e, colors: colors, options: opts)
+            attr += AttributedString("\n")
+        }
+        return attr
+    }
+
+    // MARK: Line helpers
+
+    private static func timestampTail(_ ts: Date?, options: Options) -> String {
+        guard options.showTimestamps, let ts = ts else { return "" }
+        return " @" + AppDateFormatting.transcriptTimestamp(ts)
+    }
+
+    private static func timestampPrefix(_ ts: Date?, options: Options) -> String {
+        guard options.showTimestamps, let ts = ts else { return "" }
+        return AppDateFormatting.transcriptTimestamp(ts) + AppDateFormatting.transcriptSeparator
+    }
+
+    // Legacy builders kept for compatibility in case other views still call them
+    static func buildPlain(session: Session, filters: TranscriptFilters) -> String {
+        let opts = options(from: filters, mode: .normal, source: session.source)
+        var lines: [String] = []
+        lines.append(headerLine(session: session))
+        lines.append(String(repeating: "-", count: 80))
+        for e in session.events {
+            if e.kind == .meta && !opts.showMeta { continue }
+            let b = block(from: e)
+            lines.append(render(block: b, options: opts))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func ansiLine(for e: SessionEvent, options: Options) -> String {
+        func wrap(_ s: String, _ code: String) -> String { code + s + ANSI.reset }
+        switch e.kind {
+        case .user:
+            return wrap(userPrefix, ANSI.cyan) + (e.text ?? "") + wrap(timestampTail(e.timestamp, options: options), ANSI.dim)
+        case .assistant:
+            var line = (e.text ?? "")
+            if !line.isEmpty { line += "  " }
+            line += wrap("[assistant]", ANSI.green)
+            line += wrap(timestampTail(e.timestamp, options: options), ANSI.dim)
+            return line
+        case .tool_call:
+            let args: String
+            if let input = e.toolInput, input.count <= 80 {
+                args = " " + wrap(input, ANSI.dim)
+            } else if e.toolInput != nil {
+                args = " " + wrap("(args…)", ANSI.dim)
+            } else { args = "" }
+            return wrap(toolPrefix, ANSI.magenta) + " " + (e.toolName ?? "?") + args + wrap(timestampTail(e.timestamp, options: options), ANSI.dim)
+        case .tool_result:
+            if let output = formattedOutput(e.toolOutput) {
+                return wrap(outPrefix, ANSI.dim) + " " + output + wrap(timestampTail(e.timestamp, options: options), ANSI.dim)
+            }
+            return wrap(outPrefix, ANSI.dim) + wrap(timestampTail(e.timestamp, options: options), ANSI.dim)
+        case .error:
+            return wrap(errorPrefix, ANSI.red) + " " + (e.text ?? "") + wrap(timestampTail(e.timestamp, options: options), ANSI.dim)
+        case .meta:
+            return wrap(e.text ?? e.rawJSON, ANSI.dim)
+        }
+    }
+
+    private static func attributedLine(for e: SessionEvent, colors: TranscriptColors, options: Options) -> AttributedString {
+        var line = AttributedString("")
+        func append(_ text: String, color: Color? = nil) {
+            var piece = AttributedString(text)
+            piece.font = .system(.body, design: .monospaced)
+            if let color { piece.foregroundColor = color }
+            line += piece
+        }
+        switch e.kind {
+        case .user:
+            append(userPrefix, color: colors.user)
+            append(e.text ?? "")
+            append(timestampTail(e.timestamp, options: options), color: colors.dim)
+        case .assistant:
+            append(e.text ?? "")
+            if !(e.text ?? "").isEmpty { append("  ") }
+            append("[assistant]", color: colors.assistant)
+            append(timestampTail(e.timestamp, options: options), color: colors.dim)
+        case .tool_call:
+            append(toolPrefix + " ", color: colors.tool)
+            append(e.toolName ?? "?")
+            if let input = e.toolInput {
+                if input.count <= 80 {
+                    append(" " + input, color: colors.dim)
+                } else {
+                    append(" (args…)", color: colors.dim)
+                }
+            }
+            append(timestampTail(e.timestamp, options: options), color: colors.dim)
+        case .tool_result:
+            append(outPrefix + " ", color: colors.dim)
+            if let output = formattedOutput(e.toolOutput) { append(output) }
+            append(timestampTail(e.timestamp, options: options), color: colors.dim)
+        case .error:
+            append(errorPrefix + " ", color: colors.error)
+            append(e.text ?? "")
+            append(timestampTail(e.timestamp, options: options), color: colors.dim)
+        case .meta:
+            append(e.text ?? e.rawJSON, color: colors.dim)
+        }
+        return line
+    }
+
+    // MARK: Formatting helpers
+
+    private static func options(from filters: TranscriptFilters, mode: TranscriptRenderMode, source: SessionSource?) -> Options {
+        switch filters {
+        case let .current(showTimestamps, showMeta):
+            return Options(showTimestamps: showTimestamps, showMeta: showMeta, renderMode: mode, sessionSource: source)
+        }
+    }
+
+    // Terminal rendering for tool_call events
+    private static func renderTerminalToolCall(name: String?, toolInput: String?, fallback: String) -> String {
+        guard let tool = name else { return "\(toolPrefix) \(fallback)" }
+        guard let input = toolInput, !input.isEmpty else { return "\(toolPrefix) \(tool)" }
+        if tool.lowercased() == "shell" {
+            if let data = input.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let arr = obj["command"] as? [Any] {
+                    let parts = arr.compactMap { $0 as? String }
+                    if parts.count >= 3, parts[0] == "bash" {
+                        let header = parts[0...1].joined(separator: " ")
+                        let cmd = parts.dropFirst(2).joined(separator: " ")
+                        return header + "\n" + cmd
+                    } else if parts.count >= 1 {
+                        return parts.joined(separator: " ")
+                    }
+                }
+                if let script = obj["script"] as? String { return script }
+            }
+            return "\(toolPrefix) shell \(compactJSONOneLine(input))"
+        }
+        return "\(toolPrefix) \(tool) \(compactJSONOneLine(input))"
+    }
+
+    private static func headerLine(session: Session) -> String {
+        let short = session.shortID
+        let model = session.model ?? "—"
+        let branch = session.gitBranch ?? "—"
+        let msgs = session.nonMetaCount
+        let modified = session.modifiedRelative
+        return "Session \(short)  •  model \(model)  •  branch \(branch)  •  msgs \(msgs)  •  modified \(modified)"
+    }
+
+    private static func formattedOutput(_ s: String?) -> String? {
+        guard var text = s, !text.isEmpty else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) || (trimmed.hasPrefix("[") && trimmed.hasSuffix("]")) {
+            // Pretty print JSON if possible
+            text = PrettyJSON.prettyPrinted(text)
+        }
+        return text
+    }
+
+    // MARK: New coalescer + renderer
+
+    struct LogicalBlock: Equatable {
+        enum Kind { case user, assistant, toolCall, toolOut, error, meta }
+        var kind: Kind
+        var text: String
+        var timestamp: Date?
+        var messageID: String?
+        var toolName: String?
+        var isDelta: Bool
+        var toolInput: String?
+        // Marks tool output that represents an error (stderr/non-zero exit, etc.).
+        // This is primarily used by the new Terminal view to classify error lines.
+        var isErrorOutput: Bool
+        var eventID: String
+        var rawJSON: String
+        /// 0-based index over the FULL coalesced-block stream for this session.
+        /// Stable across slicing. -1 until assigned by `coalesce`.
+        var globalBlockIndex: Int = -1
+        /// Index of this block's FIRST originating event within `session.events`
+        /// (first event of a merge chain). -1 until assigned by `coalesce`.
+        var firstEventIndex: Int = -1
+        /// Codex tool namespace of the originating tool call (e.g. `mcp__node_repl__`).
+        var toolNamespace: String? = nil
+        /// Provider call id of the originating tool call/result; outputs with different ids never merge.
+        var toolCallID: String? = nil
+        /// Structured output of the originating result (array/object, ≤ 256 KB minified).
+        var toolOutputValue: ToolPayloadValue? = nil
+        /// Structured facts recorded next to the originating result.
+        var toolSidecar: ToolSidecar? = nil
+        /// Runtime error or user rejection, when the parser classified the result as one.
+        var toolDisposition: ToolDisposition? = nil
+        var messageOrigin: MessageOrigin? = nil
+        var messageDisplayText: String? = nil
+        var messageHasEncryptedContent: Bool? = nil
+        var presentation: MessagePresentation? = nil
+
+        /// What the user typed: a mixed message's typed items, else `text` (`SessionEvent.typedText`).
+        var typedText: String {
+            if case .typed = messageOrigin, let display = messageDisplayText { return display }
+            return text
+        }
+
+        /// Shared semantic turn boundary. Legacy fixtures without provenance remain typed.
+        var isTypedUserMessage: Bool {
+            guard kind == .user, !isInterruptControlMessage else { return false }
+            return (presentation?.origin ?? messageOrigin ?? .typed) == .typed
+        }
+
+        /// A turn starts at a typed prompt or at a sub-session's task from its parent.
+        var startsTurn: Bool {
+            guard kind == .user, !isInterruptControlMessage else { return false }
+            let origin = presentation?.origin ?? messageOrigin ?? .typed
+            return origin == .typed || origin == .parentTask
+        }
+
+        /// Explicit typed provenance wins over a literal spelling of a control marker.
+        var isInterruptControlMessage: Bool {
+            kind == .user && (presentation?.origin ?? messageOrigin) != .typed
+                && ToolInvocationIndex.isInterruptNotice(text)
+        }
+
+        func resolvedPresentation(source: SessionSource = .claude) -> MessagePresentation? {
+            presentation ?? MessageOriginClassifier.presentation(for: self, context: .init(
+                source: source, isFirstUserBlock: false))
+        }
+
+    }
+
+    private static func block(from e: SessionEvent) -> LogicalBlock {
+        var block = rawBlock(from: e)
+        block.messageOrigin = e.messageOrigin
+        block.messageDisplayText = e.messageDisplayText
+        block.messageHasEncryptedContent = e.messageHasEncryptedContent
+        return block
+    }
+
+    private static func rawBlock(from e: SessionEvent) -> LogicalBlock {
+        switch e.kind {
+        case .user:
+            return LogicalBlock(kind: .user,
+                                text: e.text ?? "",
+                                timestamp: e.timestamp,
+                                messageID: e.messageID,
+                                toolName: nil,
+                                isDelta: e.isDelta,
+                                toolInput: nil,
+                                isErrorOutput: false,
+                                eventID: e.id,
+                                rawJSON: e.rawJSON)
+        case .assistant:
+            return LogicalBlock(kind: .assistant,
+                                text: e.text ?? "",
+                                timestamp: e.timestamp,
+                                messageID: e.messageID,
+                                toolName: nil,
+                                isDelta: e.isDelta,
+                                toolInput: nil,
+                                isErrorOutput: false,
+                                eventID: e.id,
+                                rawJSON: e.rawJSON)
+        case .tool_call:
+            let rendered = renderToolCallLabel(name: e.toolName, args: e.toolInput)
+            return LogicalBlock(kind: .toolCall,
+                                text: rendered,
+                                timestamp: e.timestamp,
+                                messageID: e.messageID ?? e.parentID,
+                                toolName: e.toolName,
+                                isDelta: e.isDelta,
+                                toolInput: e.toolInput,
+                                isErrorOutput: false,
+                                eventID: e.id,
+                                rawJSON: e.rawJSON,
+                                toolNamespace: e.toolNamespace,
+                                toolCallID: e.toolCallID,
+                                toolOutputValue: e.toolOutputValue,
+                                toolSidecar: e.toolSidecar,
+                                toolDisposition: e.toolDisposition)
+        case .tool_result:
+            let outputText = e.toolOutput ?? e.text ?? ""
+            let exitCode = ToolTextBlockNormalizer.exitCode(from: e.rawJSON)
+            let looksLikeError = (exitCode != nil && exitCode != 0) || SessionTranscriptBuilder.textLooksLikeError(outputText)
+            return LogicalBlock(kind: .toolOut,
+                                text: outputText,
+                                timestamp: e.timestamp,
+                                messageID: e.messageID ?? e.parentID,
+                                toolName: e.toolName,
+                                isDelta: e.isDelta,
+                                toolInput: nil,
+                                isErrorOutput: looksLikeError,
+                                eventID: e.id,
+                                rawJSON: e.rawJSON,
+                                toolNamespace: e.toolNamespace,
+                                toolCallID: e.toolCallID,
+                                toolOutputValue: e.toolOutputValue,
+                                toolSidecar: e.toolSidecar,
+                                toolDisposition: e.toolDisposition)
+        case .error:
+            if e.toolName != nil || e.toolOutput != nil {
+                let outputText = e.toolOutput ?? e.text ?? ""
+                return LogicalBlock(kind: .toolOut,
+                                    text: outputText,
+                                    timestamp: e.timestamp,
+                                    messageID: e.messageID ?? e.parentID,
+                                    toolName: e.toolName,
+                                    isDelta: e.isDelta,
+                                    toolInput: nil,
+                                    isErrorOutput: true,
+                                    eventID: e.id,
+                                    rawJSON: e.rawJSON,
+                                    toolNamespace: e.toolNamespace,
+                                    toolCallID: e.toolCallID,
+                                    toolOutputValue: e.toolOutputValue,
+                                    toolSidecar: e.toolSidecar,
+                                    toolDisposition: e.toolDisposition)
+            }
+            // If text is empty, fall back to pretty textified raw JSON
+            let txt = (e.text?.isEmpty == false) ? e.text! : PrettyJSON.prettyPrinted(e.rawJSON)
+            // A Claude runtime error lands here (no tool name); its call id lets pairing
+            // treat the block as that call's output.
+            return LogicalBlock(kind: .error,
+                                text: txt,
+                                timestamp: e.timestamp,
+                                messageID: e.messageID,
+                                toolName: nil,
+                                isDelta: e.isDelta,
+                                toolInput: nil,
+                                isErrorOutput: true,
+                                eventID: e.id,
+                                rawJSON: e.rawJSON,
+                                toolNamespace: e.toolNamespace,
+                                toolCallID: e.toolCallID,
+                                toolOutputValue: e.toolOutputValue,
+                                toolSidecar: e.toolSidecar,
+                                toolDisposition: e.toolDisposition)
+        case .meta:
+            let txt = e.text ?? PrettyJSON.prettyPrinted(e.rawJSON)
+            // A Claude user rejection is a meta event in P1; it keeps its call id and disposition.
+            return LogicalBlock(kind: .meta,
+                                text: txt,
+                                timestamp: e.timestamp,
+                                messageID: e.messageID,
+                                toolName: nil,
+                                isDelta: e.isDelta,
+                                toolInput: nil,
+                                isErrorOutput: false,
+                                eventID: e.id,
+                                rawJSON: e.rawJSON,
+                                toolNamespace: e.toolNamespace,
+                                toolCallID: e.toolCallID,
+                                toolOutputValue: e.toolOutputValue,
+                                toolSidecar: e.toolSidecar,
+                                toolDisposition: e.toolDisposition)
+        }
+    }
+
+    /// Lightweight heuristic for detecting error-looking tool output.
+    ///
+    /// This is intentionally conservative and looks only at the first line of
+    /// the output for common prefixes like "error:" or "[error]".
+    private static func textLooksLikeError(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let firstLine: String
+        if let nl = trimmed.firstIndex(of: "\n") {
+            firstLine = String(trimmed[..<nl])
+        } else {
+            firstLine = trimmed
+        }
+        let lower = firstLine.lowercased()
+        if lower.hasPrefix("[error]") { return true }
+        if lower.hasPrefix("error:") { return true }
+        if let code = parseExitValue(from: lower, regex: exitCodeRegex), code != 0 {
+            return true
+        }
+        if let status = parseExitValue(from: lower, regex: exitStatusRegex), status != 0 {
+            return true
+        }
+        return false
+    }
+
+    private static let exitCodeRegex: NSRegularExpression? =
+        try? NSRegularExpression(pattern: "exit code[:\\s]*(-?\\d+)", options: [.caseInsensitive])
+    private static let exitStatusRegex: NSRegularExpression? =
+        try? NSRegularExpression(pattern: "exit status[:\\s]*(-?\\d+)", options: [.caseInsensitive])
+
+    private static func parseExitValue(from text: String, regex: NSRegularExpression?) -> Int? {
+        guard let regex else { return nil }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges >= 2,
+              let valueRange = Range(match.range(at: 1), in: text),
+              !valueRange.isEmpty else {
+            return nil
+        }
+        return Int(text[valueRange])
+    }
+
+    /// Memo cache for coalesced blocks. Transcript opens re-derive the same
+    /// coalesced stream from several call sites (rebuild, inline-image mapper,
+    /// event-ID lookups) — at ~4.4 s per pass on a 49k-event session that
+    /// redundancy dominated opens. Keyed by (session id, event count, file size,
+    /// includeMeta). Event count alone isn't a sufficient freshness token: a
+    /// JSONL file rewritten in place to the same event count (external edit,
+    /// crash-recovery re-parse) would otherwise serve stale cached blocks under
+    /// the same key. `fileSizeBytes` is a free freshness signal that guards that
+    /// same-count-rewrite edge case; a false-positive mismatch is harmless and
+    /// only conservative — worst case it costs one extra recompute.
+    /// countLimit 2 keeps at most one monster session's blocks resident.
+    private static let coalesceCache = NSCacheMemo<[LogicalBlock]>(countLimit: 2)
+
+    /// Test-only hook to isolate cache state between tests.
+    static func _testResetCoalesceCache() {
+        coalesceCache.removeAll()
+    }
+
+    /// Expose coalesced logical blocks for reuse in terminal-specific builders.
+    ///
+    /// This keeps the structural grouping logic in one place while allowing
+    /// new views to render the underlying data differently.
+    static func coalescedBlocks(for session: Session,
+                                includeMeta: Bool,
+                                includeMessageContext: Bool = false) -> [LogicalBlock] {
+        // JSON encoding keeps arbitrary metadata strings from colliding at separators.
+        let classifierIdentity = String(data: try! JSONEncoder().encode([session.source.rawValue, session.parentSessionID, session.subagentType]), encoding: .utf8)!
+        let key = "\(classifierIdentity)|\(session.id)|\(session.events.count)|\(session.fileSizeBytes ?? -1)|\(includeMeta ? 1 : 0)|\(includeMessageContext ? 1 : 0)" as NSString
+        if let hit = coalesceCache.object(forKey: key) {
+            return hit
+        }
+        let _span = Perf.begin("transcriptCoalesce", thresholdMs: 20, "events=\(session.events.count)")
+        defer { Perf.end(_span) }
+        let blocks = coalesce(session: session, includeMeta: includeMeta, includeMessageContext: includeMessageContext)
+        coalesceCache.setObject(blocks, forKey: key)
+        return blocks
+    }
+
+    static func displayLines(for block: LogicalBlock, source: SessionSource?) -> [String] {
+        toolDisplayLines(for: block, source: source)
+    }
+
+    private static func canMerge(_ a: LogicalBlock, _ b: LogicalBlock) -> Bool {
+        // Only merge assistant/toolOut/meta streams
+        guard a.kind == b.kind else { return false }
+        // Outputs of different tool calls never fuse, even when they share a message ID.
+        if let ai = a.toolCallID, let bi = b.toolCallID, ai != bi { return false }
+        switch a.kind {
+        case .assistant, .toolOut:
+            if let am = a.messageID, let bm = b.messageID { return am == bm }
+            if a.isDelta && b.isDelta {
+                // Fall back when message IDs are missing but these are delta chunks
+                if a.kind == .toolOut { return a.toolName == b.toolName }
+                return true
+            }
+            return false
+        case .meta:
+            return false
+        default:
+            return false
+        }
+    }
+
+    private static func coalesce(session: Session, includeMeta: Bool, includeMessageContext: Bool = false) -> [LogicalBlock] {
+        // Only a sub-session's first prompt is a parent task; side chats and forks keep "User".
+        let isSubagent = session.effectiveRelationshipKind == .subagent
+        return coalesce(events: session.events, source: session.source, subagentType: isSubagent ? session.subagentType : nil,
+                        parentSessionID: isSubagent ? session.parentSessionID : nil,
+                        includeMeta: includeMeta, includeMessageContext: includeMessageContext)
+    }
+
+    private static func coalesce(events: [SessionEvent], source: SessionSource, subagentType: String? = nil, parentSessionID: String? = nil, includeMeta: Bool, includeMessageContext: Bool = false) -> [LogicalBlock] {
+        var blocks: [LogicalBlock] = []
+        blocks.reserveCapacity(events.count)
+        for (eventIndex, e) in events.enumerated() {
+            if e.kind == .meta && !includeMeta && !(includeMessageContext && e.messageOrigin != nil) { continue }
+            var base = block(from: e)
+            if includeMessageContext && e.kind == .meta {
+                switch e.messageOrigin {
+                case .peer, .typed: base.kind = .user
+                default: break
+                }
+            }
+            let expanded = expandUserEmbeddedNoticesIfNeeded(block: base)
+            for var b in expanded {
+                if source == .codex {
+                    b.text = normalizeCodexInlineImageMarkers(b.text)
+                    if let displayText = b.messageDisplayText {
+                        b.messageDisplayText = normalizeCodexInlineImageMarkers(displayText)
+                    }
+                }
+                // Merge in place: taking a copy of `blocks.last` and appending to it
+                // makes the accumulated text buffer multiply-referenced, so every
+                // delta append triggers a full CoW copy (quadratic in chain length).
+                var mergeWithLast = false
+                if let last = blocks.last {
+                    mergeWithLast = canMerge(last, b)
+                }
+                if mergeWithLast {
+                    let i = blocks.count - 1
+                    if blocks[i].messageDisplayText != nil || b.messageDisplayText != nil {
+                        blocks[i].messageDisplayText = (blocks[i].messageDisplayText ?? blocks[i].text) + (b.messageDisplayText ?? b.text)
+                    }
+                    if blocks[i].messageOrigin == nil { blocks[i].messageOrigin = b.messageOrigin }
+                    if b.messageHasEncryptedContent == true { blocks[i].messageHasEncryptedContent = true }
+                    else if blocks[i].messageHasEncryptedContent == nil { blocks[i].messageHasEncryptedContent = b.messageHasEncryptedContent }
+                    blocks[i].text += b.text
+                    if blocks[i].timestamp == nil { blocks[i].timestamp = b.timestamp }
+                    blocks[i].rawJSON = b.rawJSON
+                    if blocks[i].toolName == nil { blocks[i].toolName = b.toolName }
+                    if blocks[i].toolInput == nil { blocks[i].toolInput = b.toolInput }
+                    if blocks[i].toolNamespace == nil { blocks[i].toolNamespace = b.toolNamespace }
+                    if blocks[i].toolCallID == nil { blocks[i].toolCallID = b.toolCallID }
+                    if blocks[i].toolOutputValue == nil { blocks[i].toolOutputValue = b.toolOutputValue }
+                    if blocks[i].toolSidecar == nil { blocks[i].toolSidecar = b.toolSidecar }
+                    if blocks[i].toolDisposition == nil { blocks[i].toolDisposition = b.toolDisposition }
+                    blocks[i].isErrorOutput = blocks[i].isErrorOutput || b.isErrorOutput
+                    // firstEventIndex stays the merge chain's FIRST event (already set).
+                } else {
+                    b.firstEventIndex = eventIndex
+                    blocks.append(b)
+                }
+            }
+        }
+        // Assign the stable global block index as the final stream offset. Done in
+        // a single pass after coalescing so merges don't leave gaps.
+        var hasEligibleUserBlock = false
+        for i in blocks.indices {
+            blocks[i].globalBlockIndex = i
+            // Raw consumers keep their original stream; meta presentation is Session-only.
+            if blocks[i].kind != .meta || includeMessageContext {
+                blocks[i].presentation = MessageOriginClassifier.presentation(for: blocks[i], context: .init(
+                    source: source, subagentType: subagentType, isFirstUserBlock: !hasEligibleUserBlock,
+                    parentSessionID: parentSessionID))
+            }
+            if blocks[i].kind == .user {
+                switch blocks[i].presentation?.origin {
+                case .typed, .parentTask: hasEligibleUserBlock = true
+                default: break
+                }
+            }
+        }
+        return blocks
+    }
+
+    private static func normalizeCodexInlineImageMarkers(_ text: String) -> String {
+        guard text.localizedCaseInsensitiveContains("<image name=[image #") else { return text }
+
+        func replaceAll(pattern: String, template: String, in input: String) -> String {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return input }
+            let range = NSRange(input.startIndex..<input.endIndex, in: input)
+            return regex.stringByReplacingMatches(in: input, options: [], range: range, withTemplate: template)
+        }
+
+        var out = text
+
+        // Prefer the bracketed marker in rendered text.
+        out = replaceAll(pattern: "<image\\s+name=\\[image\\s+#(\\d+)\\]\\s*>\\s*(?:</image\\s*>)?",
+                         template: "[Image #$1]",
+                         in: out)
+
+        // De-duplicate when both the XML-ish tag and the marker appear.
+        out = replaceAll(pattern: "\\[image\\s+#(\\d+)\\]\\s*\\[image\\s+#\\1\\]",
+                         template: "[Image #$1]",
+                         in: out)
+
+        return out
+    }
+    
+    private static func expandUserEmbeddedNoticesIfNeeded(block: LogicalBlock) -> [LogicalBlock] {
+        guard block.kind == .user else { return [block] }
+        if !block.text.localizedCaseInsensitiveContains("<turn_aborted") { return [block] }
+        // Provenance knows which items the user typed (only mixed messages carry typed display
+        // text). A notice tag in injected items is context, not an interruption, so split the
+        // typed items alone; splitting the raw text would hand an injected notice the typed origin.
+        if block.messageOrigin == .typed, let typed = block.messageDisplayText {
+            guard typed.localizedCaseInsensitiveContains("<turn_aborted") else { return [block] }
+            var typedBlock = block
+            typedBlock.text = typed
+            typedBlock.messageDisplayText = nil
+            return splitTurnAbortedBlocks(from: typedBlock)
+        }
+        return splitTurnAbortedBlocks(from: block)
+    }
+    
+    private static func splitTurnAbortedBlocks(from block: LogicalBlock) -> [LogicalBlock] {
+        let text = block.text
+        let closeTag = "</turn_aborted>"
+        var out: [LogicalBlock] = []
+        out.reserveCapacity(3)
+        
+        var remainder: Substring = text[...]
+        var found = false
+        
+        func makeBlock(kind: LogicalBlock.Kind, text: String) -> LogicalBlock {
+            var part = block
+            part.kind = kind
+            part.text = text
+            part.presentation = nil
+            return part
+        }
+        
+        while let openStart = remainder.range(of: "<turn_aborted", options: [.caseInsensitive]) {
+            found = true
+            let before = String(remainder[..<openStart.lowerBound])
+            if !before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                out.append(makeBlock(kind: .user, text: before))
+            }
+            
+            // Find end of the opening tag (supports `<turn_aborted>` and `<turn_aborted ...>`).
+            guard let openEnd = remainder[openStart.lowerBound...].firstIndex(of: ">") else {
+                // Malformed tag: keep remainder as user text to avoid dropping content.
+                let rest = String(remainder)
+                if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    out.append(makeBlock(kind: .user, text: rest))
+                }
+                remainder = remainder[remainder.endIndex...]
+                break
+            }
+            
+            let innerStart = remainder.index(after: openEnd)
+            guard let closeRange = remainder.range(of: closeTag, options: [.caseInsensitive], range: innerStart..<remainder.endIndex) else {
+                let rest = String(remainder)
+                if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    out.append(makeBlock(kind: .user, text: rest))
+                }
+                remainder = remainder[remainder.endIndex...]
+                break
+            }
+            
+            let inner = String(remainder[innerStart..<closeRange.lowerBound])
+            if let display = turnAbortedDisplayText(from: inner) {
+                out.append(makeBlock(kind: .meta, text: display))
+            }
+            
+            remainder = remainder[closeRange.upperBound...]
+        }
+        
+        let tail = String(remainder)
+        if !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            out.append(makeBlock(kind: .user, text: tail))
+        }
+        
+        guard found else { return [block] }
+        if let display = block.messageDisplayText {
+            var displayBlock = block
+            displayBlock.text = display
+            displayBlock.messageDisplayText = nil
+            let displayParts = splitTurnAbortedBlocks(from: displayBlock)
+            let userDisplayParts = displayParts.filter { $0.kind == .user }.map(\.text)
+            let userIndices = out.indices.filter { out[$0].kind == .user }
+            for (offset, index) in userIndices.enumerated() {
+                // Envelope decoding may have changed the notice structure. Preserve
+                // the complete display body once rather than dropping unmatched parts.
+                out[index].messageDisplayText = userIndices.count == userDisplayParts.count
+                    ? userDisplayParts[offset]
+                    : (offset == 0 ? userDisplayParts.joined(separator: "\n") : "")
+            }
+            for index in out.indices where out[index].kind == .meta {
+                out[index].messageDisplayText = nil
+            }
+            if userIndices.isEmpty, let first = out.indices.first {
+                out[first].messageDisplayText = display
+            }
+        }
+        return out
+    }
+    
+	    private static func turnAbortedDisplayText(from inner: String) -> String? {
+	        let trimmed = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+	        let headerLines = ["Turn Aborted", "Tag: turn_aborted"]
+	        if trimmed.isEmpty { return headerLines.joined(separator: "\n") }
+	        
+	        func extractTag(_ name: String, from text: String) -> String? {
+	            guard let start = text.range(of: "<\(name)>"),
+	                  let end = text.range(of: "</\(name)>", range: start.upperBound..<text.endIndex) else {
+	                return nil
+            }
+            return String(text[start.upperBound..<end.lowerBound])
+        }
+        
+        let turnID = extractTag("turn_id", from: trimmed)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let reason = extractTag("reason", from: trimmed)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+	        let guidance = extractTag("guidance", from: trimmed)?
+	            .trimmingCharacters(in: .whitespacesAndNewlines)
+	        
+	        var parts: [String] = headerLines
+	        if let turnID, !turnID.isEmpty { parts.append("Turn ID: \(turnID)") }
+	        if let reason, !reason.isEmpty { parts.append("Reason: \(reason)") }
+	        if let guidance, !guidance.isEmpty { parts.append("Guidance: \(guidance)") }
+	        
+	        if parts.count == headerLines.count {
+	            return headerLines.joined(separator: "\n") + "\n" + trimmed
+	        }
+	        return parts.joined(separator: "\n")
+	    }
+
+    private static func render(block b: LogicalBlock, options: Options) -> String {
+        switch b.kind {
+        case .user:
+            let head = timestampPrefix(b.timestamp, options: options)
+            let typed = b.typedText
+            if let nl = typed.firstIndex(of: "\n") {
+                let first = String(typed[..<nl])
+                let rest = String(typed[nl...])
+                return head + userPrefix + first + rest
+            } else {
+                return head + userPrefix + typed
+            }
+        case .assistant:
+            let head = timestampPrefix(b.timestamp, options: options)
+            let marker = options.renderMode == .terminal ? "[assistant] " : ""
+            if let nl = b.text.firstIndex(of: "\n") {
+                let first = String(b.text[..<nl])
+                let rest = String(b.text[nl...])
+                return head + marker + first + rest
+            } else {
+                return head + marker + b.text
+            }
+        case .toolCall:
+            let head = timestampPrefix(b.timestamp, options: options)
+            let lines = toolDisplayLines(for: b, source: options.sessionSource)
+            return renderPrefixedLines(lines, prefix: head)
+        case .toolOut:
+            let head = timestampPrefix(b.timestamp, options: options)
+            let lines = toolDisplayLines(for: b, source: options.sessionSource)
+            return renderPrefixedLines(lines, prefix: head)
+        case .error:
+            let head = timestampPrefix(b.timestamp, options: options)
+            let marker = options.renderMode == .terminal ? "[error] " : (errorPrefix + " ")
+            if let nl = b.text.firstIndex(of: "\n") {
+                let first = String(b.text[..<nl])
+                let rest = String(b.text[nl...])
+                return head + marker + first + rest
+            } else {
+                return head + marker + b.text
+            }
+        case .meta:
+            let head = timestampPrefix(b.timestamp, options: options)
+            if let nl = b.text.firstIndex(of: "\n") {
+                let first = String(b.text[..<nl])
+                let rest = String(b.text[nl...])
+                return head + "· meta " + first + rest
+            } else {
+                return head + "· meta " + b.text
+            }
+        }
+    }
+
+    private static func renderPrefixedLines(_ lines: [String], prefix: String) -> String {
+        guard let first = lines.first else { return prefix }
+        if lines.count == 1 {
+            return prefix + first
+        }
+        let rest = lines.dropFirst().joined(separator: "\n")
+        return prefix + first + "\n" + rest
+    }
+
+    private static func toolDisplayLines(for block: LogicalBlock, source: SessionSource?) -> [String] {
+        if let toolBlock = ToolTextBlockNormalizer.normalize(block: block, source: source) {
+            return ToolTextBlockNormalizer.displayLines(for: toolBlock)
+        }
+        return block.text.isEmpty ? [] : block.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    }
+
+    private static func renderToolCallLabel(name: String?, args: String?) -> String {
+        var label = name ?? "?"
+        if let primary = TranscriptToolSummary.callLabelArgument(toolName: name, toolInput: args) {
+            let oneLine = primary.components(separatedBy: .newlines).filter { !$0.isEmpty }.joined(separator: " ")
+            return truncateTo(label + " " + oneLine, max: 120)
+        }
+        if let a = args, !a.isEmpty {
+            // A large input is never parsed whole for a label: show its start on one line.
+            let compact = a.utf8.count > TranscriptToolSummary.largeInputBytes ? collapsedStart(of: a) : compactJSONOneLine(a)
+            let truncated = truncateTo(compact, max: 120)
+            label += " " + truncated
+        }
+        return label
+    }
+
+    /// The first 2,048 characters of `s` with whitespace runs collapsed to one space.
+    private static func collapsedStart(of s: String) -> String {
+        String(s.prefix(2_048)).components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    private static func compactJSONOneLine(_ s: String) -> String {
+        guard let data = s.data(using: .utf8) else { return s }
+        if let obj = try? JSONSerialization.jsonObject(with: data, options: []) {
+            if let min = ToolJSON.string(from: obj, pretty: false) {
+                return min
+            }
+        }
+        // Not JSON – compress whitespace by splitting on whitespace/newlines
+        let pieces = s.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        return pieces.joined(separator: " ")
+    }
+
+    private static func truncateTo(_ s: String, max: Int) -> String {
+        if s.count <= max { return s }
+        let end = s.index(s.startIndex, offsetBy: max)
+        return String(s[..<end]) + "…"
+    }
+}
+
+/// Single source of truth for "is this block kind rendered as a tool card,"
+/// previously duplicated as `BlockRowModel.isToolCard`'s inline kind check and
+/// `TranscriptToolSummary.isToolKind` (private static func over the same two
+/// cases). Both now delegate here.
+extension SessionTranscriptBuilder.LogicalBlock.Kind {
+    var isTool: Bool {
+        self == .toolCall || self == .toolOut
+    }
+}
+// swiftlint:enable type_body_length

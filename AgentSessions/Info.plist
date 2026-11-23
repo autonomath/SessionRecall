@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>SessionRecall</string>
+	<key>CFBundleExecutable</key>
+	<string>AgentSessions</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.autonomath.SessionRecall</string>
+	<key>CFBundleName</key>
+	<string>SessionRecall</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>SessionRecall controls Terminal to resume Codex sessions on your behalf.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>SessionRecall saves exported images and terminal recordings to your Downloads folder.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>SessionRecall needs access to read session files in this location.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>SessionRecall needs access to read session files in this location.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<!-- Sparkle 2 Update Configuration -->
+	<key>SUFeedURL</key>
+	<string>https://github.com/autonomath/SessionRecall/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>8ZOQsQcYFSsvMmAMoMGPAmNoNwHwFRNDN/NgeZoIq0k=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUShowReleaseNotes</key>
+	<true/>
+</dict>
+</plist>

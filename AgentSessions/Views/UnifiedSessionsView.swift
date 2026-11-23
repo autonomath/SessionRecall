@@ -1,0 +1,5880 @@
+import SwiftUI
+import AppKit
+
+/// Display mapping for subagent-type badges. Keeps long internal type names
+/// (e.g. "workflow-subagent") short in the session list.
+enum WorkflowSubagentBadge {
+    static func displayLabel(for agentType: String) -> String {
+        agentType == Session.claudeWorkflowSubagentType ? "workflow" : agentType
+    }
+}
+
+enum UnifiedTableSelectionPolicy {
+    static func shouldClearCanonicalSelectionOnTableDeselection(
+        isDatasetChurning: Bool,
+        currentSelectionID: String?,
+        visibleRowIDs: Set<String>
+    ) -> Bool {
+        guard !isDatasetChurning else { return false }
+        guard let currentSelectionID else { return false }
+        return visibleRowIDs.contains(currentSelectionID)
+    }
+
+    /// The Table should mirror the canonical `selection` whenever that id is
+    /// actually present in the rows currently on screen. Busy/churn state must
+    /// NOT hide a selection that is genuinely still there — doing so caused the
+    /// native highlight to flicker off and on during every live-session
+    /// republish. Only hide it when the id is genuinely absent from the row
+    /// set (e.g. mid hierarchy-rebuild before `cachedRows` catches up), which
+    /// is what originally motivated this gate: avoid the Table trying to
+    /// scroll/highlight a row that doesn't exist yet.
+    static func shouldExposeCanonicalSelectionToTable(
+        selectionPresentInRows: Bool
+    ) -> Bool {
+        selectionPresentInRows
+    }
+
+    static func shouldReconcileIndexingCompletion(
+        selectionID: String?,
+        visibleRowIDs: Set<String>,
+        sourceSessionsEmpty: Bool,
+        cachedRowsEmpty: Bool
+    ) -> Bool {
+        if let selectionID, !visibleRowIDs.contains(selectionID) {
+            return true
+        }
+        return sourceSessionsEmpty && !cachedRowsEmpty
+    }
+
+    static func shouldReplaceMissingSelection(
+        hierarchyBrowsing: Bool,
+        refreshBusy: Bool,
+        hasUserManuallySelected: Bool,
+        datasetChurning: Bool
+    ) -> Bool {
+        guard !datasetChurning else { return false }
+        return !(hierarchyBrowsing && refreshBusy && hasUserManuallySelected)
+    }
+}
+
+enum UnifiedRowsStabilityPolicy {
+    static func shouldHoldRowsDuringRunningSearch(
+        isSearchRunning: Bool,
+        nextRowsEmpty: Bool,
+        showActiveSessionsOnly: Bool,
+        cachedRowsEmpty: Bool
+    ) -> Bool {
+        guard isSearchRunning else { return false }
+        guard nextRowsEmpty else { return false }
+        guard !showActiveSessionsOnly else { return false }
+        guard !cachedRowsEmpty else { return false }
+        return true
+    }
+
+    static func shouldHoldRowsDuringTransientEmptyRefresh(
+        query: String,
+        isSearchRunning: Bool,
+        isDatasetChurning: Bool,
+        isIndexing: Bool,
+        nextRowsEmpty: Bool,
+        showActiveSessionsOnly: Bool,
+        cachedRowsEmpty: Bool,
+        hasSelection: Bool
+    ) -> Bool {
+        guard query.isEmpty else { return false }
+        guard !isSearchRunning else { return false }
+        guard nextRowsEmpty else { return false }
+        guard !showActiveSessionsOnly else { return false }
+        guard !cachedRowsEmpty else { return false }
+        guard hasSelection else { return false }
+        return isDatasetChurning || isIndexing
+    }
+}
+
+enum UnifiedSessionListEmptyState: Equatable {
+    case indexing
+    case updating
+    case searching
+    case failed
+    case filtered
+    case noSessions
+}
+
+enum UnifiedSessionListEmptyStatePolicy {
+    static func indexingDetail(launchPhase: LaunchPhase) -> LocalizedStringResource? {
+        guard launchPhase < .ready else { return nil }
+        return launchPhase.statusDescription
+    }
+
+    static func state(
+        hasRows: Bool,
+        isIndexing: Bool,
+        launchPhase: LaunchPhase,
+        hasDisplayedSessions: Bool,
+        indexingError: String?,
+        isDatasetChurning: Bool,
+        isSearchRunning: Bool,
+        isFiltered: Bool
+    ) -> UnifiedSessionListEmptyState? {
+        guard !hasRows else { return nil }
+
+        if launchPhase == .error || !(indexingError?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+            return .failed
+        }
+        if isIndexing || launchPhase < .ready || !hasDisplayedSessions {
+            return .indexing
+        }
+        if isDatasetChurning {
+            return .updating
+        }
+        if isSearchRunning {
+            return .searching
+        }
+        if isFiltered {
+            return .filtered
+        }
+        return .noSessions
+    }
+}
+
+enum UnifiedTableIdentityPolicy {
+    static func tableIdentity(columnLayoutID: UUID, reorderGeneration: Int) -> String {
+        "unified-table-\(columnLayoutID.uuidString)-\(reorderGeneration)"
+    }
+
+    /// Above this many moved rows, force an O(n) Table rebuild rather than let SwiftUI
+    /// diff the reorder. Measured: a full ~3,300-row re-sort (moved≈n) diffs in ~6.5s.
+    /// Even under a pessimistic O(moved·n) cost model this bounds the diff-path worst case
+    /// to roughly a few-hundred ms for a sub-threshold (moved<128) reorder on a 3,300-row
+    /// list — a brief hitch, not a beachball — while preserving scroll position for those
+    /// small/incidental reorders. A genuine column-header sort re-keys ~all rows
+    /// (moved≈n ≫ 128), so it always takes the rebuild path.
+    static let reorderRebuildThreshold = 128
+
+    /// A *large* reorder = same membership, and enough rows moved that SwiftUI's move-diff
+    /// (O(n^2)) would beachball. Only then is a full Table rebuild (new .id(), O(n)) worth
+    /// its cost (loses scroll position). Small reorders (a few rows, or an incidental
+    /// hierarchy regroup) and membership changes fall through to SwiftUI's cheap diff, which
+    /// preserves scroll. The expensive Set-equality membership check runs only once the
+    /// move count already crossed the threshold, so normal/idle updates pay just an O(n)
+    /// scan with no allocation.
+    static func isLargeReorder(old: [Session], new: [Session]) -> Bool {
+        guard old.count == new.count, old.count > 1 else { return false }
+        var moved = 0
+        for i in 0..<old.count where old[i].id != new[i].id { moved += 1 }
+        guard moved >= reorderRebuildThreshold else { return false }
+        return Set(old.lazy.map(\.id)) == Set(new.lazy.map(\.id))
+    }
+}
+
+enum UnifiedHierarchyCommandPolicy {
+    static func collapsedParentsAfterCollapseAll(
+        existing: Set<String>,
+        visibleParentIDs: Set<String>
+    ) -> Set<String> {
+        existing.union(visibleParentIDs)
+    }
+
+    static func collapsedParentsAfterExpandAll(
+        existing: Set<String>,
+        visibleParentIDs: Set<String>
+    ) -> Set<String> {
+        existing.subtracting(visibleParentIDs)
+    }
+
+    static func parentIDForSelectedHierarchyChild(
+        rowIDs: [String],
+        rowMeta: [String: SubagentRowMeta],
+        selectedID: String?
+    ) -> String? {
+        guard let selectedID,
+              let selectedIndex = rowIDs.firstIndex(of: selectedID),
+              selectedIndex > 0,
+              rowMeta[selectedID]?.depth ?? 0 > 0 else {
+            return nil
+        }
+
+        for index in stride(from: selectedIndex - 1, through: 0, by: -1) {
+            let candidateID = rowIDs[index]
+            let metadata = rowMeta[candidateID]
+            if metadata?.depth == 0, metadata?.hasChildren == true {
+                return candidateID
+            }
+        }
+        return nil
+    }
+}
+
+private extension Notification.Name {
+    static let collapseInlineSearchIfEmpty = Notification.Name("UnifiedSessionsCollapseInlineSearchIfEmpty")
+}
+
+private enum CockpitNavigationUserInfoKey {
+    static let source = "source"
+    static let runtimeSessionID = "runtimeSessionID"
+    static let logPath = "logPath"
+    static let workingDirectory = "workingDirectory"
+}
+
+private enum UnifiedSessionsStyle {
+    static let selectionAccent = Color(hex: "007acc")
+    static let timestampColor = Color(hex: "8E8E93")
+    static let agentPillFill = Color(nsColor: .controlBackgroundColor)
+    static let agentPillStroke = Color(nsColor: .separatorColor).opacity(0.35)
+    static let agentTabFont = Font.system(size: 12, weight: .medium)
+    static let agentDotSize: CGFloat = 8
+    static let toolbarGroupSpacing: CGFloat = 12
+    static let toolbarItemSpacing: CGFloat = 4
+    static let toolbarButtonSize: CGFloat = 32
+    static let toolbarIconSize: CGFloat = 16
+    static let toolbarButtonCornerRadius: CGFloat = 8
+    static let toolbarHoverOpacity: Double = 0.06
+    static let toolbarIconFont = Font.system(size: 16, weight: .semibold)
+    static let toolbarFocusRingColor = Color(nsColor: .keyboardFocusIndicatorColor)
+}
+
+/// Memoized relative/absolute strings for the Date column. `.help()` takes an eager
+/// String (not a lazily-evaluated closure), so before this cache BOTH `Session.modifiedRelative`
+/// (lock-guarded formatter) and the absolute `Date.FormatStyle` string were computed on every
+/// body pass -- 2 formatter calls + a lock per visible row per render during fast scroll, even
+/// though only one is shown at a time. Cached per (session id, session.modifiedAt, current
+/// minute): the relative string only rolls over on minute boundaries, and the compound key
+/// invalidates immediately if a session's modifiedAt actually changes (e.g. new activity),
+/// so a cache hit is never stale. `NSCacheMemo` (LRUCache.swift) is the existing string-keyed
+/// memoization wrapper used elsewhere (SessionTranscriptBuilder, ToolTextBlockNormalizer).
+private enum DateCellStrings {
+    private struct Cached { let minuteBucket: Int64; let relative: String; let absolute: String }
+    private static let cache = NSCacheMemo<Cached>(countLimit: 4096)
+
+    static func strings(for session: Session) -> (relative: String, absolute: String) {
+        let bucket = Int64(Date().timeIntervalSinceReferenceDate / 60)
+        let key = "\(session.id)|\(session.modifiedAt.timeIntervalSinceReferenceDate)" as NSString
+        if let hit = cache.object(forKey: key), hit.minuteBucket == bucket {
+            return (hit.relative, hit.absolute)
+        }
+        let relative = session.modifiedRelative
+        let absolute = AppDateFormatting.dateTimeShort(session.modifiedAt)
+        cache.setObject(Cached(minuteBucket: bucket, relative: relative, absolute: absolute), forKey: key)
+        return (relative, absolute)
+    }
+}
+
+private struct WindowKeyObserver: NSViewRepresentable {
+    var onBecameKey: ((NSWindow) -> Void)?
+    var onResignedKey: ((NSWindow) -> Void)?
+    var onWillClose: ((NSWindow) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            onBecameKey: onBecameKey,
+            onResignedKey: onResignedKey,
+            onWillClose: onWillClose
+        )
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { [weak view] in
+            context.coordinator.attach(to: view?.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.updateCallbacks(
+            onBecameKey: onBecameKey,
+            onResignedKey: onResignedKey,
+            onWillClose: onWillClose
+        )
+        DispatchQueue.main.async { [weak nsView] in
+            context.coordinator.attach(to: nsView?.window)
+        }
+    }
+
+    final class Coordinator {
+        private var onBecameKey: ((NSWindow) -> Void)?
+        private var onResignedKey: ((NSWindow) -> Void)?
+        private var onWillClose: ((NSWindow) -> Void)?
+        private var window: NSWindow?
+        private var becameKeyObserver: NSObjectProtocol?
+        private var resignedKeyObserver: NSObjectProtocol?
+        private var willCloseObserver: NSObjectProtocol?
+
+        init(
+            onBecameKey: ((NSWindow) -> Void)?,
+            onResignedKey: ((NSWindow) -> Void)?,
+            onWillClose: ((NSWindow) -> Void)?
+        ) {
+            self.onBecameKey = onBecameKey
+            self.onResignedKey = onResignedKey
+            self.onWillClose = onWillClose
+        }
+
+        deinit {
+            detach()
+        }
+
+        func updateCallbacks(
+            onBecameKey: ((NSWindow) -> Void)?,
+            onResignedKey: ((NSWindow) -> Void)?,
+            onWillClose: ((NSWindow) -> Void)?
+        ) {
+            self.onBecameKey = onBecameKey
+            self.onResignedKey = onResignedKey
+            self.onWillClose = onWillClose
+        }
+
+        func attach(to newWindow: NSWindow?) {
+            guard let newWindow else { return }
+            if window === newWindow { return }
+
+            detach()
+            window = newWindow
+
+            becameKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, let window = self.window else { return }
+                self.onBecameKey?(window)
+            }
+
+            resignedKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, let window = self.window else { return }
+                self.onResignedKey?(window)
+            }
+
+            willCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, let window = self.window else { return }
+                self.onWillClose?(window)
+                self.detach()
+            }
+
+            if newWindow.isKeyWindow {
+                DispatchQueue.main.async { [weak self, weak newWindow] in
+                    guard let self, let window = newWindow else { return }
+                    self.onBecameKey?(window)
+                }
+            }
+        }
+
+        private func detach() {
+            if let observer = becameKeyObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = resignedKeyObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = willCloseObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            becameKeyObserver = nil
+            resignedKeyObserver = nil
+            willCloseObserver = nil
+            window = nil
+        }
+    }
+}
+
+struct UnifiedSessionsView: View {
+    @ObservedObject var unified: UnifiedSessionIndexer
+    /// Replaces twelve positional indexer properties. The concrete accessors below resolve
+    /// through it; nothing about this view's observation changed except that eleven of the
+    /// twelve indexers were never observed here to begin with (they were plain `let`s).
+    let catalog: SessionProviderCatalog
+    /// Antigravity stays an explicit `@ObservedObject` because the transcript
+    /// overlay reads its unreadable-session state. Row-level preview staleness
+    /// is observed only by the Antigravity refresh child in SessionTitleCell.
+    @ObservedObject var antigravityIndexer: AntigravitySessionIndexer
+    private var codexIndexer: SessionIndexer { catalog.indexer(.codex, as: SessionIndexer.self) }
+    private var claudeIndexer: ClaudeSessionIndexer { catalog.indexer(.claude, as: ClaudeSessionIndexer.self) }
+    private var opencodeIndexer: OpenCodeSessionIndexer { catalog.indexer(.opencode, as: OpenCodeSessionIndexer.self) }
+    private var hermesIndexer: HermesSessionIndexer { catalog.indexer(.hermes, as: HermesSessionIndexer.self) }
+    private var copilotIndexer: CopilotSessionIndexer { catalog.indexer(.copilot, as: CopilotSessionIndexer.self) }
+    private var droidIndexer: DroidSessionIndexer { catalog.indexer(.droid, as: DroidSessionIndexer.self) }
+    private var openclawIndexer: OpenClawSessionIndexer { catalog.indexer(.openclaw, as: OpenClawSessionIndexer.self) }
+    private var cursorIndexer: CursorSessionIndexer { catalog.indexer(.cursor, as: CursorSessionIndexer.self) }
+    private var piIndexer: PiSessionIndexer { catalog.indexer(.pi, as: PiSessionIndexer.self) }
+    private var kimiIndexer: KimiSessionIndexer { catalog.indexer(.kimi, as: KimiSessionIndexer.self) }
+    private var grokIndexer: GrokSessionIndexer { catalog.indexer(.grok, as: GrokSessionIndexer.self) }
+    private var qwenIndexer: QwenSessionIndexer { catalog.indexer(.qwen, as: QwenSessionIndexer.self) }
+    private var devinIndexer: DevinSessionIndexer { catalog.indexer(.devin, as: DevinSessionIndexer.self) }
+    private var fxIndexer: FxSessionIndexer { catalog.indexer(.fx, as: FxSessionIndexer.self) }
+    private var clineIndexer: ClineSessionIndexer { catalog.indexer(.cline, as: ClineSessionIndexer.self) }
+    private var deepSeekHarnessIndexer: DeepSeekHarnessSessionIndexer {
+        catalog.indexer(.deepseekHarness, as: DeepSeekHarnessSessionIndexer.self)
+    }
+    @EnvironmentObject var codexUsageModel: CodexUsageModel
+    @EnvironmentObject var claudeUsageModel: ClaudeUsageModel
+    @Environment(CodexActiveSessionsModel.self) var activeCodexSessions
+    @EnvironmentObject var updaterController: UpdaterController
+    @EnvironmentObject var columnVisibility: ColumnVisibilityStore
+    @EnvironmentObject var onboardingCoordinator: OnboardingCoordinator
+    /// Gates the Quota Meter card and scopes what activation may switch on — it
+    /// reports Codex and Claude quota only.
+    @State private var quotaMeterProviders = QuotaMeterProviderAvailability()
+    @State private var topSlotAudienceReady = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var systemColorScheme
+    @Environment(\.openWindow) private var openWindow
+
+    let layoutMode: LayoutMode
+    let analyticsReady: Bool
+    let analyticsPhase: AnalyticsIndexPhase
+    let analyticsIsStale: Bool
+    let onToggleLayout: () -> Void
+
+    @State private var selection: String?
+    // Advances only when the 150ms selectionPropagationTask fires (or on
+    // first population) — the transcript pane renders from THIS, not the raw
+    // `selection`, so key-repeat scrubbing never re-renders/rebuilds the pane.
+    // Row highlighting stays bound to `selection` directly (instant).
+    @State private var settledSelection: String?
+    @State private var settledSelectionSource: SessionSource?
+    @State private var selectionSource: SessionSource? = nil
+    @State private var lastSelectedSource: SessionSource = .codex
+		@State private var sortOrder: [KeyPathComparator<Session>] = []
+		@State private var cachedRows: [Session] = []
+        @State private var cachedRowIDs: [String] = []
+        @State private var cachedVisibleRowIDs: Set<String> = []
+        @State private var cachedTotalSessionCount: Int = 0
+	    @State private var collapsedParents: Set<String> = []
+	    @State private var hasLoadedPersistedCollapsedParents: Bool = false
+        @State private var hierarchyRowMeta: [String: SubagentRowMeta] = [:]
+        @State private var sideChatParentContextByID: [String: String] = [:]
+        @State private var cachedExpandableParentIDs: Set<String> = []
+        // O(1) id -> row lookup, rebuilt alongside cachedRows in the same apply
+        // step. Lets per-click paths (handleSelectionChange, selectedSession)
+        // avoid an O(n) `cachedRows.first(where:)` scan.
+        @State private var cachedRowByID: [String: Session] = [:]
+        // Precomputed `staticSurfacePills(for:)` per row, rebuilt alongside
+        // cachedRows (SessionRowsBuilder.build already iterates every session).
+        // `cellSource(for:)` reads this instead of calling `surfacePills`
+        // per row-body call (W7 Task 1 -- see SessionRowsBuilder.RowsOutput).
+        @State private var cachedSurfacePillsBySessionID: [String: [CodexSurfacePill]] = [:]
+        // Bumped on every updateCachedRows() trigger (both the synchronous and
+        // the off-main async paths) BEFORE any async work starts. The async
+        // path's apply step checks its captured generation against the current
+        // value; a mismatch means a newer trigger has since started/finished and
+        // this stale result must be dropped (superseded, never interleaved).
+        @State private var rowsRebuildGeneration: Int = 0
+	@State private var columnLayoutID: UUID = UUID()
+	// Bumped whenever cachedRows is reassigned as a *wholesale reorder* (same id-set,
+	// different order — i.e. a sort). Feeding this into the Table's .id() forces SwiftUI
+	// to REBUILD the table (O(n)) instead of DIFFING the reorder, whose move-computation
+	// (AppKitOutlineTableCoordinator -> remove(atOffsets:)/move(fromOffsets:toOffset:))
+	// is O(n^2) and beachballs for multiple seconds at ~3,300 rows. See docs/perf-master-plan.md W4.
+	@State private var tableReorderGeneration: Int = 0
+	@AppStorage("UnifiedShowSourceColumn") private var showSourceColumn: Bool = true
+	@AppStorage("UnifiedShowStarColumn") private var showStarColumn: Bool = true
+	@AppStorage("UnifiedShowSizeColumn") private var showSizeColumn: Bool = true
+    @AppStorage("UnifiedShowActiveSessionsOnly") private var showActiveSessionsOnly: Bool = false
+    @AppStorage(PreferencesKey.Unified.showSubagentHierarchy) private var showSubagentHierarchy: Bool = true
+    @AppStorage(TranscriptTelemetryPresentation.visibilityKey) private var showSessionInfo = false
+    @AppStorage(PreferencesKey.Unified.showTranscriptWindow) private var showTranscriptWindow: Bool = true
+    /// macOS 26 toolbar anchoring (issue #92). Held in `@State`, not `@StateObject`,
+    /// on purpose: this view must not observe it, or every divider drag would
+    /// re-evaluate the whole window body. Only `SessionListToolbarGroup` observes it.
+    @State private var sessionListToolbarAnchor = SessionListToolbarAnchor()
+    @AppStorage(PreferencesKey.Unified.collapsedHierarchyParents) private var collapsedHierarchyParentsRaw: String = ""
+    @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var liveSessionsFeatureEnabled: Bool = true
+	@AppStorage("StripMonochromeMeters") private var stripMonochrome: Bool = false
+	@AppStorage("ModifiedDisplay") private var modifiedDisplayRaw: String = SessionIndexer.ModifiedDisplay.relative.rawValue
+	@AppStorage("AppAppearance") private var appAppearanceRaw: String = AppAppearance.system.rawValue
+	@AppStorage(PreferencesKey.codexUsageEnabled) private var codexUsageEnabled: Bool = false
+	@AppStorage(PreferencesKey.claudeUsageEnabled) private var claudeUsageEnabled: Bool = false
+	/// Footer usage meters on/off. @AppStorage rather than a raw UserDefaults read so
+	/// flipping the toggle in Preferences applies to an open window immediately.
+	@AppStorage(PreferencesKey.Unified.showFooterUsage) private var showFooterUsage: Bool = true
+	// Only Codex and Claude keep a named @AppStorage mirror, because the footer usage
+	// meters are Codex/Claude-specific and read them by name. Every other per-agent
+	// enablement question in this view goes through `unified.isAgentEnabled(_:)` (whose
+	// `enablementBySource` is @Published, so the toolbar still redraws on a toggle), and
+	// the *change* notification for every registered source comes from `agentEnablementObserver`.
+	// Re-declaring the other ten as @AppStorage would only give this view a second,
+	// separately-defaulted copy of the same answer.
+	@AppStorage(PreferencesKey.Agents.codexEnabled) private var codexAgentEnabled: Bool = true
+	@AppStorage(PreferencesKey.Agents.claudeEnabled) private var claudeAgentEnabled: Bool = true
+	/// One receiver in place of the seven `.onChange(of: <x>AgentEnabled)` modifiers this
+	/// view used to carry (§8.4). Those covered only 7 of the 12 sources, so toggling
+	/// Hermes, Droid, OpenClaw, Cursor or Pi never flashed the "some agents are hidden"
+	/// notice; the key list is derived from `SessionSource.allCases`, so it cannot drift
+	/// again. Same pattern as `AgentSessionsApp`'s own enablement observer.
+	@State private var agentEnablementObserver = FilteredDefaultsObserver(keys: AgentEnablement.allEnablementKeys)
+	    @State private var autoSelectEnabled: Bool = true
+	    @State private var isDatasetChurning: Bool = false
+	    // Set by updateCachedRows() exactly when the canonical selection id was
+	    // missing from the fresh rows AND UnifiedTableSelectionPolicy suppressed
+	    // replacement solely because isDatasetChurning was true at that moment.
+	    // Consulted by the post-churn onChange(of: unified.sessions) pass to know
+	    // whether a second updateCachedRows() call is actually needed (see there).
+	    @State private var selectionReplacementDeferredDuringChurn: Bool = false
+	    @State private var isAutoSelectingFromSearch: Bool = false
+    @State private var hasEverHadSessions: Bool = false
+    @State private var hasUserManuallySelected: Bool = false
+    @State private var showAgentEnablementNotice: Bool = false
+    @State private var isWindowKey: Bool = false
+    @State private var activeConsumerID = UUID()
+    @State private var cachedFallbackPresenceBySessionKey: [String: CodexActivePresence] = [:]
+#if DEBUG
+    @State private var debugActiveOnlyUpdateRowsCount: UInt64 = 0
+    @State private var debugActiveOnlyUpdateRowsTotalMs: Double = 0
+    @State private var debugActiveOnlyUpdateRowsMaxMs: Double = 0
+    @State private var debugActiveOnlyLastReportAt: Date = .distantPast
+#endif
+
+    private enum SourceColorStyle: String, CaseIterable { case none, text, background } // deprecated
+
+    @StateObject private var searchCoordinator: SearchCoordinator
+    @StateObject private var datasetSearchRestartCoalescer = SearchDatasetRestartCoalescer()
+    @StateObject private var focusCoordinator = WindowFocusCoordinator()
+    @StateObject private var searchState = UnifiedSearchState()
+    // Debounced selection-propagation task (see handleSelectionChange). Key-repeat
+    // scrubbing fires selection changes every ~30-90ms; without this, each one used
+    // to schedule transcript teardown/reload on the next runloop turn, which always
+    // lands between key-repeat events — every scrubbed row did full propagation work.
+    @State private var selectionPropagationTask: Task<Void, Never>? = nil
+    @State private var restoreCandidate: Session? = nil
+    @State private var showRestoredRelaunch = false
+    // Search results stay best match first until the user picks a column to sort by.
+    @State private var searchSortChosen = false
+    @AppStorage(SearchPreferences.Key.bestMatchFirst) private var searchBestMatchFirst = true
+    @AppStorage(SearchPreferences.Key.excerptLines) private var searchExcerptLines = 2
+    private var rows: [Session] {
+        let baseRows: [Session]
+        let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !q.isEmpty || searchCoordinator.isRunning {
+            // Apply current UI filters and sort to search results
+            baseRows = unified.applyFiltersAndSort(to: searchCoordinator.results,
+                                                   keepOrder: searchCoordinator.isRanked && !searchSortChosen && searchBestMatchFirst)
+        } else {
+            baseRows = unified.sessions
+        }
+
+        guard showActiveSessionsOnly else { return baseRows }
+        return baseRows.filter { isSessionLive($0) }
+    }
+
+    init(unified: UnifiedSessionIndexer,
+         catalog: SessionProviderCatalog,
+         analyticsReady: Bool,
+         analyticsPhase: AnalyticsIndexPhase,
+         analyticsIsStale: Bool,
+         layoutMode: LayoutMode,
+         onToggleLayout: @escaping () -> Void) {
+        self.unified = unified
+        self.catalog = catalog
+        self.antigravityIndexer = catalog.indexer(.antigravity, as: AntigravitySessionIndexer.self)
+        self.analyticsReady = analyticsReady
+        self.analyticsPhase = analyticsPhase
+        self.analyticsIsStale = analyticsIsStale
+        self.layoutMode = layoutMode
+        self.onToggleLayout = onToggleLayout
+        // Every adapter entry now lives in its own source's `makeRuntime`, transcribed
+        // verbatim; this dictionary is assembled from the registry instead of hand-listed,
+        // so a new source cannot be searchable-but-missing here.
+        let store = SearchSessionStore(adapters: Dictionary(
+            uniqueKeysWithValues: SessionSourceRegistry.ordered.map {
+                ($0.descriptor.source, catalog[$0.descriptor.source].searchAdapter)
+            }
+        ))
+        _searchCoordinator = StateObject(wrappedValue: SearchCoordinator(store: store))
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        switch AppAppearance(rawValue: appAppearanceRaw) ?? .system {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+
+    private var effectiveColorScheme: ColorScheme {
+        let current = AppAppearance(rawValue: appAppearanceRaw) ?? .system
+        return current.effectiveColorScheme(systemScheme: systemColorScheme)
+    }
+
+	var body: some View {
+		let base = AnyView(
+			rootContent
+				.preferredColorScheme(preferredColorScheme)
+				.toolbar { toolbarContent }
+				.modifier(PaneAnchoredToolbarTitle())
+				.overlay(alignment: .topTrailing) { topTrailingNotices }
+				.background(
+					WindowKeyObserver(
+						onBecameKey: { _ in
+							handleWindowDidBecomeKey()
+						},
+						onResignedKey: { _ in
+							handleWindowDidResignKey()
+						},
+						onWillClose: { _ in
+							handleWindowWillClose()
+						}
+					)
+				)
+		)
+
+			let lifecycle = AnyView(
+				base
+				                .onAppear {
+				                    activeCodexSessions.setUnifiedConsumerVisible(true, consumerID: activeConsumerID)
+				                    updateFooterUsageVisibility()
+				                    if sortOrder.isEmpty { sortOrder = [KeyPathComparator(\Session.modifiedAt, order: .reverse)] }
+				                    if !liveSessionsFeatureEnabled { showActiveSessionsOnly = false }
+                                    loadPersistedCollapsedParentsIfNeeded()
+				                    updateCachedRows()
+				                    ensureDefaultSelectionIfNeeded()
+				                    if settledSelection == nil, let selection {
+                                        settledSelection = selection
+                                        settledSelectionSource = cachedRowByID[selection]?.source ?? selectionSource
+                                    }
+				                    unified.setAppActive(NSApp.isActive)
+			                    updateFocusedSessionIfNeeded(selectedSession)
+			                    refreshSelectionSourceFromCachedRows()
+                                tryHandlePendingCockpitNavigationIfNeeded()
+		                    searchCoordinator.setAppActive(NSApp.isActive)
+			                }
+			                .onDisappear {
+			                    activeCodexSessions.setUnifiedConsumerVisible(false, consumerID: activeConsumerID)
+			                    codexUsageModel.setStripVisible(false)
+			                    claudeUsageModel.setStripVisible(false)
+			                    selectionPropagationTask?.cancel()
+			                    selectionPropagationTask = nil
+                                datasetSearchRestartCoalescer.cancel()
+			                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    unified.setAppActive(true)
+                    searchCoordinator.setAppActive(true)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+                    unified.setAppActive(false)
+                    searchCoordinator.setAppActive(false)
+                }
+		)
+
+		let afterSelection = lifecycle
+			.onChange(of: selection) { _, id in
+				handleSelectionChange(id)
+			}
+
+        let afterCodex = afterSelection
+            .onChange(of: unified.includeCodex) { _, _ in restartSearchIfRunning() }
+        let afterArchived = afterCodex
+            .onChange(of: unified.showArchivedCodexDesktopOnly) { _, _ in restartSearchForActiveQuery() }
+            .onChange(of: unified.showArchivedClaudeDesktopOnly) { _, _ in restartSearchForActiveQuery() }
+        let afterClaude = afterArchived
+            .onChange(of: unified.includeClaude) { _, _ in restartSearchIfRunning() }
+		let afterAntigravity = afterClaude
+			.onChange(of: unified.includeAntigravity) { _, _ in restartSearchIfRunning() }
+		let afterOpenCode = afterAntigravity
+			.onChange(of: unified.includeOpenCode) { _, _ in restartSearchIfRunning() }
+		let afterCopilot = afterOpenCode
+			.onChange(of: unified.includeCopilot) { _, _ in restartSearchIfRunning() }
+		let afterDroid = afterCopilot
+			.onChange(of: unified.includeDroid) { _, _ in restartSearchIfRunning() }
+
+		let afterOpenClaw = afterDroid
+			.onChange(of: unified.includeOpenClaw) { _, _ in restartSearchIfRunning() }
+
+		let afterCursor = afterOpenClaw
+			.onChange(of: unified.includeCursor) { _, _ in restartSearchIfRunning() }
+
+        let afterPi = afterCursor
+            .onChange(of: unified.includePi) { _, _ in restartSearchIfRunning() }
+
+        let afterKimi = afterPi
+            .onChange(of: unified.includeKimi) { _, _ in restartSearchIfRunning() }
+        let afterGrok = afterKimi
+            .onChange(of: unified.includeGrok) { _, _ in restartSearchIfRunning() }
+        let afterQwen = afterGrok
+            .onChange(of: unified.includeQwen) { _, _ in restartSearchIfRunning() }
+        let afterDevin = afterQwen
+            .onChange(of: unified.includeDevin) { _, _ in restartSearchIfRunning() }
+
+        let afterFx = afterDevin
+            .onChange(of: unified.includeFx) { _, _ in restartSearchIfRunning() }
+        let afterCline = afterFx
+            .onChange(of: unified.includeCline) { _, _ in restartSearchIfRunning() }
+        let afterDeepSeekHarness = afterCline
+            .onChange(of: unified.includeDeepSeekHarness) { _, _ in restartSearchIfRunning() }
+            .onChange(of: unified.searchDatasetMembershipRevision) { _, _ in
+                restartSearchForDatasetMembershipChangeIfNeeded()
+            }
+
+        let afterActiveOnly = afterDeepSeekHarness
+            .onChange(of: showActiveSessionsOnly) { _, _ in
+                if !liveSessionsFeatureEnabled {
+                    showActiveSessionsOnly = false
+                }
+                updateCachedRows()
+                ensureDefaultSelectionIfNeeded()
+                refreshSelectionSourceFromCachedRows()
+                updateFocusedSessionIfNeeded(selectedSession)
+            }
+
+        let afterLiveFeature = afterActiveOnly
+            .onChange(of: liveSessionsFeatureEnabled) { _, enabled in
+                if !enabled { showActiveSessionsOnly = false }
+                updateCachedRows()
+                ensureDefaultSelectionIfNeeded()
+                refreshSelectionSourceFromCachedRows()
+                updateFocusedSessionIfNeeded(selectedSession)
+            }
+            .onChange(of: showSubagentHierarchy) { _, newValue in
+                if !newValue { persistCollapsedParents() }
+                updateCachedRows()
+            }
+            .onChange(of: collapsedParents) { _, _ in
+                persistCollapsedParents()
+                updateCachedRows()
+            }
+
+			let afterUsage = afterLiveFeature
+				.onChange(of: codexUsageEnabled) { _, _ in updateFooterUsageVisibility() }
+				.onChange(of: claudeUsageEnabled) { _, _ in updateFooterUsageVisibility() }
+				.onChange(of: showFooterUsage) { _, _ in updateFooterUsageVisibility() }
+					.onChange(of: searchState.query) { _, newValue in
+						if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+							cancelAutoJump()
+	                        updateCachedRows()
+	                        ensureDefaultSelectionIfNeeded()
+						}
+					}
+
+		// §8.4: one receiver for every registered enablement key. The seven `.onChange`
+		// modifiers this replaces were an ad-hoc subset (codex, claude, antigravity,
+		// opencode, copilot, kimi, grok) — the other five sources changed nothing.
+		// `updateFooterUsageVisibility()` was previously attached only to the codex and
+		// claude arms; it recomputes from `codexAgentEnabled`/`claudeAgentEnabled` and the
+		// usage toggles, so running it on any enablement write re-asserts the same two
+		// values rather than adding an effect.
+		let afterAgents = afterUsage
+			.onReceive(agentEnablementObserver.mainPublisher) { _ in
+				flashAgentEnablementNoticeIfNeeded()
+				updateFooterUsageVisibility()
+			}
+
+		let afterSessions = afterAgents
+			.onReceive(unified.$sessions) { sessions in
+				if !sessions.isEmpty {
+					hasEverHadSessions = true
+				}
+                tryHandlePendingCockpitNavigationIfNeeded()
+			}
+
+		let afterSessionSearch = afterSessions
+			.onReceive(NotificationCenter.default.publisher(for: .openSessionsSearchFromMenu)) { _ in
+				// Force a focus transition even if Search is already active so the menu action
+				// reliably focuses the search field.
+				focusCoordinator.perform(.closeAllSearch)
+				focusCoordinator.perform(.openSessionSearch)
+			}
+
+			let afterTranscriptFind = afterSessionSearch
+				.onReceive(NotificationCenter.default.publisher(for: .openTranscriptFindFromMenu)) { _ in
+					focusCoordinator.perform(.openTranscriptFind)
+				}
+
+			let afterNavigateFromImages = afterTranscriptFind
+					.onReceive(NotificationCenter.default.publisher(for: .navigateToSessionFromImages)) { n in
+						guard let id = n.object as? String else { return }
+						let eventID = n.userInfo?["eventID"] as? String
+						let userPromptIndex = n.userInfo?["userPromptIndex"] as? Int
+						let source = cachedRows.first(where: { $0.id == id })?.source
+						setActiveSelection(id, source: source, userInitiated: true)
+						CodexImagesWindowController.shared.sendToBack()
+					NSApp.activate(ignoringOtherApps: true)
+					if let main = NSApp.windows.first(where: { $0.isVisible && AppWindowRouter.isAgentSessionsWindow($0) }) ?? NSApp.mainWindow {
+						main.makeKeyAndOrderFront(nil)
+					}
+					DispatchQueue.main.async {
+						var payload: [AnyHashable: Any] = [:]
+						if let eventID, !eventID.isEmpty {
+							payload["eventID"] = eventID
+						} else if let userPromptIndex {
+							payload["userPromptIndex"] = userPromptIndex
+						} else {
+							return
+						}
+						NotificationCenter.default.post(
+							name: .navigateToSessionEventFromImages,
+							object: id,
+							userInfo: payload
+						)
+					}
+				}
+
+				let afterNavigateFromCockpit = afterNavigateFromImages
+					.onReceive(NotificationCenter.default.publisher(for: .navigateToSessionFromCockpit)) { n in
+						handleNavigateToSessionFromCockpit(n)
+					}
+
+					let afterShowImages = afterNavigateFromCockpit
+						.onReceive(NotificationCenter.default.publisher(for: .showImagesFromMenu)) { _ in
+							showImagesForSelectedSession(showNoSelectionAlert: true)
+						}
+
+                    let afterCollapseAllGroups = afterShowImages
+                        .onReceive(NotificationCenter.default.publisher(for: .collapseAllUnifiedSessionGroupsFromMenu)) { _ in
+                            collapseAllHierarchyParents()
+                        }
+
+                    let afterExpandAllGroups = afterCollapseAllGroups
+                        .onReceive(NotificationCenter.default.publisher(for: .expandAllUnifiedSessionGroupsFromMenu)) { _ in
+                            expandAllHierarchyParents()
+                        }
+
+					let afterShowImagesForInlineImage = afterExpandAllGroups
+							.onReceive(NotificationCenter.default.publisher(for: .showImagesForInlineImage)) { n in
+								guard let id = n.object as? String else { return }
+							let requestedItemID = n.userInfo?["selectedItemID"] as? String
+
+							let source = cachedRows.first(where: { $0.id == id })?.source
+							setActiveSelection(id, source: source, userInitiated: true)
+
+						guard let session = selectedSession else {
+							NSSound.beep()
+							return
+						}
+						let allSessions: [Session]
+						allSessions = unified.allSessions
+						CodexImagesWindowController.shared.show(session: session, allSessions: allSessions)
+
+						guard let requestedItemID else { return }
+						DispatchQueue.main.async {
+							NotificationCenter.default.post(
+								name: .selectImagesBrowserItem,
+								object: id,
+								userInfo: ["selectedItemID": requestedItemID, "forceScope": CodexImagesScope.singleSession.rawValue]
+							)
+						}
+					}
+                    .onReceive(activeCodexSessions.membershipTicks) { _ in
+                        // A live-presence bump changes Agent live-state dots (active/open),
+                        // never the underlying session list — the visible row SET comes from
+                        // unified.sessions, not the presence poll. So when Active-only filtering
+                        // is OFF, the full updateCachedRows() rebuild (hierarchy + side-chat +
+                        // derived-state + cachedRows reassignment, ~5-6 O(n) passes over 3,300
+                        // rows) cannot change anything the user sees and is the dominant W1
+                        // beachball contributor. Take a cheap path that only refreshes the
+                        // fallback-presence map; direct dots refresh because this onReceive
+                        // firing re-diffs the body, and each source-cell's .id(...) is keyed on
+                        // that row's own (liveState, lastSeenAt) signature (see
+                        // livePresenceSignature) so only rows whose visible dot actually changed
+                        // get a new cell identity — not every row on every tick. Cross-workspace
+                        // fallback dots read cachedFallbackPresenceBySessionKey (rebuilt here).
+                        // NOTE: reverted "C5" skipped this fallback rebuild too and broke
+                        // fallback dots — we must keep it.
+#if DEBUG
+                        let _memSpan = Perf.begin("membershipTick", thresholdMs: 8,
+                                                  showActiveSessionsOnly ? "activeOnly-full" : "cheap-dotsOnly")
+                        defer { Perf.end(_memSpan) }
+#endif
+                        if showActiveSessionsOnly {
+                            // Active-only: the visible SET depends on live membership, so a
+                            // structural rebuild is genuinely required. This fires on the
+                            // same live-poll cadence as the unified.sessions republish, so
+                            // it gets the same off-main treatment (Task 2) — a user with
+                            // Active-only enabled shouldn't pay ~110ms on main every tick.
+                            updateCachedRowsAsync { _, applied in
+                                guard applied else { return }
+                                ensureDefaultSelectionIfNeeded()
+                                refreshSelectionSourceFromCachedRows()
+                                updateFocusedSessionIfNeeded(selectedSession)
+                            }
+                        } else {
+                            // Cheap path: SET + order unchanged, only dots move.
+                            rebuildCachedFallbackPresences()
+                            updateFocusedSessionIfNeeded(selectedSession)
+                        }
+                    }
+
+				return AnyView(afterShowImagesForInlineImage)
+			}
+
+	private var topTrailingNotices: some View {
+		VStack(alignment: .trailing, spacing: 8) {
+			if showAgentEnablementNotice {
+				Text("Showing active agents only")
+					.font(.footnote)
+					.padding(10)
+					.background(.regularMaterial)
+					.clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+					.transition(.move(edge: .top).combined(with: .opacity))
+			}
+			ForEach(Array(unified.newlyAvailableProviders.enumerated()), id: \.element) { index, source in
+				newProviderBanner(for: source)
+					.transition(.move(edge: .top).combined(with: .opacity))
+					.animation(
+						.easeOut(duration: 0.3).delay(Double(index) * 0.3),
+						value: unified.newlyAvailableProviders
+					)
+			}
+		}
+		.padding(.top, 8)
+		.padding(.trailing, 8)
+	}
+
+	private func newProviderBanner(for source: SessionSource) -> some View {
+		HStack(spacing: 10) {
+			Image(systemName: source.iconName)
+				.font(.title3)
+			Text("\(source.displayName) sessions found")
+				.font(.footnote.weight(.medium))
+			Spacer(minLength: 8)
+			Button("Enable") {
+				withAnimation(.easeInOut(duration: 0.3)) {
+					unified.dismissNewProviderBanner(for: source, enable: true)
+				}
+			}
+			.buttonStyle(.borderedProminent)
+			.controlSize(.small)
+			.accessibilityLabel("Enable \(source.displayName)")
+			Button("Dismiss") {
+				withAnimation(.easeInOut(duration: 0.3)) {
+					unified.dismissNewProviderBanner(for: source, enable: false)
+				}
+			}
+			.buttonStyle(.bordered)
+			.controlSize(.small)
+			.accessibilityLabel("Dismiss \(source.displayName) notification")
+		}
+		.padding(10)
+		.background(.regularMaterial)
+		.clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+		.accessibilityElement(children: .contain)
+	}
+
+	    private var rootContent: some View {
+	        VStack(spacing: 0) {
+	            // Cap ETA banner disabled (calculations retained; UI disabled)
+	            mainSplitView
+	            cockpitFooter
+	        }
+	    }
+
+	    /// Session-list pane with the onboarding top-card slot (What's New / feedback)
+	    /// mounted above the table, outside its scrolling content. A rendered card
+	    /// is therefore actually on screen and may safely count as an impression.
+	    /// Renders nothing extra when there's nothing to show.
+	    private var listPaneWithTopSlot: some View {
+	        VStack(spacing: 0) {
+	            OnboardingListTopSlot(
+	                coordinator: onboardingCoordinator,
+	                providers: quotaMeterProviders,
+	                audienceReady: topSlotAudienceReady
+	            )
+	            if !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, searchCoordinator.isRanked {
+	                SearchScopeBar(search: searchCoordinator,
+	                               query: unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+	                               hasRows: !cachedRows.isEmpty,
+	                               openSettings: {
+	                                   PreferencesWindowController.shared.show(indexer: codexIndexer,
+	                                                                           updaterController: updaterController,
+	                                                                           initialTab: .search)
+	                               })
+	                Divider()
+	            }
+	            listPane
+	        }
+	        .onboardingSheets(
+	            coordinator: onboardingCoordinator,
+	            quotaMeterProviders: quotaMeterProviders
+	        )
+	        // Recomputed only when the index changes, never per render: the miss
+	        // cases (no Codex/Claude sessions at all, and the steward tally, which
+	        // cannot short-circuit) are the ones that scan the whole list, and they
+	        // are also the ones that would repeat every frame.
+	        .onReceive(unified.$allSessions) { sessions in
+	            quotaMeterProviders = QuotaMeterProviderAvailability(
+	                hasCodex: sessions.contains { $0.source == .codex },
+	                hasClaude: sessions.contains { $0.source == .claude }
+	            )
+	            // Tallied through `StewardAskEligibility` rather than inline: it is
+	            // the tested path, and a second copy here would be the one that
+	            // silently disagrees with it.
+	            let counts = StewardAskEligibility.sessionCounts(in: sessions.lazy.map(\.source))
+	            // Guarded assignment: this is `@Published` on an object this view
+	            // observes, so writing it unconditionally would rebuild the whole
+	            // session list on every index change even when the answer has not
+	            // moved. The line above is `@State`, which SwiftUI compares for us.
+	            let stewardTarget = StewardAskEligibility.target(sessionCounts: counts)
+	            if onboardingCoordinator.stewardAskTarget != stewardTarget {
+	                onboardingCoordinator.stewardAskTarget = stewardTarget
+	            }
+	        }
+	        // `$allSessions` publishes its initial empty value immediately. That is
+	        // not an audience snapshot: choosing then would either target nobody or
+	        // freeze an empty selection before the launch scan finds their sessions.
+	        // Arm selection only after every active source has finished its first
+	        // pass (or reported an error) and the merged list has been published.
+	        .onReceive(unified.$launchState) { state in
+	            if state.isAudienceReady {
+	                topSlotAudienceReady = true
+	            }
+	        }
+	    }
+
+	    @ViewBuilder
+	    private var mainSplitView: some View {
+	        if !showTranscriptWindow {
+	            listPaneWithTopSlot
+	                .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
+	                .transaction { $0.animation = nil }
+	        } else if layoutMode == .vertical {
+	            HSplitView {
+	                // Native macOS split idiom: panes read as distinct via a one-step
+	                // background value difference (list on window gray, transcript on
+	                // the brighter text background) + a single crisp hairline. Each
+	                // pane is inset by `paneGutter` so neither the list content nor the
+	                // transcript stripes butt against the line — equal margin both sides.
+	                listPaneWithTopSlot
+	                    .frame(minWidth: SessionListToolbarLayout.sideBySideListMinWidth, maxWidth: 1200)
+	                    .padding(.trailing, Self.paneGutter)
+	                    .background(Self.listPaneBackground)
+	                    .overlay(alignment: .trailing) { paneHairline(.vertical) }
+	                    .modifier(ListPaneDividerReporter(anchor: sessionListToolbarAnchor))
+	                transcriptPane
+	                    .frame(minWidth: 450)
+	                    .padding(.leading, Self.paneGutter)
+	                    .background(Color(nsColor: .textBackgroundColor))
+	            }
+	            .background(SplitViewAutosave(key: "UnifiedSplit-H"))
+	            .transaction { $0.animation = nil }
+	        } else {
+	            VSplitView {
+	                listPaneWithTopSlot
+	                    .frame(minHeight: 180)
+	                    .padding(.bottom, Self.paneGutter)
+	                    .background(Self.listPaneBackground)
+	                    .overlay(alignment: .bottom) { paneHairline(.horizontal) }
+	                transcriptPane
+	                    .frame(minHeight: 240)
+	                    .padding(.top, Self.paneGutter)
+	                    .background(Color(nsColor: .textBackgroundColor))
+	            }
+	            .background(SplitViewAutosave(key: "UnifiedSplit-V"))
+	            .transaction { $0.animation = nil }
+	        }
+	    }
+
+	    /// Content inset from the list/transcript hairline so neither pane's content
+	    /// touches the separator. Each pane's own background fills the inset up to
+	    /// the line, so the two panes read as distinct panels (AgentsView-style).
+	    private static let paneGutter: CGFloat = LayoutTokens.sm
+
+	    /// Flat "sidebar" tone for the Session-list pane — the standard window/chrome
+	    /// gray, one value step off the transcript's brighter text background, so the
+	    /// panes read as distinct without depending on column widths.
+	    private static let listPaneBackground = Surface.chrome
+
+	    /// A single 1px hairline at the list/transcript boundary, in the system
+	    /// `separatorColor` so it matches every other divider in the window and
+	    /// adapts to light/dark. Pane value contrast (see `mainSplitView`) does the
+	    /// heavy lifting; this just crisps the seam.
+	    @ViewBuilder
+	    private func paneHairline(_ axis: Axis) -> some View {
+	        let line = Color(nsColor: .separatorColor)
+	        switch axis {
+	        case .vertical:
+	            line.frame(width: 1).frame(maxHeight: .infinity)
+	        case .horizontal:
+	            line.frame(height: 1).frame(maxWidth: .infinity)
+	        }
+	    }
+
+	    private var cockpitFooter: some View {
+	        CockpitFooterView(
+	            isBusy: footerIsBusy,
+	            statusText: footerStatusText,
+	            quotas: footerQuotas,
+	            sessionCountText: footerSessionCountText,
+	            clearFilters: footerIsFiltered ? { clearListFilters() } : nil
+	        )
+	    }
+
+	    private var listPane: some View {
+	        let showTitle = columnVisibility.showTitleColumn
+	        let showModified = columnVisibility.showModifiedColumn
+        let showProject = columnVisibility.showProjectColumn
+        let showMsgs = columnVisibility.showMsgsColumn
+	        return ZStack(alignment: .bottom) {
+		        Table(cachedRows, selection: tableSingleSelection, sortOrder: $sortOrder) {
+            TableColumn("★") { cellFavorite(for: $0) }
+                .width(min: showStarColumn ? 36 : 0,
+                       ideal: showStarColumn ? 40 : 0,
+                       max: showStarColumn ? 44 : 0)
+
+            TableColumn("Agent", value: \Session.sourceKey) { s in
+                cellSource(for: s)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        setActiveSelection(s.id, source: s.source, userInitiated: true)
+                        autoSelectEnabled = false
+                        focusActiveTerminal(for: s)
+                    }
+            }
+                .width(min: showSourceColumn ? 90 : 0,
+                       ideal: showSourceColumn ? 100 : 0,
+                       max: showSourceColumn ? 120 : 0)
+
+            TableColumn("Session", value: \Session.listTitle) { s in
+                SessionTitleCell(
+                    session: s,
+                    displayTitleOverride: unified.claudeDesktopTitle(for: s),
+                    searchHit: searchCoordinator.hits[SearchCoordinator.SessionKey(s)],
+                    excerptLines: searchExcerptLines,
+                    showAlso: searchCoordinator.field == nil,
+                    antigravityIndexer: antigravityIndexer,
+                    rowMeta: hierarchyRowMeta[s.id],
+                    sideChatParentContext: sideChatParentContextByID[s.id],
+                    isExpanded: !collapsedParents.contains(s.id),
+                    onToggleExpand: { id in
+                            if collapsedParents.contains(id) {
+                                collapsedParents.remove(id)
+                            } else {
+                                collapsedParents.insert(id)
+                            }
+                        }
+                    )
+                    .equatable()
+	                    .contentShape(Rectangle())
+	                    .onTapGesture {
+	                        // Explicitly select the tapped row to avoid relying solely on Table's mouse handling.
+	                        setActiveSelection(s.id, source: s.source, userInitiated: true)
+	                        autoSelectEnabled = false
+	                        NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+	                    }
+            }
+            .width(min: showTitle ? 160 : 0,
+                   ideal: showTitle ? 320 : 0,
+                   max: showTitle ? 2000 : 0)
+
+            TableColumn("Date", value: \Session.modifiedAt) { s in
+                // Both strings come from DateCellStrings, memoized per (session id,
+                // modifiedAt, current minute) -- avoids recomputing the lock-guarded
+                // relative formatter and the absolute Date.FormatStyle string on every
+                // body pass during fast scroll (see DateCellStrings doc comment above).
+                let display = SessionIndexer.ModifiedDisplay(rawValue: modifiedDisplayRaw) ?? .relative
+                let strings = DateCellStrings.strings(for: s)
+                let primary = (display == .relative) ? strings.relative : strings.absolute
+                let helpText = (display == .relative) ? strings.absolute : strings.relative
+                Text(primary)
+                    .font(.system(size: 13, weight: .regular, design: .monospaced))
+                    .foregroundStyle(UnifiedSessionsStyle.timestampColor)
+                    .help(helpText)
+            }
+            .width(min: showModified ? 120 : 0,
+                   ideal: showModified ? 120 : 0,
+                   max: showModified ? 140 : 0)
+
+            TableColumn("Project", value: \Session.rowRepoDisplay) { s in
+                let display: String = {
+                    if s.source == .antigravity {
+                        if let name = s.rowRepoName, !name.isEmpty { return name }
+                        return "—"
+                    } else {
+                        return s.rowRepoDisplay
+                    }
+                }()
+                let isNestedHierarchyRow = showSubagentHierarchy
+                    && searchState.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && (hierarchyRowMeta[s.id]?.depth ?? 0) > 0
+                ProjectCellView(
+                    id: s.id,
+                    display: display,
+                    worktree: isNestedHierarchyRow ? nil : s.rowProjectWorktreeDisplayName
+                )
+                    .onTapGesture(count: 2) {
+                        if let selection = ProjectSelection.makeSelection(for: s, among: cachedRows) {
+                            applyProjectSelection(selection)
+                        }
+                    }
+            }
+            .width(min: showProject ? 120 : 0,
+                   ideal: showProject ? 160 : 0,
+                   max: showProject ? 240 : 0)
+
+            TableColumn("Msgs", value: \Session.messageCount) { s in
+                Text(String(s.messageCount))
+                    .font(.system(size: 13, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: showMsgs ? 64 : 0,
+                   ideal: showMsgs ? 64 : 0,
+                   max: showMsgs ? 80 : 0)
+
+            // File size column
+            TableColumn("Size", value: \Session.fileSizeSortKey) { s in
+                let display: String = {
+                    if let b = s.fileSizeBytes { return formattedSize(b) }
+                    return "—"
+                }()
+                Text(display)
+                    .font(.system(size: 13, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .width(min: showSizeColumn ? 72 : 0, ideal: showSizeColumn ? 80 : 0, max: showSizeColumn ? 100 : 0)
+
+            // Removed separate Refresh column to avoid churn
+	        }
+	        .id(UnifiedTableIdentityPolicy.tableIdentity(columnLayoutID: columnLayoutID, reorderGeneration: tableReorderGeneration))
+	        .tableStyle(.inset(alternatesRowBackgrounds: false))
+            // Transparent table so the flat "sidebar" pane background shows through;
+            // system white zebra is dropped (see listPaneBackground).
+            .scrollContentBackground(.hidden)
+            .tint(UnifiedSessionsStyle.selectionAccent)
+	        .environment(\.defaultMinListRowHeight, 28)
+		        .simultaneousGesture(TapGesture().onEnded {
+		            NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+		        })
+		        if let emptyState = sessionListEmptyState {
+		            sessionListEmptyStateView(emptyState)
+		                .frame(maxWidth: .infinity, maxHeight: .infinity)
+		                .background(Self.listPaneBackground)
+		                .allowsHitTesting(false)
+		        }
+		        }
+		        .contextMenu(forSelectionType: String.self) { ids in
+			            if ids.count == 1, let id = ids.first, let s = cachedRows.first(where: { $0.id == id }) {
+			                Button(s.isFavorite ? "Remove from Saved" : "Save") { unified.toggleFavorite(s) }
+			                Divider()
+	                // Derive Antigravity conversation ID once to avoid repeated disk reads
+	                let antigravityCLISessionID = (s.source == .antigravity) ? AntigravitySessionIDHelper.deriveSessionID(from: s) : nil
+                    if s.source == .codex, !s.isSideChat {
+                        Button("Continue in Codex Desktop") { openInCodexApp(s) }
+                            .disabled(CodexResumeCoordinator.appSessionID(for: s) == nil)
+                            .help("Continue this session in the local Codex Desktop. Codex Desktop must use the same session storage.")
+                        Divider()
+                    }
+	                if canResumeSession(s, antigravityCLISessionID: antigravityCLISessionID) {
+	                    Button("Resume in \(resumeAgentLabel(s.source)) (\(CodexLaunchMode.selectedResumeTerminalTitle()))") { resume(s) }
+	                        .keyboardShortcut("r", modifiers: [.command, .control])
+	                        .help("Resume the selected session in its original CLI (⌃⌘R)")
+	                    if s.source == .claude {
+	                        Button("Open in VS Code") { openInVSCode(s) }
+	                            .disabled(!ClaudeVSCodeLauncher.isEditorInstalled)
+	                            .help("Open the session’s folder in VS Code and verify the Claude Code workspace before sending the resume link.")
+	                    }
+	                    Divider()
+	                }
+                    if activeCodexSessions.supportsLiveSessions(for: s.source) {
+                        let availability = terminalFocusAvailability(for: s)
+                        Button("Focus in iTerm2") {
+                            focusActiveTerminal(for: s)
+                        }
+                        .disabled(!availability.canFocus)
+                        .help(availability.helpText)
+                        Divider()
+                    }
+	                Button("Open Working Directory") { openDir(s) }
+	                    .keyboardShortcut("o", modifiers: [.command, .shift])
+	                    .help("Reveal working directory in Finder (⌘⇧O)")
+	                Button("Reveal Session Log") { revealSessionFile(s) }
+	                    .keyboardShortcut("l", modifiers: [.command, .option])
+                    .help("Show session log file in Finder (⌥⌘L)")
+                if let copyID = copyableSessionID(for: s) {
+                    Button("Copy Session ID") { copySessionID(copyID) }
+                        .help(s.isSideChat ? "Copy the parent session ID to the clipboard" : "Copy the session ID to the clipboard")
+                } else {
+                    Button("Copy Session ID") {}
+                        .disabled(true)
+                        .help("No parent session ID is available for this side chat")
+                }
+                Button("Copy Resume Command") { copyResumeCommand(s, antigravityCLISessionID: antigravityCLISessionID) }
+                    .disabled(!canCopyResumeCommand(s, antigravityCLISessionID: antigravityCLISessionID))
+                    .help("Copy a terminal-agnostic resume command to the clipboard")
+                if let selection = ProjectSelection.makeSelection(for: s, among: cachedRows) {
+                    Divider()
+                    Button("Filter by Project: \(selection.displayName)") { applyProjectSelection(selection) }
+                        .keyboardShortcut("p", modifiers: [.command, .option])
+                        .help("Show only sessions from \(selection.displayName) (⌥⌘P)")
+                }
+                if unified.isArchivedClaudeDesktop(s) {
+                    let canRestore = UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.allowClaudeArchiveRestore)
+                    Button("Restore from Archive") { restoreCandidate = s }
+                        .disabled(!canRestore)
+                        .help(canRestore
+                              ? "Set this Claude session back to active in Claude Desktop"
+                              : "Enable 'Allow restoring archived Claude sessions' in Preferences -> Advanced")
+                    Divider()
+                }
+            } else {
+                Button("Resume") {}
+                    .disabled(true)
+                Button("Open Working Directory") {}
+                    .disabled(true)
+                    .help("Select a session to open its working directory")
+                Button("Reveal Session Log") {}
+                    .disabled(true)
+                    .help("Select a session to reveal its log file")
+                Button("Copy Session ID") {}
+                    .disabled(true)
+                    .help("Select exactly one session to copy its ID")
+                Button("Copy Resume Command") {}
+                    .disabled(true)
+                    .help("Select exactly one session to copy its resume command")
+                Button("Filter by Project") {}
+                    .disabled(true)
+                    .help("Select a session with project metadata to filter")
+            }
+        }
+        .confirmationDialog(
+            "Restore from Archive?",
+            isPresented: Binding(get: { restoreCandidate != nil }, set: { if !$0 { restoreCandidate = nil } }),
+            presenting: restoreCandidate
+        ) { session in
+            // Defer so the dialog dismisses before the relaunch alert presents.
+            Button("Restore") { restoreCandidate = nil; DispatchQueue.main.async { restoreFromArchive(session) } }
+            Button("Cancel", role: .cancel) { restoreCandidate = nil }
+        } message: { _ in
+            Text("Relaunch Claude Desktop afterward to see this session. Your transcript isn’t changed.")
+        }
+        .alert("Restored", isPresented: $showRestoredRelaunch) {
+            Button("OK") {}
+        } message: {
+            Text("Relaunch Claude Desktop to see it.")
+        }
+        .onChange(of: sortOrder) { _, newValue in
+            if !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                searchSortChosen = true
+            }
+            if let first = newValue.first {
+                let key: UnifiedSessionIndexer.SessionSortDescriptor.Key
+                if first.keyPath == \Session.modifiedAt { key = .modified }
+                else if first.keyPath == \Session.messageCount { key = .msgs }
+                else if first.keyPath == \Session.rowRepoDisplay { key = .repo }
+                else if first.keyPath == \Session.fileSizeSortKey { key = .size }
+                else if first.keyPath == \Session.sourceKey { key = .agent }
+                else if first.keyPath == \Session.listTitle { key = .title }
+                else { key = .title }
+                // Setting sortDescriptor drives the sort-only Combine fast path
+                // (re-sorts the already-filtered set off-main). Do NOT also call
+                // recomputeNow() here — a full filter+sort pass would run ~150ms
+                // later and overwrite the fast-path result, negating the optimization.
+                unified.sortDescriptor = .init(key: key, ascending: first.order == .forward)
+            }
+            // No immediate updateCachedRows() here: the sortDescriptor fast path
+            // re-sorts off-main and republishes unified.sessions, whose onChange
+            // rebuilds rows + reconciles selection. An immediate rebuild here ran
+            // against the pre-sort array — pure waste (~115 ms) plus a Table diff.
+        }
+#if DEBUG
+				.onReceive(NotificationCenter.default.publisher(for: PerfBench.toggleSortNotification)) { _ in
+					// Perf harness (AS_PERF_BENCH=sort): toggle the sort key to exercise the full
+					// real sort path — onChange(of: sortOrder) -> updateCachedRows -> Table reorder.
+					if sortOrder.first?.keyPath == \Session.messageCount {
+						sortOrder = [KeyPathComparator(\Session.modifiedAt, order: .reverse)]
+					} else {
+						sortOrder = [KeyPathComparator(\Session.messageCount, order: .reverse)]
+					}
+				}
+				.onReceive(NotificationCenter.default.publisher(for: PerfBench.selectWalkNotification)) { _ in
+					// Perf harness (AS_PERF_BENCH=select): advance selection to the next row via
+					// the real setActiveSelection(...) path — exercises handleSelectionChange's
+					// full pipeline (debounce window, focus, reload, prewarm), not a bypass, so
+					// captures show whether key-repeat-rate selection changes coalesce as intended.
+					guard !cachedRows.isEmpty else { return }
+					let stride = PerfBench.selectWalkStride
+					let nextIndex: Int
+					if let current = selection, let idx = cachedRows.firstIndex(where: { $0.id == current }) {
+						nextIndex = (idx + stride) % cachedRows.count
+					} else {
+						nextIndex = 0
+					}
+					let next = cachedRows[nextIndex]
+					Perf.event("selectWalkStep", "index=\(nextIndex) stride=\(stride) id=\(next.id.prefix(8))")
+					setActiveSelection(next.id, source: next.source, userInitiated: true)
+				}
+#endif
+				.onChange(of: unified.isIndexing) { wasIndexing, isIndexing in
+					// The unified.sessions handler owns the row rebuild and applies its
+					// generation-checked result. Indexing completion is only a state
+					// transition; rebuilding the same large table here duplicated that
+					// work and blocked the main actor after every refresh. Keep the
+					// correctness-only reconciliation for a held-empty result or a
+					// selection that disappeared while indexing was in flight.
+					if wasIndexing, !isIndexing {
+						let needsReconciliation = UnifiedTableSelectionPolicy.shouldReconcileIndexingCompletion(
+							selectionID: selection,
+							visibleRowIDs: cachedVisibleRowIDs,
+							sourceSessionsEmpty: unified.sessions.isEmpty,
+							cachedRowsEmpty: cachedRows.isEmpty
+						)
+						#if DEBUG
+						Perf.event(
+							needsReconciliation ? "indexingEndedRowsRebuild" : "indexingEndedRowsRebuildSkipped",
+							"rows=\(cachedRows.count)"
+						)
+						#endif
+						if needsReconciliation {
+							updateCachedRows()
+						}
+						ensureDefaultSelectionIfNeeded()
+						refreshSelectionSourceFromCachedRows()
+					}
+				}
+				.onChange(of: unified.sessions) { _, _ in
+					// Update cached rows first, then reconcile canonical selection with fresh data.
+					// The heavy hierarchy/derived-state computation runs off-main
+					// (SessionRowsBuilder via updateCachedRowsAsync) so this republish
+					// — which fires on the live ~2s poll cadence, not just user
+					// actions — never blocks the main thread for the full rebuild
+					// cost. The apply (and everything below that reads fresh
+					// cachedRows) runs in the completion, on main, in one turn.
+					selectionTrace("sessions changed begin selection=\(selection ?? "nil") cachedRows=\(cachedRows.count)")
+                    restartSearchForSideChatDatasetChangeIfNeeded()
+					isDatasetChurning = true
+					updateCachedRowsAsync { heldRows, applied in
+						guard applied else {
+							// Superseded by a newer trigger; that trigger's own
+							// completion carries the churn-flag reset and any
+							// needed second pass. Nothing to do here.
+							return
+						}
+						let deferredReplacement = selectionReplacementDeferredDuringChurn
+						ensureDefaultSelectionIfNeeded()
+						refreshSelectionSourceFromCachedRows()
+						updateFocusedSessionIfNeeded(selectedSession)
+						DispatchQueue.main.async {
+							isDatasetChurning = false
+							// Correctness: shouldReplaceMissingSelection() defers a
+							// missing-selection replacement while isDatasetChurning is true
+							// (Fix 2), so a genuinely-deleted session's selection can only be
+							// cleaned up once churn drops. Cost: re-running updateCachedRows()
+							// unconditionally on every republish reintroduced the double-call
+							// class Task 5 eliminated (~115ms at 3.3k rows on the ~2s live
+							// cadence). Only pay for the second pass when it can actually
+							// matter: rows were held stale, or this pass is the one that will
+							// finally apply a deferred selection replacement.
+							if heldRows || deferredReplacement {
+								updateCachedRows()
+								ensureDefaultSelectionIfNeeded()
+								refreshSelectionSourceFromCachedRows()
+								updateFocusedSessionIfNeeded(selectedSession)
+							}
+							selectionTrace("sessions changed end selection=\(selection ?? "nil") cachedRows=\(cachedRows.count)")
+						}
+					}
+				}
+        .onChange(of: columnVisibility.changeToken) { _, _ in refreshColumnLayout() }
+        .onChange(of: showSourceColumn) { _, _ in refreshColumnLayout() }
+        .onChange(of: showSizeColumn) { _, _ in refreshColumnLayout() }
+        .onChange(of: showStarColumn) { _, _ in refreshColumnLayout() }
+        .onChange(of: searchCoordinator.isRunning) { _, _ in
+            updateCachedRows()
+            let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            if q.isEmpty {
+                ensureDefaultSelectionIfNeeded()
+                refreshSelectionSourceFromCachedRows()
+            }
+        }
+        .onChange(of: searchCoordinator.results) { _, _ in
+            updateCachedRows()
+            // If we have search results but no valid selection (none selected or selected not in results),
+            // auto-select the first match without stealing focus
+            if selection == nil, let first = cachedRows.first {
+                isAutoSelectingFromSearch = true
+                setActiveSelection(first.id, source: first.source, userInitiated: false)
+                // Reset the flag on the next runloop to ensure onChange handlers have observed it
+                DispatchQueue.main.async { isAutoSelectingFromSearch = false }
+            }
+            refreshSelectionSourceFromCachedRows()
+	        }
+        .onChange(of: unified.queryDraft) { _, _ in searchSortChosen = false }
+	    }
+
+	    private var footerIsBusy: Bool {
+	        unified.isIndexing
+	        || unified.isProcessingTranscripts
+	        || searchCoordinator.isRunning
+	        || unified.launchState.overallPhase < .ready
+	    }
+
+	    private var sessionListEmptyState: UnifiedSessionListEmptyState? {
+	        // An empty single-field search is explained by the scope bar, which offers Everything instead.
+	        if searchCoordinator.field != nil, searchCoordinator.isRanked, !searchCoordinator.isRunning,
+	           !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
+	        return UnifiedSessionListEmptyStatePolicy.state(
+	            hasRows: !cachedRows.isEmpty,
+	            isIndexing: unified.isIndexing,
+	            launchPhase: unified.launchState.overallPhase,
+	            hasDisplayedSessions: unified.launchState.hasDisplayedSessions,
+	            indexingError: unified.indexingError,
+	            isDatasetChurning: isDatasetChurning,
+	            isSearchRunning: searchCoordinator.isRunning,
+	            isFiltered: footerIsFiltered
+	        )
+	    }
+
+	    @ViewBuilder
+	    private func sessionListEmptyStateView(_ state: UnifiedSessionListEmptyState) -> some View {
+	        VStack(spacing: LayoutTokens.sm) {
+	            switch state {
+	            case .indexing:
+	                ProgressView()
+	                    .controlSize(.small)
+	                Text("Indexing sessions…")
+	                    .font(.headline)
+	                if let detail = UnifiedSessionListEmptyStatePolicy.indexingDetail(
+                        launchPhase: unified.launchState.overallPhase) {
+	                    Text(String(localized: detail))
+	                        .font(.callout)
+	                        .foregroundStyle(.secondary)
+	                }
+	            case .updating:
+	                ProgressView()
+	                    .controlSize(.small)
+	                Text("Updating sessions…")
+	                    .font(.headline)
+	            case .searching:
+	                ProgressView()
+	                    .controlSize(.small)
+	                Text("Searching…")
+	                    .font(.headline)
+	            case .failed:
+	                Image(systemName: "exclamationmark.triangle")
+	                    .font(.title2)
+	                    .foregroundStyle(.secondary)
+	                Text("Session index unavailable")
+	                    .font(.headline)
+	                Text("Refresh to try indexing again.")
+	                    .font(.callout)
+	                    .foregroundStyle(.secondary)
+	            case .filtered:
+	                Image(systemName: "line.3.horizontal.decrease.circle")
+	                    .font(.title2)
+	                    .foregroundStyle(.secondary)
+	                Text("No matching sessions")
+	                    .font(.headline)
+	                Text("Try clearing the current filters.")
+	                    .font(.callout)
+	                    .foregroundStyle(.secondary)
+	            case .noSessions:
+	                Image(systemName: "text.bubble")
+	                    .font(.title2)
+	                    .foregroundStyle(.secondary)
+	                Text("No sessions yet")
+	                    .font(.headline)
+	                Text("Sessions will appear here after an agent records one.")
+	                    .font(.callout)
+	                    .foregroundStyle(.secondary)
+	            }
+        }
+	        .multilineTextAlignment(.center)
+	        .padding(LayoutTokens.xl)
+	    }
+
+	    private var footerStatusText: String {
+	        if unified.launchState.overallPhase < .ready {
+	            return String(localized: unified.launchState.overallPhase.statusDescription)
+	        }
+	        if unified.coreIndexingDisplayMode == .syncing {
+	            let progress = unified.coreIndexingProgress
+	            if progress.total > 0, let percent = progress.percent {
+	                return String(localized: "Syncing updates \(progress.processed)/\(progress.total) (\(percent)%)…", comment: "Footer progress while syncing changed sessions.")
+	            }
+	            if progress.processed > 0 {
+	                return String(localized: "Syncing updates (\(progress.processed))…", comment: "Footer progress while syncing sessions when the total is unknown.")
+	            }
+	            return String(localized: "Syncing updates…", comment: "Footer status while syncing changed sessions.")
+	        }
+	        if unified.coreIndexingDisplayMode == .indexing || unified.isIndexing {
+	            let progress = unified.coreIndexingProgress
+	            if progress.total > 0 {
+	                if let percent = progress.percent {
+	                    return String(localized: "Indexing \(progress.processed)/\(progress.total) sessions (\(percent)%)…", comment: "Footer progress while indexing sessions.")
+	                }
+	                return String(localized: "Indexing \(progress.processed)/\(progress.total) sessions…", comment: "Footer progress while indexing sessions without a percentage.")
+	            }
+	            if progress.processed > 0 {
+	                return String(localized: "Indexing \(progress.processed) sessions…", comment: "Footer progress while indexing sessions when the total is unknown.")
+	            }
+	            return String(localized: "Indexing sessions…", comment: "Footer status while indexing sessions.")
+	        }
+	        if unified.isProcessingTranscripts {
+	            return String(localized: "Processing transcripts (core index)…", comment: "Footer status while indexing transcript content.")
+	        }
+	        if searchCoordinator.isRunning {
+	            return String(localized: "Searching…", comment: "Footer status while session search is running.")
+	        }
+	        return ""
+	    }
+
+	    /// True while a filter the footer can actually undo is narrowing the list.
+	    /// Deliberately NOT "cachedRows.count != cachedTotalSessionCount": rows also
+	    /// lag behind during search churn, and offering to clear filters when none
+	    /// are set produces a control that changes nothing when pressed. This set
+	    /// must stay in step with `clearListFilters()`.
+    private var footerIsFiltered: Bool {
+        unified.showFavoritesOnly
+            || showActiveSessionsOnly
+            || unified.projectSelection != nil
+            || !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func clearListFilters() {
+        unified.showFavoritesOnly = false
+        showActiveSessionsOnly = false
+        unified.projectSelection = nil
+        unified.queryDraft = ""
+        unified.recomputeNow()
+        searchCoordinator.cancel()
+    }
+
+	    /// "3,775 sessions" when nothing is filtered; "3,625 of 3,775 shown" when
+	    /// something is. The bare fraction said neither which number was which nor
+	    /// that a filter was responsible.
+	    private var footerSessionCountText: String {
+	        let visible = cachedRows.count
+	        let total = cachedTotalSessionCount
+	        guard footerIsFiltered else {
+	            return String(localized: "\(total) sessions", comment: "Footer count of sessions when nothing is filtered.")
+	        }
+	        let countText = String(localized: "\(visible) of \(total) shown",
+	                               comment: "Footer count of visible sessions out of the total while a filter is active.")
+	        if !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+	            // Say what search could not read from the index, so a miss is never silent.
+	            var notes: [String] = []
+	            if searchCoordinator.unindexedCount > 0 {
+	                notes.append(String(localized: "\(searchCoordinator.unindexedCount) not fully indexed yet",
+	                                    comment: "Footer: sessions not yet in the search index."))
+	            }
+	            if searchCoordinator.updatingCount > 0 {
+	                notes.append(String(localized: "\(searchCoordinator.updatingCount) updating",
+	                                    comment: "Footer: sessions changed since they were indexed; their newest text is read directly."))
+	            }
+	            if searchCoordinator.skippedCount > 0 {
+	                notes.append(String(localized: "\(searchCoordinator.skippedCount) with parts too large to index",
+	                                    comment: "Footer: sessions holding single events too large for search to read."))
+	            }
+	            if !notes.isEmpty { return ([countText] + notes).joined(separator: " | ") }
+	        }
+	        if unified.showFavoritesOnly {
+	            return String(localized: "\(countText) | Saved only", comment: "Footer session count while the saved-only filter is enabled.")
+	        }
+	        return countText
+	    }
+
+	    private var footerQuotas: [QuotaData] {
+	        // Footer switched off: no meters, whatever tracking is doing. Tracking itself
+	        // keeps running for the menu bar and the Quota Meter.
+	        guard showFooterUsage else { return [] }
+	        var out: [QuotaData] = []
+	        if codexAgentEnabled && codexUsageEnabled {
+	            out.append(.codex(from: codexUsageModel))
+	        }
+	        if claudeAgentEnabled && claudeUsageEnabled {
+	            out.append(.claude(from: claudeUsageModel))
+	        }
+	        return out
+	    }
+
+	    @MainActor
+	    private func updateFooterUsageVisibility() {
+	        // `stripVisible` is only the FOOTER's claim on polling — the menu bar and a
+	        // visible/pinned Quota Meter register their own (see propagateVisibility), so
+	        // hiding the footer stops it asking for refreshes without starving them.
+	        codexUsageModel.setStripVisible(showFooterUsage && codexAgentEnabled && codexUsageEnabled)
+	        claudeUsageModel.setStripVisible(showFooterUsage && claudeAgentEnabled && claudeUsageEnabled)
+	    }
+
+    private func restoreFromArchive(_ session: Session) {
+        guard let path = unified.claudeArchiveSidecarPath(for: session) else { return }
+        do {
+            try ClaudeArchiveRestore.restore(sidecarPath: path) // reads the gate via isEnabled
+            showRestoredRelaunch = true
+            // Optimistic overlay mutation: clear the archived flag in place.
+            if let key = session.claudeArchiveJoinKey, var rec = unified.claudeArchive[key] {
+                rec = ClaudeDesktopSidecarRecord(cliSessionID: rec.cliSessionID, title: rec.title,
+                                                 isArchived: false, autoArchiveExempt: true,
+                                                 sidecarPath: rec.sidecarPath, modifiedAt: rec.modifiedAt)
+                unified.applyOptimisticClaudeArchive(rec, for: key)
+            }
+        } catch {
+            NSLog("Claude archive restore failed: \(error)")
+        }
+    }
+
+    private func copySessionID(_ id: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(id, forType: .string)
+    }
+
+    private func copyableSessionID(for session: Session) -> String? {
+        if session.isSideChat {
+            return nonEmptySessionID(session.parentSessionID)
+        }
+        if session.source == .antigravity {
+            return AntigravitySessionIDHelper.deriveSessionID(from: session)
+        }
+        if session.source == .openclaw, session.id.hasPrefix("openclaw:") {
+            // Internal key is "openclaw:<agent>:<uuid>"; the OpenClaw session id is the uuid.
+            let parts = session.id.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+            if parts.count == 3 { return nonEmptySessionID(String(parts[2])) }
+        }
+        return nonEmptySessionID(session.id)
+    }
+
+    private func nonEmptySessionID(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    /// Same shape as `canResumeSession`: the registry gate is a source-level pre-filter,
+    /// and the per-source arms below stay because several of them are narrower than it
+    /// (codex additionally needs a resolvable session id, antigravity a derivable one).
+    private func canCopyResumeCommand(_ session: Session, antigravityCLISessionID: String? = nil) -> Bool {
+        guard session.source.descriptor.supportsResume else { return false }
+        switch session.source {
+        case .claude:
+            return true // falls back to --continue
+        case .codex:
+            return canResumeCodexInCLI(session)
+                && (session.codexInternalSessionID != nil || session.codexFilenameUUID != nil)
+        case .opencode:
+            return true // session.id is the SQLite session ID; falls back to --continue
+        case .hermes:
+            return true
+        case .copilot:
+            return true // session.id from session.start; falls back to --continue
+        case .cursor:
+            return session.surface != .acp // ACP persists through ACP session/load, not Cursor CLI resume
+        case .pi:
+            return true // session file path or id; falls back to --continue
+        case .kimi:
+            // session.id is the on-disk session dir. `--continue` is only a
+            // valid fallback when the working directory is known, so
+            // copyResumeCommand may still decline; see its .kimi arm.
+            return true
+        case .grok:
+            // session.id is the on-disk session dir (a bare UUIDv7).
+            // `--continue` is only a valid fallback when the working directory
+            // is known, so copyResumeCommand may still decline; see its .grok arm.
+            return true
+        case .qwen:
+            // The installed CLI resolves IDs only from active `chats`.
+            return QwenResumeEligibility.canCopyResumeCommand(session)
+        case .devin:
+            // session.id is the `sessions.id` slug, which `--resume` accepts
+            // directly. `--continue` remains the fallback when it is absent.
+            // A probe that advertised neither flag yields no plan; mirror that
+            // here so the menu item disables instead of silently doing nothing.
+            // Must stay the pure predicate: `copyCommandPlan` heals a stale cache
+            // by writing published state and spawning a probe, which is not
+            // something a ViewBuilder may do.
+            return DevinSettings.shared.canBuildCopyCommandPlan(sessionID: session.id)
+        case .fx:
+            // session.id is the on-disk session directory name, which
+            // `--resume <id>` accepts directly. `--continue` remains the
+            // fallback when it is absent. A probe that advertised neither flag
+            // yields no plan; mirror that here so the menu item disables
+            // instead of silently doing nothing.
+            // Must stay the pure predicate: `copyCommandPlan` heals a stale cache
+            // by writing published state and spawning a probe, which is not
+            // something a ViewBuilder may do.
+            return FxSettings.shared.canBuildCopyCommandPlan(sessionID: session.id)
+        case .antigravity:
+            return (antigravityCLISessionID ?? AntigravitySessionIDHelper.deriveSessionID(from: session)) != nil
+        case .droid, .openclaw, .cline, .deepseekHarness:
+            // Old `default: return false` — no resume command exists to copy. Unreachable
+            // behind the `supportsResume` guard; explicit so a new source must decide.
+            return false
+        }
+    }
+
+    private func copyResumeCommand(_ session: Session, antigravityCLISessionID: String? = nil) {
+        // Clear only when there is something to write. Several arms below bail
+        // out on a `guard` -- an unresolvable session id, a Kimi session with no
+        // working directory -- and clearing up front meant those refusals wiped
+        // whatever the user already had on the clipboard and put nothing back.
+        let write: (String) -> Void = { command in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(command, forType: .string)
+        }
+
+        guard session.source.descriptor.supportsResume else { return }
+        guard session.surface != .acp else { return }
+
+        switch session.source {
+        case .claude:
+            let settings = ClaudeResumeSettings.shared
+            let sid = ClaudeSessionIDHelper.deriveSessionID(from: session)
+            let wd = ClaudeSessionIDHelper.projectRoot(for: session)
+            let binary = settings.binaryPath.isEmpty ? "claude" : settings.binaryPath
+            let builder = ClaudeResumeCommandBuilder()
+            let core: String
+            if let id = sid, !id.isEmpty {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --resume \(builder.shellQuoteIfNeeded(id))"
+            } else {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .codex:
+            let settings = CodexResumeSettings.shared
+            guard let sid = session.codexInternalSessionID ?? session.codexFilenameUUID else { return }
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryOverride.isEmpty ? "codex" : settings.binaryOverride
+            let builder = CodexResumeCommandBuilder()
+            let core = "\(builder.shellQuoteIfNeeded(binary)) resume \(builder.shellQuoteIfNeeded(sid))"
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0)) && \(core)" } ?? core
+            write(command)
+
+        case .opencode:
+            let settings = OpenCodeSettings.shared
+            let sid = session.id
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryPath.isEmpty ? "opencode" : settings.binaryPath
+            let builder = OpenCodeResumeCommandBuilder()
+            let core: String
+            if !sid.isEmpty {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --session \(builder.shellQuoteIfNeeded(sid))"
+            } else {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .hermes:
+            let settings = HermesSettings.shared
+            let sid = session.id
+            let wd = effectiveWorkingDirectoryURL(for: session)
+            let binary = settings.binaryPath.isEmpty ? "hermes" : settings.binaryPath
+            let builder = HermesResumeCommandBuilder()
+            let core = !sid.isEmpty
+                ? "\(builder.shellQuoteIfNeeded(binary)) --resume \(builder.shellQuoteIfNeeded(sid))"
+                : "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .copilot:
+            let settings = CopilotSettings.shared
+            let sid = session.id
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryPath.isEmpty ? "copilot" : settings.binaryPath
+            let builder = CopilotResumeCommandBuilder()
+            let core: String
+            if !sid.isEmpty {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --resume=\(builder.shellQuoteIfNeeded(sid))"
+            } else {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .cursor:
+            let settings = CursorSettings.shared
+            let sid = session.id
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let plan = settings.copyCommandPlan(sessionID: sid)
+            let builder = CursorResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy, binaryCommand: plan.binary) else { return }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .pi:
+            let settings = PiSettings.shared
+            let sid = session.id
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            guard let plan = settings.copyCommandPlan(sessionID: sid) else { return }
+            let builder = PiResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy,
+                                                          binaryCommand: plan.binary,
+                                                          sessionDirectory: plan.sessionDirectory?.path) else { return }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .kimi:
+            let settings = KimiSettings.shared
+            let wd = effectiveWorkingDirectoryURL(for: session)
+            guard let plan = settings.copyCommandPlan(sessionID: session.id) else { return }
+            // Same refusal as KimiResumeCoordinator: `--continue` resolves
+            // against the working directory, so without a `cd` it would hand the
+            // user a command that reopens an unrelated session.
+            if case .continueMostRecent = plan.strategy, wd == nil { return }
+            let builder = KimiResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy,
+                                                          binaryCommand: plan.binary) else { return }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .grok:
+            let settings = GrokSettings.shared
+            let wd = effectiveWorkingDirectoryURL(for: session)
+            guard let plan = settings.copyCommandPlan(sessionID: session.id) else { return }
+            // Same refusal as GrokResumeCoordinator: `--continue` resolves
+            // against the working directory, so without a `cd` it would hand the
+            // user a command that reopens an unrelated session.
+            if case .continueMostRecent = plan.strategy, wd == nil { return }
+            let builder = GrokResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy,
+                                                          binaryCommand: plan.binary) else { return }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .qwen:
+            let storageContext = QwenResumeEligibility.configuredStorageContext()
+            guard QwenResumeEligibility.canCopyResumeCommand(
+                session,
+                storageContext: storageContext
+            ) else { return }
+            let settings = QwenSettings.shared
+            let wd = effectiveWorkingDirectoryURL(for: session)
+            guard let plan = settings.copyCommandPlan(sessionID: session.id) else { return }
+            if case .continueMostRecent = plan.strategy, wd == nil { return }
+            let builder = QwenResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy,
+                                                          binaryCommand: plan.binary,
+                                                          storageEnvironmentOverride: storageContext.environmentOverride) else { return }
+            let command = wd.map { "cd \(ShellQuoting.quoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .devin:
+            let settings = DevinSettings.shared
+            let wd = effectiveWorkingDirectoryURL(for: session)
+            guard let plan = settings.copyCommandPlan(sessionID: session.id) else { return }
+            // Same refusal as DevinResumeCoordinator: `--continue` resolves
+            // against the working directory, so without a `cd` it would hand the
+            // user a command that reopens an unrelated session.
+            if case .continueMostRecent = plan.strategy, wd == nil { return }
+            let builder = DevinResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy,
+                                                          binaryCommand: plan.binary) else { return }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .fx:
+            let settings = FxSettings.shared
+            let wd = effectiveWorkingDirectoryURL(for: session)
+            guard let plan = settings.copyCommandPlan(sessionID: session.id) else { return }
+            // Same refusal as FxResumeCoordinator: `--continue` reopens the
+            // latest session for the workspace, so without a `cd` it would hand
+            // the user a command that reopens an unrelated session.
+            if case .continueMostRecent = plan.strategy, wd == nil { return }
+            let builder = FxResumeCommandBuilder()
+            guard let core = try? builder.makeCoreCommand(strategy: plan.strategy,
+                                                          binaryCommand: plan.binary) else { return }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .antigravity:
+            let settings = AntigravityCLISettings.shared
+            guard let sid = antigravityCLISessionID ?? AntigravitySessionIDHelper.deriveSessionID(from: session) else { return }
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryOverride.isEmpty ? "agy" : settings.binaryOverride
+            let builder = AntigravityResumeCommandBuilder()
+            let core = "\(builder.shellQuoteIfNeeded(binary)) --conversation \(builder.shellQuoteIfNeeded(sid))"
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            write(command)
+
+        case .droid, .openclaw, .cline, .deepseekHarness:
+            // Old `default: break` — neither ships a resume command to copy. Unreachable
+            // behind the `supportsResume` guard above; explicit so a new source
+            // cannot silently become a no-op here.
+            break
+        }
+    }
+
+    private var transcriptPane: some View {
+		        return ZStack {
+	            // Base host is always mounted to keep a stable split subview identity
+	            TranscriptHostView(kind: settledSelectedSession?.source
+                                   ?? settledSelectionSource
+                                   ?? lastSelectedSource,
+	                               selection: settledSelection,
+	                               catalog: catalog)
+                .environmentObject(focusCoordinator)
+                .environmentObject(searchState)
+                .id("transcript-host")
+                .transaction { txn in txn.disablesAnimations = true }
+                // Keep provider views mounted, but let this pane alone own the
+                // empty-selection message instead of painting two placeholders.
+                .opacity(settledSelection == nil ? 0 : 1)
+                .allowsHitTesting(settledSelection != nil)
+                .accessibilityHidden(settledSelection == nil)
+
+            if shouldShowLaunchOverlay {
+                launchBlockingTranscriptOverlay()
+            } else if let s = settledSelectedSession {
+                if !s.isSideChat && !CodexRolloutStorage.exists(atPath: s.filePath) {
+                    let providerName: String = s.source.descriptor.shortLabel
+                    let accent: Color = sourceAccent(s)
+                    VStack(spacing: 12) {
+                        Label("Session file not found", systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline)
+                            .foregroundStyle(accent)
+                        Text("This \(providerName) session was removed by the system or CLI.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Button("Remove") { if let id = settledSelection { unified.removeSession(id: id) } }
+                                .buttonStyle(.borderedProminent)
+                            Button("Re-scan") { unified.refresh() }
+                                .buttonStyle(.bordered)
+                            Button("Locate…") { revealParentOfMissing(s) }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(nsColor: .textBackgroundColor))
+                } else if s.source == .antigravity, antigravityIndexer.unreadableSessionIDs.contains(s.id) {
+                    VStack(spacing: 12) {
+                        Label("Could not open session", systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline)
+                            .foregroundStyle(sourceAccent(s))
+                        Text("This Antigravity session could not be parsed. It may be truncated or corrupted.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Button("Open in Finder") { revealSessionFile(s) }
+                                .buttonStyle(.borderedProminent)
+                            Button("Re-scan") { unified.refresh() }
+                                .buttonStyle(.bordered)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(nsColor: .textBackgroundColor))
+                }
+            } else if settledSelection == nil {
+                Text("Select a session to view transcript")
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .transaction { txn in txn.disablesAnimations = true }
+        .simultaneousGesture(TapGesture().onEnded {
+            NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+        })
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            paneAnchoredToolbarContent
+        } else {
+            classicToolbarContent
+        }
+    }
+
+    /// macOS 15 and earlier: the established layout, kept as-is. Filters sit in the
+    /// centered principal slot, search and actions trail.
+    @ToolbarContentBuilder
+    private var classicToolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            HStack(spacing: 12) {
+                sessionFilterControls
+            }
+            .controlSize(.small)
+            .tint(UnifiedSessionsStyle.selectionAccent)
+        }
+        ToolbarItem(placement: .automatic) {
+            sessionSearchField
+                .frame(maxWidth: 520)
+        }
+        if unified.projectSelection != nil {
+            ToolbarItem(placement: .automatic) {
+                projectFilterBadge
+            }
+        }
+        ToolbarItemGroup(placement: .automatic) {
+            sessionActionControls
+        }
+    }
+
+    /// macOS 26 (issue #92): Tahoe draws a glass capsule around each toolbar group
+    /// and the window-centered principal slot straddled the list/transcript divider,
+    /// so nothing read as belonging to either pane. Here every control that scopes
+    /// the session list (filters, search, project badge) is one leading group whose
+    /// width ends at the divider, and the selected-session actions trail over the
+    /// transcript. Glass is hidden so both groups keep the Sequoia look.
+    @available(macOS 26.0, *)
+    @ToolbarContentBuilder
+    private var paneAnchoredToolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            SessionListToolbarGroup(anchor: sessionListToolbarAnchor) { width in
+                SessionListToolbarRow(unified: unified, search: searchCoordinator, focus: focusCoordinator,
+                                      searchState: searchState, filters: sessionListFilterModel,
+                                      fillsWidth: width != nil)
+            }
+        }
+        .sharedBackgroundVisibility(.hidden)
+
+        ToolbarSpacer(.flexible)
+
+        ToolbarItemGroup(placement: .primaryAction) {
+            sessionActionControls
+        }
+        .sharedBackgroundVisibility(.hidden)
+    }
+
+    private var sessionSearchField: some View {
+        UnifiedSearchFiltersView(unified: unified, search: searchCoordinator, focus: focusCoordinator, searchState: searchState)
+    }
+
+    private var projectFilterBadge: some View {
+        UnifiedProjectFilterBadgeView(unified: unified, onClear: { applyProjectSelection(nil) })
+    }
+
+    /// Everything the macOS 26 session-list row needs from this view's state.
+    private var sessionListFilterModel: SessionListFilterModel {
+        var pinned: [AgentToolbarSpec] = []
+        if codexAgentEnabled {
+            pinned.append(AgentToolbarSpec(id: SessionSource.codex.rawValue, title: "Codex", color: .agentCodex,
+                                           isOn: $unified.includeCodex, shortcut: "1"))
+        }
+        if claudeAgentEnabled {
+            pinned.append(AgentToolbarSpec(id: SessionSource.claude.rawValue, title: "Claude", color: .agentClaude,
+                                           isOn: $unified.includeClaude, shortcut: "2"))
+        }
+        return SessionListFilterModel(
+            liveOnly: $showActiveSessionsOnly,
+            liveFeatureEnabled: liveSessionsFeatureEnabled,
+            hierarchy: $showSubagentHierarchy,
+            isHierarchyBrowsing: isHierarchyBrowsing,
+            canCollapseAll: isHierarchyBrowsing && !currentExpandableParentIDs.isEmpty,
+            canExpandAll: isHierarchyBrowsing && !collapsedParents.isEmpty,
+            collapseAll: { collapseAllHierarchyParents() },
+            expandAll: { expandAllHierarchyParents() },
+            pinnedAgents: pinned,
+            otherAgents: enabledOtherAgentSpecs,
+            isMonochrome: stripMonochrome,
+            clearProject: { applyProjectSelection(nil) }
+        )
+    }
+
+    @ViewBuilder
+    private var sessionFilterControls: some View {
+                ActiveSessionsOnlyToggle(isOn: $showActiveSessionsOnly)
+                    .disabled(!liveSessionsFeatureEnabled)
+                    .help(
+                        liveSessionsFeatureEnabled
+                            ? "Show only live sessions in the list (Codex, Claude)"
+                            : "Enable live session detection (Beta) in Settings → Quota Meter."
+                    )
+
+                Button(action: { showSubagentHierarchy.toggle() }) {
+                    Image(systemName: showSubagentHierarchy ? "list.bullet.indent" : "list.bullet")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(showSubagentHierarchy ? Color.accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(showSubagentHierarchy ? "Flat session list (⇧⌘H)" : "Show subagent hierarchy (⇧⌘H)")
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+
+                // Collapse/Expand-all only apply while browsing the subagent
+                // hierarchy, so keep them out of the toolbar entirely in the
+                // common flat-list mode rather than showing them disabled.
+                if isHierarchyBrowsing {
+                    ToolbarIconButton(help: "Collapse all visible parent sessions") { isHovering in
+                        ToolbarIcon(systemName: "arrow.down.right.and.arrow.up.left", opacity: isHovering ? 1 : 0.55)
+                    } action: {
+                        collapseAllHierarchyParents()
+                    }
+                    .disabled(currentExpandableParentIDs.isEmpty)
+
+                    ToolbarIconButton(help: "Expand all visible parent sessions") { isHovering in
+                        ToolbarIcon(systemName: "arrow.up.left.and.arrow.down.right", opacity: isHovering ? 1 : 0.55)
+                    } action: {
+                        expandAllHierarchyParents()
+                    }
+                    .disabled(collapsedParents.isEmpty)
+                }
+
+                if codexAgentEnabled {
+                    Button("") { unified.includeCodex.toggle() }
+                        .keyboardShortcut("1", modifiers: .command)
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+
+                    AgentTabToggle(title: "Codex", color: Color.agentCodex,
+                                   isMonochrome: stripMonochrome, isOn: $unified.includeCodex)
+                        .help("Show or hide Codex sessions (⌘1)")
+                }
+
+                if claudeAgentEnabled {
+                    Button("") { unified.includeClaude.toggle() }
+                        .keyboardShortcut("2", modifiers: .command)
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+
+                    AgentTabToggle(title: "Claude", color: Color.agentClaude,
+                                   isMonochrome: stripMonochrome, isOn: $unified.includeClaude)
+                        .help("Show or hide Claude sessions (⌘2)")
+                }
+
+                // Codex + Claude stay as pills; the remaining enabled agents show
+                // as pills while the toolbar is uncrowded, and collapse into a
+                // filter menu once more than four agents are enabled (⌘ shortcuts
+                // are preserved either way).
+                agentToggleControls()
+    }
+
+    // Ranked by how often a control is reached for without thinking. Three
+    // action glyphs, two view toggles, and one menu for everything that is
+    // looked for rather than reflexed at — a named menu row is more
+    // discoverable than an unlabelled glyph, not less.
+    @ViewBuilder
+    private var sessionActionControls: some View {
+            ToolbarIconButton(
+                help: liveSessionsFeatureEnabled
+                    ? "Open the Quota Meter."
+                    : "Enable live session detection (Beta) in Settings → Quota Meter."
+            ) { _ in
+                ToolbarIcon(systemName: "rectangle.3.group")
+            } action: {
+                QuotaMeterPresentationCoordinator.shared.showQuotaMeter()
+            }
+            .disabled(!liveSessionsFeatureEnabled)
+            .accessibilityLabel(Text("Quota Meter"))
+
+            ToolbarIconButton(help: "Resume the selected session in its original CLI (⌃⌘R).") { _ in
+                ToolbarIcon(systemName: "terminal")
+            } action: {
+                if let s = selectedSession { resume(s) }
+            }
+            .keyboardShortcut("r", modifiers: [.command, .control])
+            .disabled(!canResumeSelectedSession)
+            .accessibilityLabel(Text("Resume"))
+
+            if let s = selectedSession, s.source == .codex, !s.isSideChat {
+                ToolbarIconButton(
+                    help: String(localized: "Continue this session in the local Codex Desktop. Codex Desktop must use the same session storage.",
+                                 comment: "Tooltip for opening the selected local thread in the separate Codex desktop app.")
+                ) { _ in
+                    ToolbarIcon(systemName: "macwindow")
+                } action: {
+                    openInCodexApp(s)
+                }
+                .disabled(CodexResumeCoordinator.appSessionID(for: s) == nil)
+                .accessibilityLabel(Text("Continue in Codex Desktop"))
+            }
+
+            ToolbarIconButton(help: imagesToolbarHelpText) { _ in
+                ToolbarIcon(systemName: "photo.on.rectangle")
+            } action: {
+                showImagesForSelectedSession(showNoSelectionAlert: true)
+            }
+            .disabled(selectedSession == nil)
+            .accessibilityLabel(Text("Image Browser"))
+
+            ToolbarGroupDivider()
+
+            ToolbarIconToggle(
+                isOn: $showTranscriptWindow,
+                onSymbol: "sidebar.right",
+                offSymbol: "sidebar.right",
+                help: showTranscriptWindow ? "Hide Transcript window" : "Show Transcript window",
+                activeColor: .primary,
+                accessibilityLabel: "Transcript Window"
+            )
+
+            // A meter, not an "about" glyph: the panel reports what the session
+            // consumed. `info.circle` reads as Help everywhere else in macOS and
+            // sat one slot from the sidebar toggle at identical weight.
+            ToolbarIconToggle(
+                isOn: $showSessionInfo,
+                onSymbol: "gauge.with.needle.fill",
+                offSymbol: "gauge.with.needle",
+                help: showSessionInfo ? "Hide Session info (⇧⌘I)" : "Show Session info (⇧⌘I)",
+                activeColor: .primary,
+                accessibilityLabel: "Session info"
+            )
+            .disabled(!showTranscriptWindow)
+
+            ToolbarGroupDivider()
+
+            mainOverflowMenu
+
+            // Menu content is built lazily, so a shortcut declared only inside
+            // `mainOverflowMenu` is dead until the menu is first opened. Same
+            // workaround the source pills already use when they collapse into
+            // AgentOverflowMenu.
+            overflowMenuShortcuts
+    }
+
+    @ViewBuilder
+    private var overflowMenuShortcuts: some View {
+        hiddenShortcut(key: "k", modifiers: .command) {
+            NotificationCenter.default.post(name: .toggleAnalyticsWindow, object: nil)
+        }
+        hiddenShortcut(key: "o", modifiers: [.command, .shift]) {
+            if let s = selectedSession { openDir(s) }
+        }
+        hiddenShortcut(key: "r", modifiers: .command) {
+            guard !unified.isIndexing, !unified.isProcessingTranscripts else { return }
+            activeCodexSessions.refreshNow()
+            unified.refresh()
+        }
+    }
+
+    private func hiddenShortcut(key: KeyEquivalent,
+                                modifiers: EventModifiers,
+                                action: @escaping () -> Void) -> some View {
+        Button("", action: action)
+            .keyboardShortcut(key, modifiers: modifiers)
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+    }
+
+    /// The analytics build state used to be a badge on a glyph. As a menu row it
+    /// says the state in words instead, which is the whole reason the item moved.
+    private var layoutMenuTitle: String {
+        layoutMode == .vertical
+            ? String(localized: "Switch to Horizontal Split")
+            : String(localized: "Switch to Vertical Split")
+    }
+
+    private var analyticsMenuTitle: String {
+        switch analyticsPhase {
+        case .queued, .building: return String(localized: "Analytics (building…)")
+        case .failed: return String(localized: "Analytics (last build failed)")
+        case .canceled: return String(localized: "Analytics (build canceled)")
+        case .ready, .idle:
+            if analyticsIsStale { return String(localized: "Analytics (update available)") }
+            return analyticsReady
+                ? String(localized: "Analytics")
+                : String(localized: "Analytics (build required)")
+        }
+    }
+
+    /// Everything below daily use. Each item keeps its shortcut and gains a name.
+    @ViewBuilder
+    private var mainOverflowMenu: some View {
+        Menu {
+            Button(analyticsMenuTitle) {
+                NotificationCenter.default.post(name: .toggleAnalyticsWindow, object: nil)
+            }
+
+            Divider()
+
+            Button("Reveal Working Directory in Finder") {
+                if let s = selectedSession { openDir(s) }
+            }
+            .disabled(selectedSession == nil)
+
+            Button(layoutMenuTitle) { onToggleLayout() }
+
+            Divider()
+
+            Button(unified.isIndexing || unified.isProcessingTranscripts
+                   ? "Reindexing…" : "Reindex Now") {
+                activeCodexSessions.refreshNow()
+                unified.refresh()
+            }
+            .disabled(unified.isIndexing || unified.isProcessingTranscripts)
+
+            Divider()
+
+            Button(effectiveColorScheme == .dark ? "Switch to Light Mode" : "Switch to Dark Mode") {
+                codexIndexer.toggleDarkLight(systemScheme: systemColorScheme)
+            }
+
+            Button("Settings…") {
+                PreferencesWindowController.shared.show(indexer: codexIndexer,
+                                                        updaterController: updaterController)
+            }
+        } label: {
+            ToolbarIcon(systemName: "ellipsis")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize(horizontal: true, vertical: false)
+        .help("More options")
+        .accessibilityLabel(Text("More options"))
+    }
+
+    /// Enabled agents other than Codex/Claude (which always render as segmented pills),
+    /// in the fixed order they've historically appeared in the toolbar.
+    ///
+    /// Derived from the registry (K10): a source shows an "other agent" pill exactly when
+    /// its descriptor carries a `PillSpec`, which is true for the ten non-Codex/Claude
+    /// sources and nobody else. `SessionSourceRegistry.ordered` *is* the historical toolbar
+    /// order once Codex and Claude drop out, and title / color / ⌘-shortcut all come from
+    /// the descriptor, so adding a source no longer means editing this file. The pinned
+    /// values live in `SessionSourceRegistryTests` (pill colors, shortcuts, short labels)
+    /// and `ViewRegistryDerivationTests` (the derivation itself).
+    private var enabledOtherAgentSpecs: [AgentToolbarSpec] {
+        SessionSourceRegistry.ordered.compactMap { adapter -> AgentToolbarSpec? in
+            let descriptor = adapter.descriptor
+            guard let pill = descriptor.otherAgentPill else { return nil }
+            guard unified.isAgentEnabled(descriptor.source) else { return nil }
+            return AgentToolbarSpec(
+                id: descriptor.source.rawValue,
+                title: descriptor.shortLabel,
+                color: pill.color,
+                isOn: includeBinding(for: descriptor.source),
+                // ⌘3–⌘9 are frozen history and run out before hermes/kimi/grok, which is
+                // why `PillSpec.shortcut` is optional rather than derived.
+                shortcut: pill.shortcut.flatMap(\.first).map { KeyEquivalent($0) }
+            )
+        }
+    }
+
+    /// The source-filter toggle a pill drives. THE one place this view names the registered
+    /// `include…` properties, and exhaustive on purpose: a new source has to say
+    /// which toggle its pill flips rather than falling through a `default:`.
+    private func includeBinding(for source: SessionSource) -> Binding<Bool> {
+        switch source {
+        case .codex:       return $unified.includeCodex
+        case .claude:      return $unified.includeClaude
+        case .antigravity: return $unified.includeAntigravity
+        case .opencode:    return $unified.includeOpenCode
+        case .hermes:      return $unified.includeHermes
+        case .copilot:     return $unified.includeCopilot
+        case .droid:       return $unified.includeDroid
+        case .openclaw:    return $unified.includeOpenClaw
+        case .cursor:      return $unified.includeCursor
+        case .pi:          return $unified.includePi
+        case .kimi:        return $unified.includeKimi
+        case .grok:        return $unified.includeGrok
+        case .qwen:        return $unified.includeQwen
+        case .devin:       return $unified.includeDevin
+        case .fx:          return $unified.includeFx
+        case .cline:       return $unified.includeCline
+        case .deepseekHarness: return $unified.includeDeepSeekHarness
+        }
+    }
+
+    /// Total enabled agents including Codex/Claude — drives when the other agents
+    /// collapse into the overflow menu.
+    private var enabledAgentCount: Int {
+        (unified.isAgentEnabled(.codex) ? 1 : 0)
+            + (unified.isAgentEnabled(.claude) ? 1 : 0)
+            + enabledOtherAgentSpecs.count
+    }
+
+    @ViewBuilder
+    private func agentToggleControls() -> some View {
+        let specs = enabledOtherAgentSpecs
+        if enabledAgentCount > 4 {
+            AgentOverflowMenu(specs: specs)
+            // Keep ⌘3–9 working while the pills are collapsed into the menu.
+            ForEach(specs) { spec in
+                if let sc = spec.shortcut {
+                    Button("") { spec.isOn.wrappedValue.toggle() }
+                        .keyboardShortcut(sc, modifiers: .command)
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+                }
+            }
+        } else {
+            ForEach(specs) { spec in
+                agentPill(spec)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func agentPill(_ spec: AgentToolbarSpec) -> some View {
+        let pill = AgentTabToggle(title: spec.title, color: spec.color, isMonochrome: stripMonochrome, isOn: spec.isOn)
+            .help("Show or hide \(spec.title) sessions in the list")
+        if let sc = spec.shortcut {
+            pill.keyboardShortcut(sc, modifiers: .command)
+        } else {
+            pill
+        }
+    }
+
+            private var selectedSession: Session? { selection.flatMap { id in cachedRowByID[id] } }
+            private var settledSelectedSession: Session? {
+                settledSelection.flatMap { id in cachedRowByID[id] }
+            }
+
+            static func sideChatParentContexts(for rows: [Session],
+                                                       allSessions: [Session]) -> [String: String] {
+                let candidates = rows + allSessions
+                var titleByParentKey: [String: String] = [:]
+                titleByParentKey.reserveCapacity(candidates.count * 2)
+                for session in candidates where !session.isSideChat {
+                    let title = session.listTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !title.isEmpty else { continue }
+                    titleByParentKey[session.id] = title
+                    if let internalID = session.codexInternalSessionIDHint?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !internalID.isEmpty {
+                        titleByParentKey[internalID] = title
+                    }
+                }
+
+                var contexts: [String: String] = [:]
+                for session in rows where session.isSideChat {
+                    guard let parentID = session.parentSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !parentID.isEmpty else {
+                        continue
+                    }
+                    contexts[session.id] = titleByParentKey[parentID] ?? shortenedParentID(parentID)
+                }
+                return contexts
+            }
+
+            private static func shortenedParentID(_ id: String) -> String {
+                guard id.count > 12 else { return id }
+                return "\(id.prefix(8))…"
+            }
+
+            private var currentExpandableParentIDs: Set<String> {
+                guard isHierarchyBrowsing else { return [] }
+                return cachedExpandableParentIDs
+            }
+
+            private var parentIDForSelectedHierarchyChild: String? {
+                UnifiedHierarchyCommandPolicy.parentIDForSelectedHierarchyChild(
+                    rowIDs: cachedRowIDs,
+                    rowMeta: hierarchyRowMeta,
+                    selectedID: selection
+                )
+            }
+
+            private func collapseAllHierarchyParents() {
+                let parentIDs = currentExpandableParentIDs
+                guard !parentIDs.isEmpty else { return }
+                if let parentID = parentIDForSelectedHierarchyChild,
+                   let parent = cachedRows.first(where: { $0.id == parentID }) {
+                    setActiveSelection(parentID, source: parent.source, userInitiated: false)
+                }
+                collapsedParents = UnifiedHierarchyCommandPolicy.collapsedParentsAfterCollapseAll(
+                    existing: collapsedParents,
+                    visibleParentIDs: parentIDs
+                )
+            }
+
+            private func expandAllHierarchyParents() {
+                guard isHierarchyBrowsing else { return }
+                guard !collapsedParents.isEmpty else { return }
+                collapsedParents = UnifiedHierarchyCommandPolicy.collapsedParentsAfterExpandAll(
+                    existing: collapsedParents,
+                    visibleParentIDs: currentExpandableParentIDs
+                )
+            }
+
+            private func loadPersistedCollapsedParentsIfNeeded() {
+                guard !hasLoadedPersistedCollapsedParents else { return }
+                hasLoadedPersistedCollapsedParents = true
+                collapsedParents = Self.decodeCollapsedHierarchyParents(collapsedHierarchyParentsRaw)
+            }
+
+            private func persistCollapsedParents() {
+                collapsedHierarchyParentsRaw = Self.encodeCollapsedHierarchyParents(collapsedParents)
+            }
+
+            private static func encodeCollapsedHierarchyParents(_ ids: Set<String>) -> String {
+                ids.sorted().joined(separator: "\n")
+            }
+
+            private static func decodeCollapsedHierarchyParents(_ raw: String) -> Set<String> {
+                Set(raw.split(separator: "\n").map(String.init))
+            }
+
+		    private var tableSingleSelection: Binding<String?> {
+	        Binding(
+	            get: {
+	                guard let id = selection else { return nil }
+                    guard UnifiedTableSelectionPolicy.shouldExposeCanonicalSelectionToTable(
+                        selectionPresentInRows: cachedVisibleRowIDs.contains(id)
+                    ) else {
+                        return nil
+                    }
+	                return id
+	            },
+	                    set: { newID in
+						if let newID {
+							let source = cachedRowByID[newID]?.source
+							selectionTrace("table set newID=\(newID) source=\(source?.rawValue ?? "nil")")
+	                    setActiveSelection(newID, source: source, userInitiated: true)
+	                    autoSelectEnabled = false
+	                    NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+	                    return
+	                }
+
+	                let shouldClearSelection = UnifiedTableSelectionPolicy
+	                    .shouldClearCanonicalSelectionOnTableDeselection(
+	                        isDatasetChurning: isDatasetChurning,
+	                        currentSelectionID: selection,
+		                        visibleRowIDs: cachedVisibleRowIDs
+		                    )
+	                let userInitiated = isLikelyUserInitiatedTableDeselection()
+	                selectionTrace(
+		                    "table clear-request current=\(selection ?? "nil") shouldClear=\(shouldClearSelection) userInitiated=\(userInitiated) churning=\(isDatasetChurning) visibleCount=\(cachedVisibleRowIDs.count)"
+	                )
+	                guard userInitiated else { return }
+	                guard shouldClearSelection else { return }
+	                setActiveSelection(nil, userInitiated: true)
+	                autoSelectEnabled = false
+	                NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+	            }
+	        )
+	    }
+
+    private var imagesToolbarHelpText: String {
+        return "Show images for the selected session"
+    }
+
+	    @MainActor
+	    private func setActiveSelection(_ id: String?, source: SessionSource? = nil, userInitiated: Bool) {
+		        selectionTrace("setActiveSelection id=\(id ?? "nil") source=\(source?.rawValue ?? "nil") userInitiated=\(userInitiated)")
+	        if userInitiated {
+	            hasUserManuallySelected = true
+	        }
+	        selection = id
+
+	        guard let id else { return }
+
+	        if let source {
+	            selectionSource = source
+	            lastSelectedSource = source
+	            return
+	        }
+
+	        if let row = cachedRows.first(where: { $0.id == id }) {
+	            selectionSource = row.source
+	            lastSelectedSource = row.source
+	        }
+	    }
+
+	    @MainActor
+	    private func ensureDefaultSelectionIfNeeded() {
+	        guard selection == nil, !hasUserManuallySelected else { return }
+	        guard let first = cachedRows.first else { return }
+	        setActiveSelection(first.id, source: first.source, userInitiated: false)
+	    }
+
+	    @MainActor
+	    private func refreshSelectionSourceFromCachedRows() {
+	        guard let id = selection else { return }
+	        guard let row = cachedRows.first(where: { $0.id == id }) else { return }
+	        selectionSource = row.source
+	        lastSelectedSource = row.source
+	        selectionTrace("refreshSelectionSource id=\(id) source=\(row.source.rawValue)")
+	    }
+
+	    private func isLikelyUserInitiatedTableDeselection() -> Bool {
+	        guard let event = NSApp.currentEvent else { return false }
+	        switch event.type {
+	        case .leftMouseDown, .leftMouseUp,
+	             .rightMouseDown, .rightMouseUp,
+	             .otherMouseDown, .otherMouseUp,
+	             .keyDown:
+	            return true
+	        default:
+	            return false
+	        }
+	    }
+
+	    private var selectionTraceEnabled: Bool {
+	        ProcessInfo.processInfo.environment["AGENTSESSIONS_TRACE_SELECTION"] == "1"
+	            || UserDefaults.standard.bool(forKey: "DebugTraceSelection")
+	    }
+
+	    private func selectionTrace(_ message: @autoclosure () -> String) {
+	        #if DEBUG
+	        guard selectionTraceEnabled else { return }
+	        print("🧭[Selection] \(message())")
+	        #endif
+	    }
+
+    private func showImagesForSelectedSession(showNoSelectionAlert: Bool) {
+        guard let session = selectedSession else {
+            if showNoSelectionAlert {
+                showActionAlert(message: "Select a session to view images.")
+            }
+            return
+        }
+        CodexImagesWindowController.shared.show(session: session, allSessions: unified.allSessions)
+    }
+
+    /// Every resume coordinator returns a result carrying a user-facing error
+    /// string, and every call site used to discard it — so a CLI that could not
+    /// be found, a Warp that refused the launch, or a session with no working
+    /// directory all produced the same thing on screen: nothing at all. Removing
+    /// the launch-failure retry made that worse, since users previously got at
+    /// least *a* terminal.
+    private func reportResumeFailure(launched: Bool, error: String?, source: SessionSource, in window: NSWindow?) {
+        guard !launched else { return }
+        showActionAlert(message: error ?? "\(resumeAgentLabel(source)) could not resume this session.",
+                        in: window)
+    }
+
+    /// `preferredWindow` is the window the action started from. Attaching the
+    /// sheet there keeps a late failure tied to its origin, and lets it wait
+    /// politely if the user has since switched apps, rather than throwing an
+    /// app-modal panel over whatever they are now looking at.
+    private func showActionAlert(message: String, in preferredWindow: NSWindow? = nil) {
+        let alert = NSAlert()
+        alert.messageText = message
+        if let window = preferredWindow ?? NSApp.keyWindow, window.isVisible {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
+	    private func handleSelectionChange(_ id: String?) {
+		        guard let id, let s = cachedRowByID[id] else {
+	            cancelAutoJump()
+	            selectionPropagationTask?.cancel()
+	            selectionPropagationTask = nil
+	            settledSelection = nil
+	            settledSelectionSource = nil
+	            updateFocusedSessionIfNeeded(nil)
+		            return
+		        }
+	        ListScrubSignal.shared.noteSelectionChange()
+        // Only the cheap, selection-visual-relevant work runs synchronously in
+        // this SwiftUI update turn: the row lookup and presence-probe deferral.
+        // This is what lets the native selection highlight paint on the NEXT
+        // runloop turn instead of waiting behind transcript-pane teardown/reload —
+        // see the deferred block below. Search auto-jump is requested from inside
+        // that deferred block too (once selection settles), not here.
+        activeCodexSessions.deferExpensiveProbesForSelectionOpen()
+	        selectionSource = s.source
+	        lastSelectedSource = s.source
+
+        if searchState.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            cancelAutoJump()
+        }
+        // If a large, unparsed session is clicked during an active search, promote it in the coordinator.
+        let sizeBytes = s.fileSizeBytes ?? 0
+        if searchCoordinator.isRunning, s.events.isEmpty, sizeBytes >= 10 * 1024 * 1024 {
+            searchCoordinator.promote(id: s.id)
+        }
+
+        // Everything below triggers transcript-pane work (focus transition,
+        // per-source reload/parse, transcript prewarm). It waits for a short
+        // stability window instead of just the next runloop turn: key-repeat
+        // events during list scrubbing arrive every ~30-90ms, and a next-turn
+        // defer always lands between two of them, so the staleness guard used
+        // to pass for EVERY scrubbed row — each one fired a full transcript
+        // teardown+reload (measured 120-290% CPU, ~1s perceived latency,
+        // independent of list size). Debouncing to 150ms — comfortably above
+        // the key-repeat interval, but still imperceptible for a single
+        // click/arrow-key press — coalesces a whole scrub into one propagation
+        // for the row the user actually rests on.
+        selectionPropagationTask?.cancel()
+        // Sample the flag now, synchronously: isAutoSelectingFromSearch is reset by a
+        // DispatchQueue.main.async on the very next runloop turn after search auto-selection
+        // sets it, which always fires well before this task's 150ms sleep wakes. Re-reading
+        // the @State var inside the propagation body would therefore always observe false.
+        let wasAutoSelectingFromSearch = isAutoSelectingFromSearch
+        selectionPropagationTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled, selection == id else { return }
+            Perf.event("selectionPropagate", "id=\(id.prefix(8))")
+            settledSelection = id
+            settledSelectionSource = s.source
+            // Count a session-open for the feedback-ask trigger (debounced settle
+            // fires once per rested selection, not per key-repeat scrub).
+            onboardingCoordinator.noteSessionOpened(id: id)
+            // Auto-jump to the first search-term occurrence in the transcript, but only once
+            // the transcript pane's own selection (settledSelection) is about to match this id —
+            // TranscriptPlainView gates its match on searchState.autoJumpSessionID == session.id,
+            // where session.id tracks settledSelection, not the raw (possibly still-scrubbing)
+            // selection. Requesting the jump here (instead of eagerly in the raw-selection
+            // branch above) keeps the two in lockstep so manual clicks/arrows land the same
+            // instant auto-jump the first search-selected result already gets.
+            scheduleAutoJump(for: id)
+            // When selection is changed due to search auto-selection, do not steal focus or collapse inline search
+            if !wasAutoSelectingFromSearch {
+                // CRITICAL: Selecting session FORCES cleanup of all search UI (Apple Notes behavior)
+                focusCoordinator.perform(.selectSession(id: id))
+                NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+            }
+            // Lazy load full session per source. Parse + model build run off-main and the
+            // windowed build paints only the tail window, so hydration always proceeds
+            // immediately on selection (no manual "Show full transcript" gate).
+		            let requestedSelectionReload = reloadSessionForSource(s)
+            searchCoordinator.prewarmTranscriptIfNeeded(for: s, allowParsingLightweight: !requestedSelectionReload)
+            updateFocusedSessionIfNeeded(s)
+        }
+    }
+
+    private struct CockpitNavigationTarget {
+        let unifiedSessionID: String
+        let source: SessionSource?
+        let runtimeSessionID: String?
+        let logPath: String?
+        let workingDirectory: String?
+    }
+
+    private func handleNavigateToSessionFromCockpit(_ notification: Notification) {
+        guard let unifiedSessionID = notification.object as? String else { return }
+        let sourceRaw = notification.userInfo?[CockpitNavigationUserInfoKey.source] as? String
+        let source = sourceRaw.flatMap(SessionSource.init(rawValue:))
+        let target = CockpitNavigationTarget(
+            unifiedSessionID: unifiedSessionID,
+            source: source,
+            runtimeSessionID: notification.userInfo?[CockpitNavigationUserInfoKey.runtimeSessionID] as? String,
+            logPath: notification.userInfo?[CockpitNavigationUserInfoKey.logPath] as? String,
+            workingDirectory: notification.userInfo?[CockpitNavigationUserInfoKey.workingDirectory] as? String
+        )
+        _ = handleCockpitNavigation(target, emitBeepOnFailure: false)
+    }
+
+    @discardableResult
+    private func handleCockpitNavigation(_ target: CockpitNavigationTarget, emitBeepOnFailure: Bool) -> Bool {
+        guard let session = resolveCockpitNavigationTarget(target) else {
+            if emitBeepOnFailure {
+                NSSound.beep()
+            }
+            return false
+        }
+
+        let wasVisible = cachedRows.contains(where: { $0.id == session.id })
+        if !wasVisible {
+            applyAutoRevealFiltersForCockpitNavigation(session)
+            _ = updateCachedRows()
+        }
+
+        guard cachedRows.contains(where: { $0.id == session.id }) else {
+            if emitBeepOnFailure {
+                NSSound.beep()
+            }
+            return false
+        }
+
+        let selectedSource = cachedRows.first(where: { $0.id == session.id })?.source ?? session.source
+        setActiveSelection(session.id, source: selectedSource, userInitiated: true)
+        focusCoordinator.perform(.selectSession(id: session.id))
+        NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+        updateFocusedSessionIfNeeded(session)
+        CockpitNavigationBridge.clearIfMatching(unifiedSessionID: target.unifiedSessionID)
+
+        NSApp.activate(ignoringOtherApps: true)
+		if let main = NSApp.windows.first(where: { $0.isVisible && AppWindowRouter.isAgentSessionsWindow($0) }) ?? NSApp.mainWindow {
+            main.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    private func tryHandlePendingCockpitNavigationIfNeeded() {
+        guard let pending = CockpitNavigationBridge.load() else { return }
+        if Date().timeIntervalSince(pending.createdAt) > 45 {
+            CockpitNavigationBridge.clear()
+            return
+        }
+
+        let source = pending.sourceRawValue.flatMap(SessionSource.init(rawValue:))
+        let target = CockpitNavigationTarget(
+            unifiedSessionID: pending.unifiedSessionID,
+            source: source,
+            runtimeSessionID: pending.runtimeSessionID,
+            logPath: pending.logPath,
+            workingDirectory: pending.workingDirectory
+        )
+        _ = handleCockpitNavigation(target, emitBeepOnFailure: false)
+    }
+
+    private func resolveCockpitNavigationTarget(_ target: CockpitNavigationTarget) -> Session? {
+        let scoped = unified.allSessions.filter { session in
+            guard let source = target.source else { return true }
+            return session.source == source
+        }
+
+        if let direct = scoped.first(where: { $0.id == target.unifiedSessionID }) {
+            return direct
+        }
+
+        if let logPath = target.logPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !logPath.isEmpty {
+            let normalized = CodexActiveSessionsModel.normalizePath(logPath)
+            if let match = scoped.first(where: {
+                CodexActiveSessionsModel.normalizePath($0.filePath) == normalized
+            }) {
+                return match
+            }
+        }
+
+        if let runtimeSessionID = target.runtimeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !runtimeSessionID.isEmpty {
+            if let match = scoped.first(where: {
+                CodexActiveSessionsModel.liveSessionIDCandidates(for: $0).contains(runtimeSessionID)
+            }) {
+                return match
+            }
+        }
+
+        // cwd-only fallback intentionally omitted — prefer "no navigation"
+        // over navigating to a potentially wrong session from the same directory.
+        return nil
+    }
+
+    private func applyAutoRevealFiltersForCockpitNavigation(_ session: Session) {
+        ensureSourceIncludedForCockpitNavigation(session.source)
+
+        if showActiveSessionsOnly, !isSessionLive(session) {
+            showActiveSessionsOnly = false
+        }
+        if unified.showFavoritesOnly {
+            unified.showFavoritesOnly = false
+        }
+        if unified.showArchivedCodexDesktopOnly, session.source == .codex, !session.isArchivedCodexDesktopSession {
+            unified.showArchivedCodexDesktopOnly = false
+        }
+
+        if !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !unified.query.isEmpty {
+            unified.queryDraft = ""
+            unified.query = ""
+            searchCoordinator.cancel()
+        }
+
+        if unified.projectSelection != nil { unified.projectSelection = nil }
+        if unified.dateFrom != nil { unified.dateFrom = nil }
+        if unified.dateTo != nil { unified.dateTo = nil }
+        if unified.selectedModel != nil { unified.selectedModel = nil }
+        let allKinds = Set(SessionEventKind.allCases)
+        if unified.selectedKinds != allKinds {
+            unified.selectedKinds = allKinds
+        }
+        unified.recomputeNow()
+    }
+
+    private func ensureSourceIncludedForCockpitNavigation(_ source: SessionSource) {
+        switch source {
+        case .codex:
+            if !unified.includeCodex { unified.includeCodex = true }
+        case .claude:
+            if !unified.includeClaude { unified.includeClaude = true }
+        case .antigravity:
+            if !unified.includeAntigravity { unified.includeAntigravity = true }
+        case .opencode:
+            if !unified.includeOpenCode { unified.includeOpenCode = true }
+        case .hermes:
+            if !unified.includeHermes { unified.includeHermes = true }
+        case .copilot:
+            if !unified.includeCopilot { unified.includeCopilot = true }
+        case .droid:
+            if !unified.includeDroid { unified.includeDroid = true }
+        case .openclaw:
+            if !unified.includeOpenClaw { unified.includeOpenClaw = true }
+        case .cursor:
+            if !unified.includeCursor { unified.includeCursor = true }
+        case .pi:
+            if !unified.includePi { unified.includePi = true }
+        case .kimi:
+            if !unified.includeKimi { unified.includeKimi = true }
+        case .grok:
+            if !unified.includeGrok { unified.includeGrok = true }
+        case .qwen:
+            if !unified.includeQwen { unified.includeQwen = true }
+        case .devin:
+            if !unified.includeDevin { unified.includeDevin = true }
+        case .fx:
+            if !unified.includeFx { unified.includeFx = true }
+        case .cline:
+            if !unified.includeCline { unified.includeCline = true }
+        case .deepseekHarness:
+            if !unified.includeDeepSeekHarness { unified.includeDeepSeekHarness = true }
+        }
+    }
+
+    private func handleWindowDidBecomeKey() {
+        isWindowKey = true
+        updateFocusedSessionIfNeeded(selectedSession)
+    }
+
+    private func handleWindowDidResignKey() {
+        isWindowKey = false
+    }
+
+    private func handleWindowWillClose() {
+        isWindowKey = false
+        unified.setFocusedSession(nil)
+    }
+
+    private func updateFocusedSessionIfNeeded(_ session: Session?) {
+        guard isWindowKey else { return }
+        unified.setFocusedSession(session)
+    }
+
+    /// Per-source lazy reload of a session's full content. Returns true if a reload was started.
+    @discardableResult
+    private func reloadSessionForSource(_ s: Session) -> Bool {
+        let id = s.id
+        // Mirror the agent-enabled guards on the canonical focused-reload dispatch
+        // (UnifiedSessionIndexer.focusedMonitorCapabilityBySource): don't reload a
+        // source the user has disabled.
+        switch s.source {
+        case .codex:
+            // isPartiallyHydrated (Task 9e stage 0 tail-first paint) must not look
+            // "already loaded" here — otherwise a second selection-change on the
+            // same still-hydrating session (re-fired list selection, etc.) would
+            // skip re-dispatching reloadSession. reloadSession's own
+            // reloadingSessionIDs guard already de-dupes a genuinely in-flight
+            // parse, so this is a safety net, not the primary de-dupe.
+            if unified.codexAgentEnabled, let e = codexIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty || e.isPartiallyHydrated { codexIndexer.reloadSession(id: id); return true }
+        case .claude:
+            if unified.claudeAgentEnabled, let e = claudeIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { claudeIndexer.reloadSession(id: id); return true }
+        case .antigravity:
+            if unified.antigravityAgentEnabled, let e = antigravityIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { antigravityIndexer.reloadSession(id: id); return true }
+        case .opencode:
+            if unified.openCodeAgentEnabled, let e = opencodeIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { opencodeIndexer.reloadSession(id: id); return true }
+        case .hermes:
+            if unified.hermesAgentEnabled, let e = hermesIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { hermesIndexer.reloadSession(id: id); return true }
+        case .copilot:
+            if unified.copilotAgentEnabled, let e = copilotIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { copilotIndexer.reloadSession(id: id); return true }
+        case .droid:
+            if unified.droidAgentEnabled, let e = droidIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { droidIndexer.reloadSession(id: id); return true }
+        case .openclaw:
+            if unified.openClawAgentEnabled, let e = openclawIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { openclawIndexer.reloadSession(id: id); return true }
+        case .cursor:
+            if unified.cursorAgentEnabled, let e = cursorIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty, !CursorSessionIndexer.isDBOnlySession(e) { cursorIndexer.reloadSession(id: id); return true }
+        case .pi:
+            if unified.piAgentEnabled, let e = piIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { piIndexer.reloadSession(id: id); return true }
+        case .kimi:
+            if unified.kimiAgentEnabled, let e = kimiIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { kimiIndexer.reloadSession(id: id); return true }
+        case .grok:
+            if unified.grokAgentEnabled, let e = grokIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { grokIndexer.reloadSession(id: id); return true }
+        case .qwen:
+            if unified.qwenAgentEnabled, let e = qwenIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { qwenIndexer.reloadSession(id: id); return true }
+        case .devin:
+            if unified.devinAgentEnabled, let e = devinIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { devinIndexer.reloadSession(id: id); return true }
+        case .fx:
+            if unified.fxAgentEnabled, let e = fxIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { fxIndexer.reloadSession(id: id); return true }
+        case .cline:
+            if unified.clineAgentEnabled, let e = clineIndexer.allSessions.first(where: { $0.id == id }), e.events.isEmpty { clineIndexer.reloadSession(id: id); return true }
+        case .deepseekHarness:
+            if unified.deepSeekHarnessAgentEnabled,
+               let e = deepSeekHarnessIndexer.allSessions.first(where: { $0.id == id }),
+               e.events.isEmpty {
+                deepSeekHarnessIndexer.reloadSession(id: id)
+                return true
+            }
+        }
+        return false
+    }
+
+        /// Phases 0-3 of a rows rebuild: cheap main-actor bookkeeping (fallback
+        /// presences, `nextRows` filter/sort, hold-rows-during-churn checks). Shared
+        /// by both the synchronous path (`updateCachedRows()`) and the off-main
+        /// path (`updateCachedRowsAsync()`) so the two never diverge on what
+        /// counts as "hold" vs "rebuild".
+        ///
+        /// Returns nil when the rebuild should be held (rows left exactly as-is);
+        /// otherwise the `SessionRowsBuilder.RowsInput` snapshot for the heavy
+        /// phase, ready to run sync or via `Task.detached`.
+        private func prepareRowsRebuild() -> SessionRowsBuilder.RowsInput? {
+            selectionReplacementDeferredDuringChurn = false
+            // Cheap main-actor step only: the direct-join lookup itself must run
+            // here (CodexActiveSessionsModel.presence(for:) reads main-actor-only
+            // lookup caches), but the heavy fallback-presence grouping/sorting
+            // moves into SessionRowsBuilder.build, off-main (W7 Task 1 Step 6c;
+            // was `rebuildCachedFallbackPresences()`, computed unconditionally on
+            // main under the "fallbackPresences" span every rebuild).
+            let allSessionsForFallback = unified.allSessions
+            let presencesForFallback = activeCodexSessions.presences
+            let directJoinFallbackKeys = directJoinFallbackKeys(for: allSessionsForFallback)
+            let nextRows: [Session]
+            if FeatureFlags.coalesceListResort {
+                // unified.sessions is already sorted by the view model's descriptor
+                nextRows = rows
+            } else {
+                nextRows = rows.sorted(using: sortOrder)
+            }
+            cachedTotalSessionCount = unified.sessions.count
+
+            let query = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            let shouldHoldRowsDuringRunningSearch = UnifiedRowsStabilityPolicy.shouldHoldRowsDuringRunningSearch(
+                isSearchRunning: searchCoordinator.isRunning,
+                nextRowsEmpty: nextRows.isEmpty,
+                showActiveSessionsOnly: showActiveSessionsOnly,
+                cachedRowsEmpty: cachedRows.isEmpty
+            )
+            let shouldHoldRowsDuringTransientEmptyRefresh = UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: query,
+                isSearchRunning: searchCoordinator.isRunning,
+                isDatasetChurning: isDatasetChurning,
+                isIndexing: unified.isIndexing,
+                nextRowsEmpty: nextRows.isEmpty,
+                showActiveSessionsOnly: showActiveSessionsOnly,
+                cachedRowsEmpty: cachedRows.isEmpty,
+                hasSelection: selection != nil
+            )
+            guard !(shouldHoldRowsDuringRunningSearch || shouldHoldRowsDuringTransientEmptyRefresh) else {
+                return nil
+            }
+
+            return SessionRowsBuilder.RowsInput(
+                nextRows: nextRows,
+                allSessions: allSessionsForFallback,
+                previousCachedRows: cachedRows,
+                collapsedParents: collapsedParents,
+                showSubagentHierarchy: showSubagentHierarchy,
+                searchActive: !query.isEmpty,
+                isHierarchyBrowsing: isHierarchyBrowsing,
+                presences: presencesForFallback,
+                directJoinFallbackKeys: directJoinFallbackKeys
+            )
+        }
+
+        /// Apply a `SessionRowsBuilder` result on the main actor: assign
+        /// cachedRows/hierarchy/derived state, bump `tableReorderGeneration` for a
+        /// large reorder, then run the UNCHANGED selection-reconciliation block.
+        /// `heldRows` reflects whether `prepareRowsRebuild()` held rows for this
+        /// trigger (output is nil in that case — nothing to assign).
+        @MainActor
+        private func applyRowsOutput(_ output: SessionRowsBuilder.RowsOutput?) {
+            if let output {
+                if output.isLargeReorder {
+                    tableReorderGeneration &+= 1
+#if DEBUG
+	                    Perf.event("reorderRebuild", "rows=\(output.cachedRows.count) gen=\(tableReorderGeneration)")
+#endif
+	                }
+	                cachedRows = output.cachedRows
+                hierarchyRowMeta = output.hierarchyRowMeta
+                sideChatParentContextByID = output.sideChatParentContextByID
+                cachedRowIDs = output.cachedRowIDs
+                cachedVisibleRowIDs = output.cachedVisibleRowIDs
+                cachedExpandableParentIDs = output.cachedExpandableParentIDs
+                cachedRowByID = output.cachedRowByID
+                cachedSurfacePillsBySessionID = output.surfacePillsBySessionID
+                cachedFallbackPresenceBySessionKey = output.fallbackPresenceBySessionKey
+            }
+
+            if let selectedID = selection,
+               !cachedRows.contains(where: { $0.id == selectedID }) {
+                if UnifiedTableSelectionPolicy.shouldReplaceMissingSelection(
+                    hierarchyBrowsing: isHierarchyBrowsing,
+                    refreshBusy: isRefreshBusyForSelection,
+                    hasUserManuallySelected: hasUserManuallySelected,
+                    datasetChurning: isDatasetChurning
+                ) {
+                    if let first = cachedRows.first {
+                        setActiveSelection(first.id, source: first.source, userInitiated: false)
+                    } else {
+                        setActiveSelection(nil, userInitiated: false)
+                    }
+                } else if isDatasetChurning {
+                    // Replacement would have happened but was suppressed solely by the
+                    // churn gate — flag it so the post-churn pass knows to retry.
+                    selectionReplacementDeferredDuringChurn = true
+                }
+            }
+
+            ensureDefaultSelectionIfNeeded()
+            refreshSelectionSourceFromCachedRows()
+        }
+
+        /// Synchronous rows rebuild — used by every call site except the heavy
+        /// `unified.sessions` republish path (see `updateCachedRowsAsync()`).
+        /// Returns `heldRows` (rows were intentionally left stale this call).
+	    @discardableResult
+	    private func updateCachedRows() -> Bool {
+        rowsRebuildGeneration &+= 1
+#if DEBUG
+        // Snapshot the row count NOW: Perf detail closures are evaluated lazily in end()
+        // (after cachedRows is reassigned below), so capture the pre-update value in a let.
+        let _rowsBefore = cachedRows.count
+        let _perfSpan = Perf.begin("updateCachedRows", thresholdMs: 8, "n=\(_rowsBefore) activeOnly=\(showActiveSessionsOnly)")
+        defer { Perf.end(_perfSpan) }
+        let startedAt = Date()
+        defer {
+            if showActiveSessionsOnly {
+                let elapsedMs = Date().timeIntervalSince(startedAt) * 1000.0
+                debugActiveOnlyUpdateRowsCount &+= 1
+                debugActiveOnlyUpdateRowsTotalMs += elapsedMs
+                debugActiveOnlyUpdateRowsMaxMs = max(debugActiveOnlyUpdateRowsMaxMs, elapsedMs)
+
+                if elapsedMs > 25 {
+                    print("[UnifiedSessionsView][perf] updateCachedRows active-only took \(String(format: "%.1f", elapsedMs))ms rows=\(cachedRows.count)")
+                }
+
+                let now = Date()
+                if now.timeIntervalSince(debugActiveOnlyLastReportAt) >= 10, debugActiveOnlyUpdateRowsCount > 0 {
+                    let avgMs = debugActiveOnlyUpdateRowsTotalMs / Double(debugActiveOnlyUpdateRowsCount)
+                    print(
+                        "[UnifiedSessionsView][perf] active-only updateCachedRows " +
+                        "count=\(debugActiveOnlyUpdateRowsCount) avgMs=\(String(format: "%.1f", avgMs)) maxMs=\(String(format: "%.1f", debugActiveOnlyUpdateRowsMaxMs))"
+                    )
+                    debugActiveOnlyUpdateRowsCount = 0
+                    debugActiveOnlyUpdateRowsTotalMs = 0
+                    debugActiveOnlyUpdateRowsMaxMs = 0
+                    debugActiveOnlyLastReportAt = now
+                }
+            }
+        }
+#endif
+        guard let input = prepareRowsRebuild() else {
+            applyRowsOutput(nil)
+            return true
+        }
+#if DEBUG
+        let _hbSpan = Perf.begin("hierarchyBuild", thresholdMs: 4, "rows=\(input.nextRows.count)")
+#endif
+        let output = SessionRowsBuilder.build(input: input)
+#if DEBUG
+        Perf.end(_hbSpan)
+#endif
+        applyRowsOutput(output)
+        return false
+	    }
+
+        /// Off-main rows rebuild for the heavy `unified.sessions` republish path
+        /// (Task 2): computes `SessionRowsBuilder.build` on a detached task, then
+        /// applies the result on main IF this trigger's generation is still
+        /// current — a newer trigger (another republish, or a synchronous
+        /// `updateCachedRows()` call from a different onChange firing in between)
+        /// supersedes it and this result is dropped, never interleaved.
+        ///
+        /// The hold/no-hold decision itself is cheap and made on main before the
+        /// async hop, so callers needing `heldRows` get it via `completion`
+        /// rather than a return value — only the heavy hierarchy/derived-state
+        /// computation moves off-main.
+        /// - Parameter completion: invoked on the main actor exactly once, either
+        ///   synchronously before returning (rows held, nothing to compute) or
+        ///   after the off-main compute applies. `heldRows` matches the
+        ///   synchronous `updateCachedRows()` return value; `applied` is false
+        ///   when a newer trigger superseded this one (the completion still
+        ///   fires so callers can run their "did this pass finish" bookkeeping,
+        ///   but must not treat a superseded pass as having produced fresh rows).
+        private func updateCachedRowsAsync(completion: @escaping (_ heldRows: Bool, _ applied: Bool) -> Void) {
+            rowsRebuildGeneration &+= 1
+            let generation = rowsRebuildGeneration
+#if DEBUG
+            let _rowsBefore = cachedRows.count
+            let _perfSpan = Perf.begin("updateCachedRows", thresholdMs: 8, "n=\(_rowsBefore) activeOnly=\(showActiveSessionsOnly) async=1")
+            defer { Perf.end(_perfSpan) }
+#endif
+            guard let input = prepareRowsRebuild() else {
+                applyRowsOutput(nil)
+                completion(true, true)
+                return
+            }
+            Task.detached(priority: .userInitiated) {
+#if DEBUG
+                let _hbSpan = Perf.begin("hierarchyBuild", thresholdMs: 4, "rows=\(input.nextRows.count) offMain=1")
+#endif
+                let output = SessionRowsBuilder.build(input: input)
+#if DEBUG
+                Perf.end(_hbSpan)
+#endif
+                await MainActor.run { [self] in
+                    // Staleness discipline: only apply if no newer trigger has
+                    // started since this one (a newer updateCachedRows()/
+                    // updateCachedRowsAsync() call bumps rowsRebuildGeneration
+                    // before this closure can run). A stale result is dropped
+                    // silently — the newer trigger's own apply (sync or async)
+                    // is authoritative and already reflects the latest input.
+                    guard self.rowsRebuildGeneration == generation else {
+#if DEBUG
+                        Perf.event("rowsRebuildSuperseded", "gen=\(generation) current=\(self.rowsRebuildGeneration)")
+#endif
+                        completion(false, false)
+                        return
+                    }
+                    self.applyRowsOutput(output)
+                    completion(false, true)
+                }
+            }
+        }
+
+    private var isHierarchyBrowsing: Bool {
+        showSubagentHierarchy && searchState.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var isRefreshBusyForSelection: Bool {
+        isDatasetChurning || unified.isIndexing || searchCoordinator.isRunning
+    }
+
+    // Called only from within the 150ms-settled selection-propagation task, i.e. once
+    // `settledSelection` (and therefore the transcript pane's resolved session.id) is about
+    // to match `sessionID`. Firing here — rather than eagerly off the raw selection stream —
+    // is what keeps this request in lockstep with TranscriptPlainView's
+    // `searchState.autoJumpSessionID == session.id` gate; see the call site for the full
+    // rationale.
+    private func scheduleAutoJump(for sessionID: String) {
+        cancelAutoJump()
+        let q = searchState.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        searchState.requestAutoJump(sessionID: sessionID)
+    }
+
+    private func cancelAutoJump() {
+        // Clear any outstanding request so a transcript pane that hasn't caught up yet
+        // (e.g. selection was cleared, or search was cleared mid-settle) doesn't apply a
+        // stale jump once it does.
+        searchState.autoJumpSessionID = nil
+    }
+
+	    private func refreshColumnLayout() {
+		        columnLayoutID = UUID()
+		        updateCachedRows()
+	        ensureDefaultSelectionIfNeeded()
+	        refreshSelectionSourceFromCachedRows()
+	    }
+
+
+    @ViewBuilder
+    private func launchBlockingTranscriptOverlay() -> some View {
+        launchAnimationView
+            .allowsHitTesting(false)
+    }
+
+    private var shouldShowLaunchOverlay: Bool {
+        false
+    }
+
+    private var launchAnimationView: some View {
+        LoadingAnimationView(
+            codexColor: Color.agentColor(for: .codex, monochrome: stripMonochrome),
+            claudeColor: Color.agentColor(for: .claude, monochrome: stripMonochrome)
+        )
+    }
+
+    @ViewBuilder
+    private func cellFavorite(for session: Session) -> some View {
+        if showStarColumn {
+            Button(action: { unified.toggleFavorite(session) }) {
+                Image(systemName: session.isFavorite ? "star.fill" : "star")
+                    .imageScale(.medium)
+                    .foregroundStyle(.primary)
+            }
+            .buttonStyle(.plain)
+            .help(starHelpText(isStarred: session.isFavorite))
+            .accessibilityLabel(session.isFavorite ? "Remove from Saved" : "Save")
+        } else {
+            EmptyView()
+        }
+    }
+
+    private func cellSource(for session: Session) -> some View {
+        let label: String
+        let isSelected = selection == session.id
+        let presence: CodexActivePresence? = {
+            guard activeCodexSessions.supportsLiveSessions(for: session.source) else { return nil }
+            return livePresence(for: session)
+        }()
+        let liveState: CodexLiveState? = {
+            guard let presence else { return nil }
+            return activeCodexSessions.liveState(for: presence)
+        }()
+        let rowTextColor: Color = {
+            if isSelected { return .white }
+            return !stripMonochrome ? sourceAccent(session) : .secondary
+        }()
+        let rowDotColor: Color = {
+            if let liveState {
+                switch liveState {
+                case .activeWorking:
+                    return Color(hex: "30d158")
+                case .openIdle:
+                    return effectiveColorScheme == .dark ? Color(hex: "ffb340") : Color(hex: "e08600")
+                }
+            }
+            if isSelected { return .white.opacity(0.95) }
+            return !stripMonochrome ? sourceAccent(session) : .primary
+        }()
+        let liveOpacity: Double = liveState == .openIdle ? 0.60 : 1.0
+        // Static part precomputed once per rows rebuild (SessionRowsBuilder.build);
+        // only the live Claude Desktop archived bit is patched in here. Falls back
+        // to the full per-call computation if the row hasn't been through a rebuild
+        // yet (cache miss should not happen in steady state, but must never crash).
+        let staticPills = cachedSurfacePillsBySessionID[session.id] ?? Self.staticSurfacePills(for: session)
+        let surfacePills = Self.applyingLiveClaudeArchiveState(
+            to: staticPills,
+            session: session,
+            isClaudeArchived: unified.isArchivedClaudeDesktop(session)
+        )
+        label = session.source.descriptor.shortLabel
+        let isSubagentRow = (hierarchyRowMeta[session.id]?.depth ?? 0) > 0
+        return HStack(spacing: 6) {
+            if isSubagentRow {
+                Spacer().frame(width: 12)
+            }
+            if let liveState {
+                CodexLiveStatusDot(
+                    state: liveState,
+                    color: rowDotColor,
+                    size: 7,
+                    lastSeenAt: presence?.lastSeenAt
+                )
+                    .accessibilityLabel(Text("\(label) \(liveState == .activeWorking ? "active" : "open") session"))
+            }
+            Text(label)
+                .font(.system(size: 12, weight: isSubagentRow ? .light : .regular, design: .monospaced))
+                .foregroundStyle(isSubagentRow ? rowTextColor.opacity(0.7) : rowTextColor)
+            ForEach(surfacePills, id: \.identity) { surfacePill in
+                Text(surfacePill.label)
+                    .font(surfacePill.font)
+                    // Never truncate the pill itself: it is a 3-6 character token
+                    // whose whole value is being readable at a glance. Subagent
+                    // rows spend 12pt on their indent, which is enough to clip a
+                    // 6-character label like "cowork" into "cowo…".
+                    .fixedSize()
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(surfacePill.fill)
+                    .foregroundStyle(surfacePill.foreground(isSelected: isSelected))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .stroke(surfacePill.stroke(isSelected: isSelected), lineWidth: surfacePill.strokeWidth)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .accessibilityLabel(surfacePill.accessibilityLabel(agentLabel: label))
+            }
+            Spacer(minLength: 4)
+        }
+        .opacity(liveOpacity)
+        .id("source-cell-\(session.id)-\(Self.livePresenceSignature(state: liveState, lastSeenAt: presence?.lastSeenAt))")
+    }
+
+    /// Compact signature of the row's own visible live-state, used to key the
+    /// Agent cell's `.id(...)`. Deliberately narrower than the global
+    /// `activeCodexSessions.activeMembershipVersion` counter: that counter
+    /// bumps on every live-presence poll tick regardless of whether *this*
+    /// row's dot/label actually changed, which was forcing every Agent cell
+    /// (and its gesture recognizers) to be torn down and recreated on every
+    /// tick — eating in-flight double-clicks. Keying on the row's own derived
+    /// (state, lastSeenAt) pair still forces re-identification exactly when
+    /// this row's visible presence changes, and leaves untouched rows alone.
+    private static func livePresenceSignature(state: CodexLiveState?, lastSeenAt: Date?) -> String {
+        let stateToken = state?.rawValue ?? "none"
+        let lastSeenToken = lastSeenAt.map { String($0.timeIntervalSince1970) } ?? "none"
+        return "\(stateToken)-\(lastSeenToken)"
+    }
+
+    /// Surface-pill classification (`staticSurfacePills`, `surfacePills`,
+    /// `applyingLiveClaudeArchiveState`, and their private helpers) lives in
+    /// `SessionRowsBuilder` (Services) -- it's pure business logic over
+    /// `Session` data with no SwiftUI dependency, whereas `CodexSurfacePill`
+    /// itself stays here since it carries presentation (`Color`/`Font`)
+    /// methods. These are thin forwarders so call sites in this file can keep
+    /// using `Self.<name>(...)` (T2).
+    static func staticSurfacePills(for session: Session) -> [CodexSurfacePill] {
+        SessionRowsBuilder.staticSurfacePills(for: session)
+    }
+
+    static func applyingLiveClaudeArchiveState(
+        to staticPills: [CodexSurfacePill],
+        session: Session,
+        isClaudeArchived: Bool
+    ) -> [CodexSurfacePill] {
+        SessionRowsBuilder.applyingLiveClaudeArchiveState(to: staticPills, session: session, isClaudeArchived: isClaudeArchived)
+    }
+
+    static func surfacePills(for session: Session, isClaudeArchived: Bool = false) -> [CodexSurfacePill] {
+        SessionRowsBuilder.surfacePills(for: session, isClaudeArchived: isClaudeArchived)
+    }
+
+    struct CodexSurfacePill {
+        let label: String
+        let accessibilityLabel: String
+        let usesFullAccessibilityLabel: Bool
+        let isArchived: Bool
+
+        var identity: String { "\(label)-\(isArchived ? "archived" : "standard")" }
+
+        static func desktop(isArchived: Bool = false) -> CodexSurfacePill {
+            CodexSurfacePill(
+                label: "desk",
+                accessibilityLabel: isArchived ? "Codex Desktop archived session" : "Desktop app",
+                usesFullAccessibilityLabel: isArchived,
+                isArchived: isArchived
+            )
+        }
+
+        /// Codex Desktop's sandboxed per-task workspaces. Labelled "work" after
+        /// Codex's own `codex_work_desktop` originator rather than reusing
+        /// Claude's "cowork": Cowork is Anthropic branding, and applying it to an
+        /// OpenAI surface would invent a product name OpenAI does not use.
+        static func work(isArchived: Bool = false) -> CodexSurfacePill {
+            CodexSurfacePill(
+                label: "work",
+                accessibilityLabel: isArchived ? "Codex work archived session" : "Codex work session",
+                usesFullAccessibilityLabel: isArchived,
+                isArchived: isArchived
+            )
+        }
+
+        static func cowork(isArchived: Bool = false) -> CodexSurfacePill {
+            CodexSurfacePill(
+                label: "cowork",
+                accessibilityLabel: isArchived ? "Claude Cowork archived session" : "Cowork session",
+                usesFullAccessibilityLabel: isArchived,
+                isArchived: isArchived
+            )
+        }
+
+        static func standard(label: String, accessibilityLabel: String) -> CodexSurfacePill {
+            CodexSurfacePill(label: label, accessibilityLabel: accessibilityLabel)
+        }
+
+        init(label: String, accessibilityLabel: String, usesFullAccessibilityLabel: Bool = false, isArchived: Bool = false) {
+            self.label = label
+            self.accessibilityLabel = accessibilityLabel
+            self.usesFullAccessibilityLabel = usesFullAccessibilityLabel
+            self.isArchived = isArchived
+        }
+
+        func accessibilityLabel(agentLabel: String) -> String {
+            usesFullAccessibilityLabel ? accessibilityLabel : "\(agentLabel) \(accessibilityLabel)"
+        }
+
+        func foreground(isSelected: Bool) -> Color {
+            if isArchived {
+                return isSelected ? Color.white.opacity(0.95) : UnifiedSessionsStyle.selectionAccent
+            }
+            return isSelected ? Color.white.opacity(0.85) : Color.secondary
+        }
+
+        var fill: Color {
+            isArchived ? UnifiedSessionsStyle.selectionAccent.opacity(0.14) : Color.secondary.opacity(0.12)
+        }
+
+        func stroke(isSelected: Bool) -> Color {
+            guard isArchived else { return .clear }
+            return isSelected ? Color.white.opacity(0.50) : UnifiedSessionsStyle.selectionAccent.opacity(0.55)
+        }
+
+        var strokeWidth: CGFloat {
+            isArchived ? 1 : 0
+        }
+
+        var font: Font {
+            let base = Font.system(size: 10, weight: .semibold, design: .monospaced)
+            return isArchived ? base.italic() : base
+        }
+    }
+
+    private struct TerminalFocusAvailability {
+        let canFocus: Bool
+        let helpText: String
+    }
+
+    private func terminalFocusAvailability(for session: Session) -> TerminalFocusAvailability {
+        guard activeCodexSessions.supportsLiveSessions(for: session.source) else {
+            return TerminalFocusAvailability(
+                canFocus: false,
+                helpText: "This agent does not support live terminal focus."
+            )
+        }
+
+        let presence = livePresence(for: session)
+        let canFocus = CodexActiveSessionsModel.canAttemptITerm2Focus(
+            itermSessionId: presence?.terminal?.itermSessionId,
+            tty: presence?.tty,
+            termProgram: presence?.terminal?.termProgram
+        ) || presence?.revealURL != nil
+        let helpText: String = {
+            if canFocus { return "Focus the existing iTerm2 tab/window for this session." }
+            if isSessionLive(session) { return "Focus is unavailable for this terminal session." }
+            return "This session is not currently live."
+        }()
+        return TerminalFocusAvailability(canFocus: canFocus, helpText: helpText)
+    }
+
+    private func focusActiveTerminal(for session: Session) {
+        let availability = terminalFocusAvailability(for: session)
+        guard availability.canFocus else {
+            showActionAlert(message: availability.helpText)
+            return
+        }
+
+        let presence = livePresence(for: session)
+        if CodexActiveSessionsModel.tryFocusITerm2(
+            itermSessionId: presence?.terminal?.itermSessionId,
+            tty: presence?.tty
+        ) {
+            return
+        }
+        if let focusURL = presence?.revealURL, NSWorkspace.shared.open(focusURL) {
+            return
+        }
+
+        showActionAlert(message: "Unable to focus the terminal for this session.")
+    }
+
+    private var canResumeSelectedSession: Bool {
+        guard let selectedSession else { return false }
+        let antigravityCLISessionID = selectedSession.source == .antigravity
+            ? AntigravitySessionIDHelper.deriveSessionID(from: selectedSession)
+            : nil
+        return canResumeSession(selectedSession, antigravityCLISessionID: antigravityCLISessionID)
+    }
+
+    private func effectiveWorkingDirectoryURL(for session: Session) -> URL? {
+        switch session.source {
+        case .claude:
+            return ClaudeSessionIDHelper.projectRoot(for: session)
+        case .codex:
+            if let wd = CodexResumeSettings.shared.effectiveWorkingDirectory(for: session), !wd.isEmpty {
+                return URL(fileURLWithPath: wd)
+            }
+            return nil
+        case .opencode:
+            return OpenCodeSettings.shared.effectiveWorkingDirectory(for: session)
+        case .hermes:
+            return HermesSettings.shared.effectiveWorkingDirectory(for: session)
+        case .copilot:
+            return CopilotSettings.shared.effectiveWorkingDirectory(for: session)
+        case .cursor:
+            return CursorSettings.shared.effectiveWorkingDirectory(for: session)
+        case .pi:
+            return PiSettings.shared.effectiveWorkingDirectory(for: session)
+        case .antigravity:
+            return AntigravityCLISettings.shared.effectiveWorkingDirectory(for: session)
+        default:
+            guard let path = session.cwd, !path.isEmpty else { return nil }
+            return URL(fileURLWithPath: path)
+        }
+    }
+
+    private func openDir(_ s: Session) {
+        guard let url = effectiveWorkingDirectoryURL(for: s) else { return }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func revealSessionFile(_ s: Session) {
+        // Reveal the file that exists: a compressed Codex rollout is `.jsonl.zst`.
+        guard let url = CodexRolloutStorage.storageURL(for: URL(fileURLWithPath: s.filePath)) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func revealParentOfMissing(_ s: Session) {
+        let url = URL(fileURLWithPath: s.filePath)
+        let dir = url.deletingLastPathComponent()
+        NSWorkspace.shared.open(dir)
+    }
+
+    /// The agent name shown in Resume affordances. `?? "CLI"` is the old switch's
+    /// `default:` and is load-bearing, not cosmetic: droid and openclaw carry no label
+    /// (they never resume), and any future label-less source lands here too.
+    private func resumeAgentLabel(_ source: SessionSource) -> String {
+        source.descriptor.resumeAgentLabel ?? "CLI"
+    }
+
+    /// Whether this *session* can be resumed.
+    ///
+    /// `descriptor.supportsResume` is a source-level PRE-gate and is strictly WEAKER than
+    /// the per-session predicates below (Task 2 review I1): codex excludes side chats and
+    /// VS Code sessions, claude excludes workflow subagents, antigravity requires a
+    /// derivable conversation ID. The descriptor guard is prepended, never substituted —
+    /// substituting it would sprout broken Resume affordances on exactly those subtypes.
+    private func canResumeSession(_ s: Session, antigravityCLISessionID: String? = nil) -> Bool {
+        guard s.source.descriptor.supportsResume else { return false }
+        switch s.source {
+        case .codex:
+            return canResumeCodexInCLI(s)
+        case .claude:
+            return !s.isClaudeWorkflowSubagent
+        case .opencode, .hermes, .copilot, .cursor, .pi, .kimi, .grok, .fx:
+            return s.source != .cursor || s.surface != .acp
+        case .qwen:
+            return QwenResumeEligibility.canResume(s)
+        case .devin:
+            // session.id is the `sessions.id` slug, which `--resume` accepts directly.
+            return true
+        case .antigravity:
+            return (antigravityCLISessionID ?? AntigravitySessionIDHelper.deriveSessionID(from: s)) != nil
+        case .droid, .openclaw, .cline, .deepseekHarness:
+            // Old `default: return false`. Unreachable — the descriptor guard above already
+            // refused both — but written out so a new source must declare its own
+            // per-session rule instead of silently inheriting "never resumable".
+            return false
+        }
+    }
+
+    private func canResumeCodexInCLI(_ session: Session) -> Bool {
+        !session.isSideChat && session.codexSurface != .vscode
+    }
+
+    private func openInCodexApp(_ session: Session) {
+        let presentingWindow = NSApp.keyWindow ?? NSApp.mainWindow
+        Task { @MainActor in
+            switch await CodexResumeCoordinator.shared.openInApp(session: session) {
+            case .launched:
+                break
+            case .needsConfiguration(let message), .failure(let message):
+                showActionAlert(message: message, in: presentingWindow)
+            }
+        }
+    }
+
+    private func openInVSCode(_ session: Session) {
+        guard session.source == .claude, !session.isClaudeWorkflowSubagent else { return }
+        // Captured at click time for the same reason as in `resume(_:)`: VS Code
+        // takes focus, so a late failure must attach to the window it came from.
+        let presentingWindow = NSApp.keyWindow ?? NSApp.mainWindow
+        let sessionID = ClaudeSessionIDHelper.deriveSessionID(from: session)
+        let folder = ClaudeSessionIDHelper.projectRoot(for: session, includeDefaultFallback: false)
+        Task { @MainActor in
+            if case .failure(let message) = await ClaudeVSCodeLauncher.open(sessionID: sessionID, workingDirectory: folder) {
+                showActionAlert(message: message, in: presentingWindow)
+            }
+        }
+    }
+
+    private func resume(_ s: Session) {
+        guard !s.isClaudeWorkflowSubagent else { return }
+        guard s.source.descriptor.supportsResume else { return }
+        guard s.surface != .acp else { return }
+        // Captured at click time, not at report time. A Warp cold start
+        // activates Warp and deactivates us, so by the time a failure comes back
+        // (3s later, more if Gatekeeper is verifying) `NSApp.keyWindow` is nil
+        // and the alert would go app-modal on top of Warp — or attach itself to
+        // whatever unrelated window of ours happened to become key.
+        let presentingWindow = NSApp.keyWindow ?? NSApp.mainWindow
+        switch s.source {
+        case .codex:
+            Task { @MainActor in
+                switch await CodexResumeCoordinator.shared.quickLaunchInTerminal(session: s) {
+                case .launched:
+                    break
+                case .needsConfiguration(let message), .failure(let message):
+                    reportResumeFailure(launched: false, error: message, source: s.source, in: presentingWindow)
+                }
+            }
+        case .opencode:
+            let settings = OpenCodeSettings.shared
+            let sid = s.id
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = OpenCodeResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: OpenCodeTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return OpenCodeITermLauncher()
+                    case .warp:                    return OpenCodeWarpLauncher()
+                    case .warpPreview:             return OpenCodeWarpPreviewLauncher()
+                    case .ghostty:                 return OpenCodeGhosttyLauncher()
+                    case .macterm:                 return OpenCodeMactermLauncher()
+                    case .terminalApp, .unknown:   return OpenCodeTerminalLauncher()
+                    }
+                }()
+                let coord = OpenCodeResumeCoordinator(env: OpenCodeCLIEnvironment(), builder: OpenCodeResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .hermes:
+            let settings = HermesSettings.shared
+            let sid = s.id
+            let wd = effectiveWorkingDirectoryURL(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = HermesResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: HermesTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return HermesITermLauncher()
+                    case .warp:                    return HermesWarpLauncher()
+                    case .warpPreview:             return HermesWarpPreviewLauncher()
+                    case .ghostty:                 return HermesGhosttyLauncher()
+                    case .macterm:                 return HermesMactermLauncher()
+                    case .terminalApp, .unknown:   return HermesTerminalLauncher()
+                    }
+                }()
+                let coord = HermesResumeCoordinator(env: HermesCLIEnvironment(), builder: HermesResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .copilot:
+            let settings = CopilotSettings.shared
+            let sid = s.id
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = CopilotResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: CopilotTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return CopilotITermLauncher()
+                    case .warp:                    return CopilotWarpLauncher()
+                    case .warpPreview:             return CopilotWarpPreviewLauncher()
+                    case .ghostty:                 return CopilotGhosttyLauncher()
+                    case .macterm:                 return CopilotMactermLauncher()
+                    case .terminalApp, .unknown:   return CopilotTerminalLauncher()
+                    }
+                }()
+                let coord = CopilotResumeCoordinator(env: CopilotCLIEnvironment(), builder: CopilotResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .cursor:
+            let settings = CursorSettings.shared
+            let sid = s.id
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = CursorResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: CursorTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return CursorITermLauncher()
+                    case .warp:                    return CursorWarpLauncher()
+                    case .warpPreview:             return CursorWarpPreviewLauncher()
+                    case .ghostty:                 return CursorGhosttyLauncher()
+                    case .macterm:                 return CursorMactermLauncher()
+                    case .terminalApp, .unknown:   return CursorTerminalLauncher()
+                    }
+                }()
+                let coord = CursorResumeCoordinator(env: CursorCLIEnvironment(), builder: CursorResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .pi:
+            let settings = PiSettings.shared
+            let sid = s.id
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let sessionDirectory = settings.copyCommandPlan(sessionID: sid)?.sessionDirectory
+            let input = PiResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin, sessionDirectory: sessionDirectory)
+            Task { @MainActor in
+                let launcher: PiTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return PiITermLauncher()
+                    case .warp:                    return PiWarpLauncher()
+                    case .warpPreview:             return PiWarpPreviewLauncher()
+                    case .ghostty:                 return PiGhosttyLauncher()
+                    case .macterm:                 return PiMactermLauncher()
+                    case .terminalApp, .unknown:   return PiTerminalLauncher()
+                    }
+                }()
+                let coord = PiResumeCoordinator(env: PiCLIEnvironment(), builder: PiResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .kimi:
+            let settings = KimiSettings.shared
+            let sid = s.id
+            let wd = effectiveWorkingDirectoryURL(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = KimiResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: KimiTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return KimiITermLauncher()
+                    case .warp:                    return KimiWarpLauncher()
+                    case .warpPreview:             return KimiWarpPreviewLauncher()
+                    case .ghostty:                 return KimiGhosttyLauncher()
+                    case .macterm:                 return KimiMactermLauncher()
+                    case .terminalApp, .unknown:   return KimiTerminalLauncher()
+                    }
+                }()
+                let coord = KimiResumeCoordinator(env: KimiCLIEnvironment(), builder: KimiResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .grok:
+            let settings = GrokSettings.shared
+            let sid = s.id
+            let wd = effectiveWorkingDirectoryURL(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = GrokResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: GrokTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return GrokITermLauncher()
+                    case .warp:                    return GrokWarpLauncher()
+                    case .warpPreview:             return GrokWarpPreviewLauncher()
+                    case .ghostty:                 return GrokGhosttyLauncher()
+                    case .macterm:                 return GrokMactermLauncher()
+                    case .terminalApp, .unknown:   return GrokTerminalLauncher()
+                    }
+                }()
+                let coord = GrokResumeCoordinator(env: GrokCLIEnvironment(), builder: GrokResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .qwen:
+            let storageContext = QwenResumeEligibility.configuredStorageContext()
+            guard QwenResumeEligibility.canResume(s, storageContext: storageContext) else { return }
+            let settings = QwenSettings.shared
+            let input = QwenResumeInput(
+                sessionID: s.id,
+                workingDirectory: effectiveWorkingDirectoryURL(for: s),
+                binaryOverride: settings.binaryPath.isEmpty ? nil : settings.binaryPath,
+                storageEnvironmentOverride: storageContext.environmentOverride
+            )
+            Task { @MainActor in
+                let launcher: QwenTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                return QwenITermLauncher()
+                    case .warp:                  return QwenWarpLauncher()
+                    case .warpPreview:           return QwenWarpPreviewLauncher()
+                    case .ghostty:               return QwenGhosttyLauncher()
+                    case .macterm:               return QwenMactermLauncher()
+                    case .terminalApp, .unknown: return QwenTerminalLauncher()
+                    }
+                }()
+                let coordinator = QwenResumeCoordinator(
+                    environment: QwenCLIEnvironment(),
+                    builder: QwenResumeCommandBuilder(),
+                    launcher: launcher
+                )
+                let result = await coordinator.resumeInTerminal(input: input)
+                reportResumeFailure(launched: result.launched, error: result.error,
+                                    source: s.source, in: presentingWindow)
+            }
+        case .devin:
+            let settings = DevinSettings.shared
+            let sid = s.id
+            let wd = effectiveWorkingDirectoryURL(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = DevinResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: DevinTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return DevinITermLauncher()
+                    case .warp:                    return DevinWarpLauncher()
+                    case .warpPreview:             return DevinWarpPreviewLauncher()
+                    case .ghostty:                 return DevinGhosttyLauncher()
+                    case .macterm:                 return DevinMactermLauncher()
+                    case .terminalApp, .unknown:   return DevinTerminalLauncher()
+                    }
+                }()
+                let coord = DevinResumeCoordinator(env: DevinCLIEnvironment(), builder: DevinResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .fx:
+            let settings = FxSettings.shared
+            let input = FxResumeInput(
+                sessionID: s.id,
+                workingDirectory: effectiveWorkingDirectoryURL(for: s),
+                binaryOverride: settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            )
+            Task { @MainActor in
+                let launcher: FxTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                return FxITermLauncher()
+                    case .warp:                  return FxWarpLauncher()
+                    case .warpPreview:           return FxWarpPreviewLauncher()
+                    case .ghostty:               return FxGhosttyLauncher()
+                    case .macterm:               return FxMactermLauncher()
+                    case .terminalApp, .unknown: return FxTerminalLauncher()
+                    }
+                }()
+                let coord = FxResumeCoordinator(env: FxCLIEnvironment(), builder: FxResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .antigravity:
+            let settings = AntigravityCLISettings.shared
+            let sid = AntigravitySessionIDHelper.deriveSessionID(from: s)
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryOverride.isEmpty ? nil : settings.binaryOverride
+            let input = AntigravityResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: AntigravityTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return AntigravityITermLauncher()
+                    case .warp:                    return AntigravityWarpLauncher()
+                    case .warpPreview:             return AntigravityWarpPreviewLauncher()
+                    case .ghostty:                 return AntigravityGhosttyLauncher()
+                    case .macterm:                 return AntigravityMactermLauncher()
+                    case .terminalApp, .unknown:   return AntigravityTerminalLauncher()
+                    }
+                }()
+                let coord = AntigravityResumeCoordinator(env: AntigravityCLIEnvironment(), builder: AntigravityResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .claude:
+            let settings = ClaudeResumeSettings.shared
+            let sid = ClaudeSessionIDHelper.deriveSessionID(from: s)
+            let wd = ClaudeSessionIDHelper.projectRoot(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = ClaudeResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: ClaudeTerminalLaunching = {
+                    switch ResumePreferenceHelpers.resolveTerminalKind() {
+                    case .iterm2:                  return ClaudeITermLauncher()
+                    case .warp:                    return ClaudeWarpLauncher()
+                    case .warpPreview:             return ClaudeWarpPreviewLauncher()
+                    case .ghostty:                 return ClaudeGhosttyLauncher()
+                    case .macterm:                 return ClaudeMactermLauncher()
+                    case .terminalApp, .unknown:   return ClaudeTerminalLauncher()
+                    }
+                }()
+                let coord = ClaudeResumeCoordinator(env: ClaudeCLIEnvironment(), builder: ClaudeResumeCommandBuilder(), launcher: launcher)
+                let result = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+                reportResumeFailure(launched: result.launched, error: result.error, source: s.source, in: presentingWindow)
+            }
+        case .droid, .openclaw, .cline, .deepseekHarness:
+            // Old `default: return` (SPEC §6.C). Neither has a resume path, and the
+            // `supportsResume` guard above already returned — but the arm is written out so
+            // a new source fails to compile here instead of quietly doing nothing
+            // behind a Resume menu item that its own descriptor said it supports.
+            return
+        }
+    }
+
+    // Match Codex window message display policy
+    private func unifiedMessageDisplay(for s: Session) -> String {
+        let count = s.messageCount
+        if s.events.isEmpty {
+            if let bytes = s.fileSizeBytes {
+                return formattedSize(bytes)
+            }
+            return fallbackEstimate(count)
+        } else {
+            return String(format: "%3d", count)
+        }
+    }
+
+    private func formattedSize(_ bytes: Int) -> String {
+        let mb = Double(bytes) / 1_048_576.0
+        if mb >= 10 {
+            return "\(Int(round(mb)))MB"
+        } else if mb >= 1 {
+            return String(format: "%.1fMB", mb)
+        }
+        let kb = max(1, Int(round(Double(bytes) / 1024.0)))
+        return "\(kb)KB"
+    }
+
+    private func fallbackEstimate(_ count: Int) -> String {
+        if count >= 1000 { return "1000+" }
+        return "~\(count)"
+    }
+    
+    /// Immutable snapshot of the titles actually displayed for rows, keyed by
+    /// source-qualified session identity. Mirrors row rendering (`SessionTitleCell` receives
+    /// `unified.claudeDesktopTitle(for:)` as its display override): only
+    /// nonempty overrides are included, everything else falls back to
+    /// `session.listTitle` inside the coordinator. Pure over its inputs so
+    /// search tests can pin it without a live indexer.
+    static func claudeDisplayTitleSnapshot(
+        sessions: [Session],
+        titleFor: (Session) -> String?
+    ) -> [SearchCoordinator.SessionKey: String] {
+        var out: [SearchCoordinator.SessionKey: String] = [:]
+        out.reserveCapacity(sessions.count)
+        for session in sessions {
+            guard let title = titleFor(session)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !title.isEmpty else { continue }
+            out[SearchCoordinator.SessionKey(session)] = title
+        }
+        return out
+    }
+
+    /// Single helper for setting or clearing the exact project selection: the
+    /// list recomputes and any nonempty search restarts whether the coordinator
+    /// is running or already completed, so the search coordinator always
+    /// receives the selected identity and never retains an old search universe.
+    /// An empty query cancels instead of starting a search.
+    private func applyProjectSelection(_ selection: ProjectSelection?) {
+        unified.projectSelection = selection
+        unified.recomputeNow()
+        restartSearchForActiveQuery()
+    }
+
+    private func restartSearchIfRunning() {
+        restartSearch(onlyIfRunning: true)
+    }
+
+    private func restartSearchForActiveQuery() {
+        restartSearch(onlyIfRunning: false)
+    }
+
+    private func restartSearchForSideChatDatasetChangeIfNeeded() {
+        let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        guard FilterEngine.parseOperators(q).sideChatsOnly else { return }
+        scheduleDatasetSearchRestart()
+    }
+
+    /// Dataset-membership refresh: a nonempty search, running or completed,
+    /// restarts when the unified (source, id) membership changes. Passes
+    /// preserveResultsUntilRefreshPublishes so old results stay visible until
+    /// the new run's first publication replaces them.
+    private func restartSearchForDatasetMembershipChangeIfNeeded() {
+        let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        scheduleDatasetSearchRestart()
+    }
+
+    private func scheduleDatasetSearchRestart() {
+        guard NSApp.isActive else { return }
+        datasetSearchRestartCoalescer.schedule {
+            guard NSApp.isActive else { return }
+            restartSearch(onlyIfRunning: false, preserveResultsUntilRefreshPublishes: true)
+        }
+    }
+
+    private func restartSearch(onlyIfRunning: Bool, preserveResultsUntilRefreshPublishes: Bool = false) {
+        guard !onlyIfRunning || searchCoordinator.isRunning else { return }
+        let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { searchCoordinator.cancel(); return }
+        let filters = Filters(query: q,
+                              dateFrom: unified.dateFrom,
+                              dateTo: unified.dateTo,
+                              model: unified.selectedModel,
+                              kinds: unified.selectedKinds,
+                              repoName: nil,
+                              pathContains: nil,
+                              archivedCodexDesktopOnly: unified.showArchivedCodexDesktopOnly,
+                              archivedClaudeDesktopOnly: unified.showArchivedClaudeDesktopOnly,
+                              archivedClaudeSessionIDs: unified.archivedClaudeSessionIDs,
+                              sideChatsOnly: false,
+                              selectedProjectIdentity: unified.projectSelection?.identity)
+        searchCoordinator.start(query: q,
+                                filters: filters,
+                                allowed: unified.allowedSearchSources(),
+                                enableDeepScan: searchCoordinator.deepScanEnabled,
+                                all: unified.allSessions,
+                                effectiveDisplayTitles: Self.claudeDisplayTitleSnapshot(
+                                    sessions: unified.allSessions,
+                                    titleFor: { unified.claudeDesktopTitle(for: $0) }),
+                                preserveResultsUntilRefreshPublishes: preserveResultsUntilRefreshPublishes)
+    }
+
+    private func flashAgentEnablementNoticeIfNeeded() {
+        // The twelve-term `&&` chain this replaces had to be extended by hand for every
+        // new source; `allCases` cannot forget one.
+        let anyDisabled = SessionSource.allCases.contains { !unified.isAgentEnabled($0) }
+        guard anyDisabled else {
+            withAnimation { showAgentEnablementNotice = false }
+            return
+        }
+
+        withAnimation { showAgentEnablementNotice = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            withAnimation { showAgentEnablementNotice = false }
+        }
+    }
+
+    /// Row accent. The ten "other agent" sources use the same color as their toolbar pill
+    /// — that was already true arm-for-arm in the switch this replaces, including
+    /// antigravity's and opencode's SwiftUI `.teal`/`.purple`. Codex and Claude have no
+    /// pill (they render as fixed segmented pills), and their old arms were
+    /// `Color.agentCodex`/`agentClaude`, which are defined as the brand accent — so the
+    /// fallback reproduces them exactly. Pinned per source and per appearance by
+    /// `SessionSourceRegistryTests`' pill and brand goldens.
+    private func sourceAccent(_ s: Session) -> Color {
+        let descriptor = s.source.descriptor
+        return descriptor.otherAgentPill?.color
+            ?? Color(nsColor: SessionSourceRegistry.resolvedBrandAccent(for: s.source))
+    }
+
+    private func isSessionLive(_ session: Session) -> Bool {
+        guard activeCodexSessions.supportsLiveSessions(for: session.source) else { return false }
+        return livePresence(for: session) != nil
+    }
+
+    private func livePresence(for session: Session) -> CodexActivePresence? {
+        if let direct = activeCodexSessions.presence(for: session) {
+            return direct
+        }
+        let fallbackKey = Self.fallbackPresenceKey(source: session.source, sessionID: session.id)
+        return cachedFallbackPresenceBySessionKey[fallbackKey]
+    }
+
+    /// Sessions eligible for fallback-presence matching whose `activeCodexSessions.presence(for:)`
+    /// lookup (main-actor: hits `CodexActiveSessionsModel`'s internal lookup caches,
+    /// not just Sendable data) already resolved directly. Computed on main --
+    /// this is the one part of the fallback-presence pipeline that genuinely
+    /// cannot move off-main (see doc comment on `buildFallbackPresenceMap`) --
+    /// but it's the same O(sessions) set of calls this function always made, just
+    /// isolated from the heavy grouping/sorting that used to run alongside it.
+    /// Delegates to `SessionRowsBuilder.directJoinFallbackKeys` (S2 shared
+    /// helper) so this file and `AgentCockpitHUDView` don't each keep their
+    /// own copy of the same source-filter loop.
+    private func directJoinFallbackKeys(for sessions: [Session]) -> Set<String> {
+#if DEBUG
+        let _span = Perf.begin("directJoinFallbackKeys", thresholdMs: 4, "sessions=\(sessions.count)")
+        defer { Perf.end(_span) }
+#endif
+        return SessionRowsBuilder.directJoinFallbackKeys(for: sessions) { session in
+            activeCodexSessions.presence(for: session)
+        }
+    }
+
+    /// Main-actor, standalone fallback-presence refresh for the membership-tick
+    /// "cheap path" (dots-only update when Active-only filtering is off, see the
+    /// call site's comment: SET+order don't change on a live-presence poll, only
+    /// dot state does, so a full rows rebuild would be wasted work). This is
+    /// distinct from the rows-rebuild pipeline's fallback-presence computation
+    /// (SessionRowsBuilder.build, off-main, W7 Task 1 Step 6c) -- this path must
+    /// stay synchronous and main-actor because it runs on every live-poll tick
+    /// independent of any rows rebuild.
+    private func rebuildCachedFallbackPresences() {
+        let sessions = unified.allSessions
+        cachedFallbackPresenceBySessionKey = SessionRowsBuilder.buildFallbackPresenceMap(
+            sessions: sessions,
+            presences: activeCodexSessions.presences,
+            directJoinSessionKeys: directJoinFallbackKeys(for: sessions)
+        )
+    }
+
+    /// Fallback-presence join logic (`buildFallbackPresenceMap` and its
+    /// private helpers, plus `fallbackClaimedPresence`/`fallbackEligibleSessions`/
+    /// `fallbackSessionSort`/`fallbackPresenceSort`) lives in `SessionRowsBuilder`
+    /// (Services) -- pure business logic over `Session`/`CodexActivePresence`
+    /// Sendable data, with no View dependency (T2). These are thin forwarders
+    /// so call sites in this file can keep using `Self.<name>(...)`.
+    static func buildFallbackPresenceMap(sessions: [Session],
+                                         presences: [CodexActivePresence],
+                                         directJoinSessionKeys: Set<String>) -> [String: CodexActivePresence] {
+        SessionRowsBuilder.buildFallbackPresenceMap(
+            sessions: sessions,
+            presences: presences,
+            directJoinSessionKeys: directJoinSessionKeys
+        )
+    }
+
+    static func fallbackPresenceKey(source: SessionSource, sessionID: String) -> String {
+        SessionRowsBuilder.fallbackPresenceKey(source: source, sessionID: sessionID)
+    }
+
+    static func fallbackClaimedPresence(for session: Session,
+                                        among candidateSessions: [Session],
+                                        using fallbackPresences: [CodexActivePresence]) -> CodexActivePresence? {
+        SessionRowsBuilder.fallbackClaimedPresence(for: session, among: candidateSessions, using: fallbackPresences)
+    }
+
+    static func fallbackEligibleSessions(from candidateSessions: [Session],
+                                         hasDirectJoin: (Session) -> Bool) -> [Session] {
+        SessionRowsBuilder.fallbackEligibleSessions(from: candidateSessions, hasDirectJoin: hasDirectJoin)
+    }
+
+	    private func progressLineText(_ p: SearchCoordinator.Progress) -> String {
+	        switch p.phase {
+	        case .idle:
+	            return "Searching…"
+	        case .indexed:
+	            return "Searching indexed text…"
+	        case .legacySmall:
+	            return "Scanning sessions… \(p.scannedSmall)/\(p.totalSmall)"
+	        case .legacyLarge:
+	            return "Scanning sessions (large)… \(p.scannedLarge)/\(p.totalLarge)"
+	        case .unindexedSmall:
+	            return "Searching sessions not indexed yet… \(p.scannedSmall)/\(p.totalSmall)"
+	        case .unindexedLarge:
+	            return "Searching sessions not indexed yet (large)… \(p.scannedLarge)/\(p.totalLarge)"
+	        case .toolOutputsSmall:
+	            return "Searching full tool outputs… \(p.scannedSmall)/\(p.totalSmall)"
+	        case .toolOutputsLarge:
+	            return "Searching large tool outputs… \(p.scannedLarge)/\(p.totalLarge)"
+	        }
+	    }
+
+    private func starHelpText(isStarred: Bool) -> String {
+        let pins = UserDefaults.standard.object(forKey: PreferencesKey.Archives.starPinsSessions) as? Bool ?? true
+        let unstarRemoves = UserDefaults.standard.bool(forKey: PreferencesKey.Archives.unstarRemovesArchive)
+        if isStarred {
+            if pins && unstarRemoves { return "Remove from Saved (deletes local copy)" }
+            if pins { return "Remove from Saved (keeps local copy)" }
+            return "Remove from Saved"
+        } else {
+            return pins ? "Save (keeps locally)" : "Save"
+        }
+    }
+}
+
+/// Describes one non-Codex/Claude agent toggle so it can render either as a
+/// toolbar pill or as a row in the overflow filter menu without duplicating the
+/// title/color/binding/shortcut in two places.
+struct AgentToolbarSpec: Identifiable {
+    let id: String
+    let title: String
+    let color: Color
+    let isOn: Binding<Bool>
+    let shortcut: KeyEquivalent?
+}
+
+/// Overflow control shown in place of the individual agent pills once the
+/// toolbar gets crowded (more than four agents enabled). Styled as a pill
+/// identical to `AgentTabToggle` — with a chevron to signal it expands — so it
+/// reads as "the other agent pills, collapsed into one." Each menu row toggles
+/// that agent's inclusion; the ⌘ shortcuts are handled by hidden buttons.
+private struct AgentOverflowMenu: View {
+    let specs: [AgentToolbarSpec]
+
+    var body: some View {
+        Menu {
+            ForEach(specs) { spec in
+                Toggle(isOn: spec.isOn) { Text(spec.title) }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("Agents")
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundStyle(.primary)
+            .agentPillSurface()
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Show or hide agents in the list")
+        .accessibilityLabel(Text("Agent filters"))
+    }
+}
+
+/// The shared capsule surface used by every agent pill (individual toggles and
+/// the "Agents" overflow), so they stay pixel-identical.
+private struct AgentPillSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(UnifiedSessionsStyle.agentTabFont)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(UnifiedSessionsStyle.agentPillFill)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(UnifiedSessionsStyle.agentPillStroke, lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+    }
+}
+
+private extension View {
+    func agentPillSurface() -> some View { modifier(AgentPillSurface()) }
+}
+
+private struct AgentTabToggle: View {
+    let title: String
+    let color: Color
+    let isMonochrome: Bool
+    @Binding var isOn: Bool
+
+    private var activeColor: Color { isMonochrome ? .primary : color }
+    private var textColor: Color {
+        if isOn { return activeColor }
+        return isMonochrome ? .secondary : .primary
+    }
+
+    var body: some View {
+        Button(action: { isOn.toggle() }) {
+            Text(title)
+                .foregroundStyle(textColor)
+                .agentPillSurface()
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(title))
+        .accessibilityValue(Text(isOn ? "On" : "Off"))
+    }
+}
+
+private struct ActiveSessionsOnlyToggle: View {
+    @Binding var isOn: Bool
+
+    private let dotSize: CGFloat = 7.8
+
+    private var dotColor: Color {
+        isOn ? UnifiedSessionsStyle.selectionAccent : Color.secondary.opacity(0.5)
+    }
+
+    var body: some View {
+        Button(action: { isOn.toggle() }) {
+            HStack(spacing: 0) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: dotSize, height: dotSize)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(UnifiedSessionsStyle.agentPillFill)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(UnifiedSessionsStyle.agentPillStroke, lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Live sessions only"))
+        .accessibilityValue(Text(isOn ? "On" : "Off"))
+    }
+}
+
+private struct ArchivedCodexDesktopIconToggle: View {
+    @Binding var isOn: Bool
+    @Binding var includeCodex: Bool
+
+    var body: some View {
+        Button(action: toggle) {
+            Image(systemName: isOn ? "archivebox.fill" : "archivebox")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isOn ? UnifiedSessionsStyle.selectionAccent : .secondary)
+                .frame(minWidth: 14)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(UnifiedSessionsStyle.agentPillFill)
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(isOn ? UnifiedSessionsStyle.selectionAccent.opacity(0.55) : UnifiedSessionsStyle.agentPillStroke, lineWidth: 1)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Narrow Codex to archived Desktop sessions"))
+        .accessibilityValue(Text(isOn ? "On" : "Off"))
+    }
+
+    private func toggle() {
+        let nextValue = !isOn
+        if nextValue, !includeCodex {
+            includeCodex = true
+        }
+        isOn = nextValue
+    }
+}
+
+private struct ToolbarIcon: View {
+    let systemName: String
+    var isActive: Bool = false
+    var activeColor: Color = UnifiedSessionsStyle.selectionAccent
+    var opacity: Double? = nil
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(UnifiedSessionsStyle.toolbarIconFont)
+            .frame(width: UnifiedSessionsStyle.toolbarIconSize, height: UnifiedSessionsStyle.toolbarIconSize)
+            .foregroundStyle(isActive ? activeColor : .primary)
+            .opacity((opacity ?? 1) * (isEnabled ? 1 : 0.4))
+    }
+}
+
+private struct ToolbarIconButton<Label: View>: View {
+    let help: String
+    let label: (Bool) -> Label
+    let action: () -> Void
+    @State private var isHovering: Bool = false
+
+    var body: some View {
+        Button(action: action) {
+            label(isHovering)
+                .frame(width: UnifiedSessionsStyle.toolbarButtonSize, height: UnifiedSessionsStyle.toolbarButtonSize)
+                .background(
+                    RoundedRectangle(cornerRadius: UnifiedSessionsStyle.toolbarButtonCornerRadius, style: .continuous)
+                        .fill(Color.black.opacity(isHovering ? UnifiedSessionsStyle.toolbarHoverOpacity : 0))
+                )
+                .contentShape(RoundedRectangle(cornerRadius: UnifiedSessionsStyle.toolbarButtonCornerRadius, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .onHover { hovering in isHovering = hovering }
+        .animation(.easeInOut(duration: 0.15), value: isHovering)
+    }
+}
+
+private struct ToolbarIconToggle: View {
+    @Binding var isOn: Bool
+    let onSymbol: String
+    let offSymbol: String
+    let help: String
+    var activeColor: Color = UnifiedSessionsStyle.selectionAccent
+    var accessibilityLabel: String = "Toggle"
+
+    var body: some View {
+        ToolbarIconButton(help: help) { _ in
+            ToolbarIcon(systemName: isOn ? onSymbol : offSymbol,
+                        isActive: isOn,
+                        activeColor: activeColor)
+        } action: {
+            isOn.toggle()
+        }
+        .accessibilityLabel(Text(accessibilityLabel))
+        .accessibilityValue(Text(isOn ? "On" : "Off"))
+    }
+}
+
+private struct ToolbarGroupDivider: View {
+    var body: some View {
+        Divider()
+            .frame(height: 18)
+    }
+}
+
+// Stable transcript host that preserves layout identity across provider switches
+struct TranscriptHostView: View {
+    let kind: SessionSource
+    let selection: String?
+    /// Twelve positional indexer properties collapse to one catalog. This is the enumerated
+    /// concrete-type site (SPEC §6.A.6): each transcript view below is generic over its own
+    /// indexer class, so the downcasts stay, but they are now resolved in one place from the
+    /// same objects `coveredSources` is tested against.
+    let catalog: SessionProviderCatalog
+    private var codexIndexer: SessionIndexer { catalog.indexer(.codex, as: SessionIndexer.self) }
+    private var claudeIndexer: ClaudeSessionIndexer { catalog.indexer(.claude, as: ClaudeSessionIndexer.self) }
+    private var antigravityIndexer: AntigravitySessionIndexer { catalog.indexer(.antigravity, as: AntigravitySessionIndexer.self) }
+    private var opencodeIndexer: OpenCodeSessionIndexer { catalog.indexer(.opencode, as: OpenCodeSessionIndexer.self) }
+    private var hermesIndexer: HermesSessionIndexer { catalog.indexer(.hermes, as: HermesSessionIndexer.self) }
+    private var copilotIndexer: CopilotSessionIndexer { catalog.indexer(.copilot, as: CopilotSessionIndexer.self) }
+    private var droidIndexer: DroidSessionIndexer { catalog.indexer(.droid, as: DroidSessionIndexer.self) }
+    private var openclawIndexer: OpenClawSessionIndexer { catalog.indexer(.openclaw, as: OpenClawSessionIndexer.self) }
+    private var cursorIndexer: CursorSessionIndexer { catalog.indexer(.cursor, as: CursorSessionIndexer.self) }
+    private var piIndexer: PiSessionIndexer { catalog.indexer(.pi, as: PiSessionIndexer.self) }
+    private var kimiIndexer: KimiSessionIndexer { catalog.indexer(.kimi, as: KimiSessionIndexer.self) }
+    private var grokIndexer: GrokSessionIndexer { catalog.indexer(.grok, as: GrokSessionIndexer.self) }
+    private var qwenIndexer: QwenSessionIndexer { catalog.indexer(.qwen, as: QwenSessionIndexer.self) }
+    private var devinIndexer: DevinSessionIndexer { catalog.indexer(.devin, as: DevinSessionIndexer.self) }
+    private var fxIndexer: FxSessionIndexer { catalog.indexer(.fx, as: FxSessionIndexer.self) }
+    private var clineIndexer: ClineSessionIndexer { catalog.indexer(.cline, as: ClineSessionIndexer.self) }
+    private var deepSeekHarnessIndexer: DeepSeekHarnessSessionIndexer {
+        catalog.indexer(.deepseekHarness, as: DeepSeekHarnessSessionIndexer.self)
+    }
+
+    var body: some View {
+        ZStack { // keep one stable container to avoid split reset
+            TranscriptPlainView(sessionID: selection)
+                .environmentObject(codexIndexer)
+                .opacity(kind == .codex ? 1 : 0)
+            ClaudeTranscriptView(indexer: claudeIndexer, sessionID: selection)
+                .opacity(kind == .claude ? 1 : 0)
+            AntigravityTranscriptView(indexer: antigravityIndexer, sessionID: selection)
+                .opacity(kind == .antigravity ? 1 : 0)
+            OpenCodeTranscriptView(indexer: opencodeIndexer, sessionID: selection)
+                .opacity(kind == .opencode ? 1 : 0)
+            HermesTranscriptView(indexer: hermesIndexer, sessionID: selection)
+                .opacity(kind == .hermes ? 1 : 0)
+            CopilotTranscriptView(indexer: copilotIndexer, sessionID: selection)
+                .opacity(kind == .copilot ? 1 : 0)
+            DroidTranscriptView(indexer: droidIndexer, sessionID: selection)
+                .opacity(kind == .droid ? 1 : 0)
+            OpenClawTranscriptView(indexer: openclawIndexer, sessionID: selection)
+                .opacity(kind == .openclaw ? 1 : 0)
+            CursorTranscriptView(indexer: cursorIndexer, sessionID: selection)
+                .opacity(kind == .cursor ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: piIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "Pi",
+                enableCaching: false
+            )
+            .opacity(kind == .pi ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: kimiIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "Kimi Code",
+                enableCaching: false
+            )
+            .opacity(kind == .kimi ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: grokIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "Grok CLI",
+                enableCaching: false
+            )
+            .opacity(kind == .grok ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: qwenIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "Qwen Code",
+                enableCaching: false
+            )
+            .opacity(kind == .qwen ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: devinIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "Devin CLI",
+                enableCaching: false
+            )
+            .opacity(kind == .devin ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: fxIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "fx",
+                enableCaching: false
+            )
+            .opacity(kind == .fx ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: clineIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "Cline",
+                enableCaching: false
+            )
+            .opacity(kind == .cline ? 1 : 0)
+            UnifiedTranscriptView(
+                indexer: deepSeekHarnessIndexer,
+                sessionID: selection,
+                sessionIDExtractor: { $0.id.isEmpty ? nil : $0.id },
+                sessionIDLabel: "DeepSeek",
+                enableCaching: false
+            )
+            .opacity(kind == .deepseekHarness ? 1 : 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+    }
+
+    /// Every source that has a layer in the `ZStack` above.
+    ///
+    /// The layers are selected by `opacity`, not by a `switch`, so a source with no
+    /// layer is not a compile error — it silently renders an empty transcript with
+    /// every layer at zero opacity. Grok shipped exactly that way: its indexer was
+    /// declared, passed in, and never used. `testTranscriptHostCoversEverySource`
+    /// compares this set against `SessionSource.allCases`.
+    static let coveredSources: Set<SessionSource> = [
+        .codex, .claude, .antigravity, .opencode, .hermes, .copilot,
+        .droid, .openclaw, .cursor, .pi, .kimi, .grok, .qwen, .devin, .fx, .cline, .deepseekHarness
+    ]
+}
+
+// Session title cell with inline Antigravity refresh affordance (hover-only)
+private struct SessionTitleCell: View, Equatable {
+    let session: Session
+    let displayTitleOverride: String?
+    let searchHit: SearchHit?
+    let excerptLines: Int
+    let showAlso: Bool
+    let antigravityIndexer: AntigravitySessionIndexer
+    let rowMeta: SubagentRowMeta?
+    let sideChatParentContext: String?
+    let isExpanded: Bool
+    let onToggleExpand: ((String) -> Void)?
+    @State private var hover: Bool = false
+
+    static func == (lhs: SessionTitleCell, rhs: SessionTitleCell) -> Bool {
+        lhs.session.id == rhs.session.id
+            && lhs.session.source == rhs.session.source
+            && lhs.session.listTitle == rhs.session.listTitle
+            && lhs.session.isSubagent == rhs.session.isSubagent
+            && lhs.session.isSideChat == rhs.session.isSideChat
+            && lhs.session.isDeleted == rhs.session.isDeleted
+            && lhs.session.subagentType == rhs.session.subagentType
+            && lhs.session.model == rhs.session.model
+            && lhs.session.reasoningEffort == rhs.session.reasoningEffort
+            && lhs.displayTitleOverride == rhs.displayTitleOverride
+            && lhs.searchHit == rhs.searchHit
+            && lhs.excerptLines == rhs.excerptLines
+            && lhs.showAlso == rhs.showAlso
+            && lhs.rowMeta == rhs.rowMeta
+            && lhs.sideChatParentContext == rhs.sideChatParentContext
+            && lhs.isExpanded == rhs.isExpanded
+    }
+
+    var body: some View {
+        let isNestedSubagent = (rowMeta?.depth ?? 0) > 0
+        let showFlatSubagentMarker = session.isSubagent && !isNestedSubagent
+        HStack(spacing: 4) {
+            // Indent nested rows by depth. A nested row can itself be a parent
+            // (subagent that spawned subagents), so this can't live in the
+            // chevron's `else` branch or those rows would read as top-level.
+            if isNestedSubagent {
+                Spacer().frame(width: CGFloat(20 * (rowMeta?.depth ?? 1)))
+            }
+            // Disclosure chevron for parents with children
+            if let meta = rowMeta, meta.hasChildren {
+                Button(action: { onToggleExpand?(session.id) }) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeInOut(duration: 0.15), value: isExpanded)
+                }
+                .buttonStyle(.plain)
+                .frame(width: 16)
+                .foregroundStyle(.secondary)
+                if meta.hasWorkflowChildren {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .help("Spawned a workflow · \(meta.childCount) agents")
+                        .accessibilityLabel("Spawned a workflow")
+                }
+                Text("(\(meta.childCount))")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            if showFlatSubagentMarker {
+                Text("sub")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.12))
+                    .foregroundStyle(.secondary)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .accessibilityLabel("Subagent")
+                    .help(subagentPillHelp)
+            }
+
+            if session.isSideChat {
+                Text("side")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.green.opacity(0.18))
+                    .foregroundStyle(.green)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .accessibilityLabel("Side chat")
+                    .help("Codex side chat")
+            }
+
+            // Subagent type badge (only when hierarchy nesting is active)
+            if isNestedSubagent {
+                if let agentType = session.subagentType, !agentType.isEmpty {
+                    Text(WorkflowSubagentBadge.displayLabel(for: agentType))
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.purple.opacity(0.15))
+                        .foregroundStyle(.purple)
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .help(subagentPillHelp)
+                }
+                // Model badge
+                if let abbreviated = ModelNameAbbreviator.abbreviate(
+                    SessionInfoMetadataSanitizer.model(session.model, source: session.source)) {
+                    Text(abbreviated)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.blue.opacity(0.12))
+                        .foregroundStyle(.blue)
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                }
+            }
+
+            if session.isDeleted {
+                Text("deleted")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.red.opacity(0.12))
+                    .foregroundStyle(.red)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .accessibilityLabel("Deleted session")
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(displayTitle)
+                        .font(.system(size: 13, weight: .regular, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if session.isSideChat, let sideChatParentContext {
+                        Text("of \(sideChatParentContext)")
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                if let searchHit {
+                    Text(Self.excerptText(searchHit))
+                        .font(.system(size: 11))
+                        .lineLimit(min(3, max(1, excerptLines)))
+                        .truncationMode(.tail)
+                    if showAlso, !searchHit.also.isEmpty {
+                        Text(String(localized: "Also in \(searchHit.also.map(\.label).formatted(.list(type: .and)))",
+                                    comment: "Search result: other parts of the chat that match too, e.g. Also in Tool calls and Tool output."))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            .background(Color.clear)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if session.source == .antigravity {
+                AntigravityPreviewRefreshButton(
+                    indexer: antigravityIndexer,
+                    sessionID: session.id,
+                    isHovered: hover
+                )
+            }
+        }
+        .onHover { hover = $0 }
+    }
+
+    private var displayTitle: String {
+        SessionInfoMetadataSanitizer.rowTitle(for: session, override: displayTitleOverride) ?? "Untitled session"
+    }
+
+    /// "My prompts  …the passage with the matched words in bold…", the field in its transcript color.
+    private static func excerptText(_ hit: SearchHit) -> AttributedString {
+        var label = hit.inSubagent
+            ? String(localized: "Sub-agent \(hit.field.label)",
+                     comment: "Search result: the passage is from a sub-agent of this chat, e.g. Sub-agent Replies.")
+            : hit.field.label
+        if let part = hit.part, let count = hit.partCount {
+            label += " · " + String(localized: "part \(part) of \(count)",
+                                    comment: "Search result: which stored file of a long chat matched, e.g. part 3 of 5.")
+        }
+        var out = AttributedString(label)
+        out.foregroundColor = fieldColor(hit.field)
+        out.inlinePresentationIntent = .stronglyEmphasized
+        if hit.excerpt != nil { out += AttributedString("  ") }
+        var isMatch = false
+        let pieces = SearchHit.plain(hit.excerpt ?? "").split(omittingEmptySubsequences: false) {
+            $0 == SearchHit.markStart || $0 == SearchHit.markEnd
+        }
+        for piece in pieces {
+            var part = AttributedString(String(piece))
+            part.foregroundColor = isMatch ? .primary : .secondary
+            if isMatch { part.inlinePresentationIntent = .stronglyEmphasized }
+            out += part
+            isMatch.toggle()
+        }
+        return out
+    }
+
+    private var subagentPillHelp: String {
+        guard let effort = session.reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !effort.isEmpty else {
+            return "Subagent"
+        }
+        return "Subagent\nReasoning effort: \(effort)"
+    }
+
+    /// The color of the transcript chip that shows this field, so the label says where a click lands.
+    static func fieldColor(_ field: TranscriptField) -> Color {
+        switch field {
+        case .title: return .secondary
+        case .user: return TranscriptColorSystem.semanticAccent(.user)
+        case .assistant: return TranscriptColorSystem.semanticAccent(.assistant)
+        case .toolCall, .toolOutput: return TranscriptColorSystem.semanticAccent(.toolCall)
+        }
+    }
+}
+
+/// Under the toolbar while searching: which part of the chats to search, how many chats match
+/// in each, and how many search cannot read yet. Below the toolbar, so the search row keeps its width.
+private struct SearchScopeBar: View {
+    @ObservedObject var search: SearchCoordinator
+    let query: String
+    let hasRows: Bool
+    let openSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: LayoutTokens.xs) {
+            HStack(spacing: LayoutTokens.xs) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 2) {
+                        scope(nil, String(localized: "Everything", comment: "Search scope: every part of the chats."),
+                              count: search.matchCount)
+                        ForEach(SearchPreferences.fields) { field in
+                            scope(field, field.label, count: search.fieldCounts[field] ?? 0)
+                        }
+                    }
+                }
+                if search.unindexedCount > 0 {
+                    Button(action: openSettings) {
+                        Label(String(localized: "\(search.unindexedCount) not indexed yet",
+                                     comment: "Search scope bar: sessions search cannot fully read yet. Opens Settings, Search."),
+                              systemImage: "info.circle")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                    .help(String(localized: "Search finds these sessions only by their first part until they are indexed. Open Settings to see index coverage.",
+                                 comment: "Tooltip for the not-indexed count in the search scope bar."))
+                }
+            }
+            if let field = search.field, !hasRows, !search.isRunning {
+                HStack(spacing: LayoutTokens.sm) {
+                    Text(String(localized: "No chat matches “\(query)” in \(field.label).",
+                                comment: "Search scope bar: nothing matches in the chosen part of the chats, e.g. in Title."))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    if search.matchCount > 0 {
+                        Button(String(localized: "Search Everything (\(search.matchCount))",
+                                      comment: "Button: search every part of the chats instead; the number is how many chats match there.")) {
+                            search.field = nil
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, LayoutTokens.sm)
+        .padding(.vertical, LayoutTokens.xs)
+    }
+
+    private func scope(_ field: TranscriptField?, _ label: String, count: Int) -> some View {
+        let isOn = search.field == field
+        return Button { search.field = field } label: {
+            HStack(spacing: LayoutTokens.xs) {
+                Text(label)
+                Text(count, format: .number)
+                    .monospacedDigit()
+                    .foregroundStyle(field.map(SessionTitleCell.fieldColor) ?? .secondary)
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, LayoutTokens.sm)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 6).fill(isOn ? Color.primary.opacity(0.1) : Color.clear))
+            .contentShape(Rectangle())
+            .opacity(count == 0 && !isOn ? 0.5 : 1)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isOn ? .isSelected : [])
+        .help(field == nil
+              ? String(localized: "Search every part of the chats", comment: "Tooltip for the Everything search scope button.")
+              : String(localized: "Search only in \(label)", comment: "Tooltip for a search scope button, e.g. Search only in Tool output."))
+    }
+}
+
+private struct AntigravityPreviewRefreshButton: View {
+    @ObservedObject var indexer: AntigravitySessionIndexer
+    let sessionID: String
+    let isHovered: Bool
+
+    var body: some View {
+        if indexer.isPreviewStale(id: sessionID) {
+            Button(action: { indexer.refreshPreview(id: sessionID) }) {
+                Text("Refresh")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+            }
+            .buttonStyle(.bordered)
+            .tint(.teal)
+            .opacity(isHovered ? 1 : 0)
+            .help("Update this session's preview to reflect the latest file contents")
+        }
+    }
+}
+
+// Stable cell to prevent Table reuse glitches in Project column
+private struct ProjectCellView: View {
+    let id: String
+    let display: String
+    let worktree: String?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(display)
+                .font(.system(size: 13, weight: .regular, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let worktree, !worktree.isEmpty, worktree != display {
+                Text(worktree)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .id("project-cell-\(id)")
+    }
+}
+
+/// A scope toggle living inside the search field. Reads as part of the query,
+/// which is what it is, instead of as another toolbar action.
+private struct SearchScopeChip: View {
+    @Binding var isOn: Bool
+    let symbol: String
+    let title: LocalizedStringResource
+    let help: LocalizedStringResource
+    /// Narrow macOS 26 list pane: the symbol alone, title kept for VoiceOver.
+    var iconOnly: Bool = false
+
+    var body: some View {
+        Button { isOn.toggle() } label: {
+            HStack(spacing: 4) {
+                Image(systemName: isOn ? "\(symbol).fill" : symbol)
+                    .font(.system(size: 10, weight: .semibold))
+                if !iconOnly {
+                    Text(title)
+                        .font(.system(size: 11, weight: .medium))
+                }
+            }
+            .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(
+                Capsule().fill(isOn ? Color.accentColor.opacity(0.14) : Color.clear)
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(Text(help))
+        .accessibilityLabel(Text(title))
+        .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+}
+
+/// One archive control instead of an archive segment on every source pill.
+///
+/// Deliberately NOT a single archived-only Boolean: each item keeps its own
+/// source-scoped meaning — narrow that source to archived Desktop sessions,
+/// leaving every other agent visible — exactly as the pill segments did. Turning
+/// one on also turns its source on, because narrowing a hidden source to its
+/// archive would otherwise show nothing and look broken.
+private struct ArchivedScopeChip: View {
+    @ObservedObject var unified: UnifiedSessionIndexer
+    let codexEnabled: Bool
+    let claudeEnabled: Bool
+    /// Narrow macOS 26 list pane: the box symbol alone; a filled box still shows
+    /// that a filter is on.
+    var iconOnly: Bool = false
+
+    private var activeCount: Int {
+        (codexEnabled && unified.showArchivedCodexDesktopOnly ? 1 : 0)
+            + (claudeEnabled && unified.showArchivedClaudeDesktopOnly ? 1 : 0)
+    }
+
+    var body: some View {
+        if codexEnabled || claudeEnabled {
+            Menu {
+                if codexEnabled {
+                    Toggle("Codex archived only", isOn: Binding(
+                        get: { unified.showArchivedCodexDesktopOnly },
+                        set: { on in
+                            if on, !unified.includeCodex { unified.includeCodex = true }
+                            unified.showArchivedCodexDesktopOnly = on
+                        }))
+                }
+                if claudeEnabled {
+                    Toggle("Claude archived only", isOn: Binding(
+                        get: { unified.showArchivedClaudeDesktopOnly },
+                        set: { on in
+                            if on, !unified.includeClaude { unified.includeClaude = true }
+                            unified.showArchivedClaudeDesktopOnly = on
+                        }))
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: activeCount > 0 ? "archivebox.fill" : "archivebox")
+                        .font(.system(size: 10, weight: .semibold))
+                    if !iconOnly {
+                        Text(activeCount > 1 ? "Archived · \(activeCount)" : "Archived")
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                    }
+                }
+                .foregroundStyle(activeCount > 0 ? Color.accentColor : Color.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(activeCount > 0 ? Color.accentColor.opacity(0.14) : Color.clear))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Narrow a source to its archived Desktop sessions; other agents stay visible")
+            .accessibilityLabel(Text("Archived"))
+        }
+    }
+}
+
+private struct UnifiedSearchFiltersView: View {
+    @ObservedObject var unified: UnifiedSessionIndexer
+    @ObservedObject var search: SearchCoordinator
+    @ObservedObject var focus: WindowFocusCoordinator
+    @ObservedObject var searchState: UnifiedSearchState
+    /// macOS 26 pane-anchored toolbar: the field may shrink further, and the ⌥⌘F
+    /// hint and scope-chip titles drop out when the list pane is narrow. Off, the
+    /// field keeps its established layout.
+    var adaptive: Bool = false
+    // The pi/kimi/grok enablement flags this view used to AND into its two `search.start`
+    // calls are gone: the allow-list now comes from `unified.allowedSearchSources()`, which
+    // applies enablement to every registered source (SPEC §8.5). `unified` is observed, and its
+    // per-source enablement is `@Published`, so those changes still redraw this view.
+    @AppStorage(PreferencesKey.Agents.codexEnabled) private var codexAgentEnabled: Bool = true
+    @AppStorage(PreferencesKey.Agents.claudeEnabled) private var claudeAgentEnabled: Bool = true
+    @FocusState private var searchFocus: SearchFocusTarget?
+    @State private var searchDebouncer: DispatchWorkItem? = nil
+    @State private var focusRequestToken: Int = 0
+    private enum SearchFocusTarget: Hashable { case field, clear }
+
+    private var shortcutHint: some View {
+        Text("⌥⌘F")
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func scopeChips(iconOnly: Bool) -> some View {
+        SearchScopeChip(isOn: $unified.showFavoritesOnly,
+                        symbol: "star",
+                        title: "Saved",
+                        help: "Show only saved sessions",
+                        iconOnly: iconOnly)
+
+        ArchivedScopeChip(unified: unified,
+                          codexEnabled: codexAgentEnabled,
+                          claudeEnabled: claudeAgentEnabled,
+                          iconOnly: iconOnly)
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Inline search field (always visible to keep global search front-and-center)
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                    // The scope bar under the toolbar picks the field; search again when it changes.
+                    .onChange(of: search.field) { _, _ in startSearchImmediate() }
+
+                // Use an AppKit-backed text field to ensure focus works inside a toolbar
+                ToolbarSearchTextField(text: $unified.queryDraft,
+                                       placeholder: String(localized: "Search sessions",
+                                                           comment: "Placeholder in the main window search field; it searches every indexed session, not the open transcript."),
+                                       isFirstResponder: Binding(get: { searchFocus == .field },
+                                                                 set: { want in
+                                                                     if want { searchFocus = .field }
+                                                                     else if searchFocus == .field { searchFocus = nil }
+                                                                 }),
+                                       focusRequestToken: focusRequestToken,
+                                       onCommit: { startSearchImmediate() },
+                                       onEscape: { clearSearchFromField() })
+                    .frame(minWidth: adaptive ? 80 : 220)
+                    .help("Search sessions (⌥⌘F). Filters: repo:NAME, path:PATH. Use quotes for phrases; escape \\\" and \\\\. Press Return for full deep scan.")
+
+                if unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if adaptive {
+                        ViewThatFits(in: .horizontal) {
+                            shortcutHint
+                            Color.clear.frame(width: 0, height: 0)
+                        }
+                        .layoutPriority(1)
+                    } else {
+                        shortcutHint
+                    }
+                } else {
+                    Button(action: {
+                        clearSearchFromField()
+                        searchFocus = nil
+                    }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .focused($searchFocus, equals: .clear)
+                    .buttonStyle(.plain)
+                    .help("Clear search (⎋)")
+                }
+
+                // Saved is a scope on the result set, so it belongs inside the
+                // field with the other scoping, not as a separate toolbar glyph.
+                Divider().frame(height: 14)
+
+                if adaptive {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) { scopeChips(iconOnly: false) }
+                        HStack(spacing: 8) { scopeChips(iconOnly: true) }
+                    }
+                    .layoutPriority(1)
+                } else {
+                    scopeChips(iconOnly: false)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .textBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(searchFocus == .field ? UnifiedSessionsStyle.toolbarFocusRingColor : Color(nsColor: .separatorColor).opacity(0.6),
+                            lineWidth: searchFocus == .field ? 2 : 1)
+            )
+            .help("Search sessions (⌥⌘F). Filters: repo:NAME, path:PATH. Use quotes for phrases; escape \\\" and \\\\. Press Return for full deep scan.")
+            .onAppear {
+                if searchState.query != unified.queryDraft {
+                    searchState.query = unified.queryDraft
+                }
+            }
+            .onChange(of: unified.queryDraft) { _, newValue in
+                TypingActivity.shared.bump()
+                if searchState.query != newValue {
+                    searchState.query = newValue
+                }
+                let q = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if q.isEmpty {
+                    search.cancel()
+                } else {
+                    if FeatureFlags.increaseDeepSearchDebounce {
+                        scheduleSearch()
+                    } else {
+                        startSearch()
+                    }
+                }
+            }
+            .onChange(of: searchState.query) { _, newValue in
+                if unified.queryDraft != newValue {
+                    unified.queryDraft = newValue
+                }
+            }
+            .onChange(of: focus.activeFocus) { _, newFocus in
+                if newFocus == .sessionSearch {
+                    requestSearchFocus()
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSessionsSearchFromMenu)) { _ in
+                requestSearchFocus()
+            }
+
+            // Preserve the keyboard shortcut binding even though the search box is always visible.
+            Button(action: {
+                focus.perform(.closeAllSearch)
+                focus.perform(.openSessionSearch)
+                requestSearchFocus()
+            }) { EmptyView() }
+                .buttonStyle(.plain)
+                .keyboardShortcut("f", modifiers: [.command, .option])
+                .opacity(0.001)
+                .frame(width: 1, height: 1)
+
+            Button(action: {
+                focus.perform(.closeAllSearch)
+                focus.perform(.openSessionSearch)
+                requestSearchFocus()
+            }) { EmptyView() }
+                .buttonStyle(.plain)
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .opacity(0.001)
+                .frame(width: 1, height: 1)
+        }
+    }
+
+    private func requestSearchFocus() {
+        focusRequestToken &+= 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            searchFocus = .field
+        }
+    }
+
+    private func startSearch(deepScan: Bool = false) {
+        let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { search.cancel(); return }
+        let filters = Filters(query: q,
+                              dateFrom: unified.dateFrom,
+                              dateTo: unified.dateTo,
+                              model: unified.selectedModel,
+                              kinds: unified.selectedKinds,
+                              repoName: nil,
+                              pathContains: nil,
+                              archivedCodexDesktopOnly: unified.showArchivedCodexDesktopOnly,
+                              archivedClaudeDesktopOnly: unified.showArchivedClaudeDesktopOnly,
+                              archivedClaudeSessionIDs: unified.archivedClaudeSessionIDs,
+                              sideChatsOnly: false,
+                              selectedProjectIdentity: unified.projectSelection?.identity)
+        search.start(query: q,
+                     filters: filters,
+                     allowed: unified.allowedSearchSources(),
+                     enableDeepScan: deepScan,
+                     all: unified.allSessions,
+                     effectiveDisplayTitles: UnifiedSessionsView.claudeDisplayTitleSnapshot(
+                         sessions: unified.allSessions,
+                         titleFor: { unified.claudeDesktopTitle(for: $0) }))
+    }
+
+    private func startSearchImmediate() {
+        searchDebouncer?.cancel(); searchDebouncer = nil
+        startSearch(deepScan: true)
+    }
+
+    private func scheduleSearch() {
+        searchDebouncer?.cancel()
+        let work = DispatchWorkItem { [weak unified, weak search] in
+            guard let unified = unified, let search = search else { return }
+            let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !q.isEmpty else { search.cancel(); return }
+            let filters = Filters(query: q,
+                                  dateFrom: unified.dateFrom,
+                                  dateTo: unified.dateTo,
+                                  model: unified.selectedModel,
+                                  kinds: unified.selectedKinds,
+                                  repoName: nil,
+                                  pathContains: nil,
+                                  archivedCodexDesktopOnly: unified.showArchivedCodexDesktopOnly,
+                                  archivedClaudeDesktopOnly: unified.showArchivedClaudeDesktopOnly,
+                                  archivedClaudeSessionIDs: unified.archivedClaudeSessionIDs,
+                                  sideChatsOnly: false,
+                                  selectedProjectIdentity: unified.projectSelection?.identity)
+            search.start(query: q,
+                         filters: filters,
+                         allowed: unified.allowedSearchSources(),
+                         enableDeepScan: false,
+                         all: unified.allSessions,
+                         effectiveDisplayTitles: UnifiedSessionsView.claudeDisplayTitleSnapshot(
+                             sessions: unified.allSessions,
+                             titleFor: { unified.claudeDesktopTitle(for: $0) }))
+        }
+        searchDebouncer = work
+        let delay: TimeInterval = FeatureFlags.increaseDeepSearchDebounce ? 0.28 : 0.15
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func clearSearchFromField() {
+        unified.queryDraft = ""
+        unified.query = ""
+        unified.recomputeNow()
+        search.cancel()
+    }
+}
+
+private struct UnifiedProjectFilterBadgeView: View {
+    @ObservedObject var unified: UnifiedSessionIndexer
+    /// Narrow macOS 26 list pane: one tinted "remove folder filter" button; the
+    /// project name moves to its tooltip and VoiceOver value.
+    var compact: Bool = false
+    var onClear: () -> Void
+    @AppStorage("StripMonochromeMeters") private var stripMonochrome: Bool = false
+
+    var body: some View {
+        if compact {
+            compactBody
+        } else {
+            regularBody
+        }
+    }
+
+    private var accent: Color {
+        stripMonochrome ? Color.secondary : UnifiedSessionsStyle.selectionAccent
+    }
+
+    private var compactBody: some View {
+        let name = unified.projectSelection.map(Self.badgeText(for:)) ?? ""
+        return Button(action: onClear) {
+            Image(systemName: "folder.badge.minus")
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(accent.opacity(0.1))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(accent.opacity(0.3)))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .help(Text(verbatim: name + "\n") + Text("Remove the project filter and show all sessions"))
+        .accessibilityLabel(Text("Remove the project filter and show all sessions"))
+        .accessibilityValue(Text(verbatim: name))
+        .fixedSize()
+    }
+
+    private var regularBody: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+            if let selection = unified.projectSelection {
+                Text(Self.badgeText(for: selection))
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 220, alignment: .leading)
+            }
+            Button(action: {
+                onClear()
+            }) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Remove the project filter and show all sessions")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(accent.opacity(0.1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(accent.opacity(0.3))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    /// The normal name when unambiguous; name plus the concise parent-path
+    /// discriminator when another visible project shares the name.
+    static func badgeText(for selection: ProjectSelection) -> String {
+        guard let path = selection.disambiguationPath, !path.isEmpty else { return selection.displayName }
+        return "\(selection.displayName) (\(path))"
+    }
+}
+
+// MARK: - AppKit-backed text field for reliable toolbar focus
+/// Width math for the macOS 26 session-list toolbar group (issue #92). The group
+/// starts at the toolbar's leading slot and must stop just short of the
+/// list/transcript divider, so it is sized from two window-space measurements.
+enum SessionListToolbarLayout {
+    /// Breathing room between the group's trailing edge and the divider line,
+    /// matching the pane gutter used inside the split.
+    static let dividerGap: CGFloat = LayoutTokens.sm
+
+    /// Narrowest side-by-side list pane. On macOS 26 the session-list toolbar group
+    /// must fit above it in its minimal form (Filters menu, search with icon-only
+    /// chips, compact project button); `SessionListToolbarLayoutTests` measures
+    /// that row against this width. Older systems keep 320.
+    static var sideBySideListMinWidth: CGFloat {
+        if #available(macOS 26.0, *) { return tahoeListMinWidth }
+        return 320
+    }
+    static let tahoeListMinWidth: CGFloat = 470
+
+    /// The space between the group's leading edge and the divider, never more:
+    /// the group is clipped to this, so it cannot reach into the transcript.
+    /// `nil` means "no side-by-side divider to align to" (stacked layout, hidden
+    /// transcript, or not yet measured): the group then uses its natural width.
+    static func groupWidth(dividerX: CGFloat?, groupMinX: CGFloat?) -> CGFloat? {
+        guard let dividerX, let groupMinX else { return nil }
+        return max(0, (dividerX - groupMinX - dividerGap).rounded(.down))
+    }
+
+    /// Sub-point jitter must not write state, or the measure → resize → measure
+    /// cycle never settles.
+    static func hasMoved(_ old: CGFloat?, to new: CGFloat) -> Bool {
+        guard let old else { return true }
+        return abs(old - new) >= 0.5
+    }
+}
+
+/// The session-list filter state the macOS 26 toolbar row renders. A plain value
+/// so the row can be built (and measured) without the whole window view.
+struct SessionListFilterModel {
+    var liveOnly: Binding<Bool>
+    var liveFeatureEnabled: Bool
+    var hierarchy: Binding<Bool>
+    var isHierarchyBrowsing: Bool
+    var canCollapseAll: Bool
+    var canExpandAll: Bool
+    var collapseAll: () -> Void
+    var expandAll: () -> Void
+    /// Codex and Claude, which stay as their own pills in the regular tier.
+    var pinnedAgents: [AgentToolbarSpec]
+    var otherAgents: [AgentToolbarSpec]
+    var isMonochrome: Bool
+    var clearProject: () -> Void
+
+    var allAgents: [AgentToolbarSpec] { pinnedAgents + otherAgents }
+}
+
+/// How much of the filter cluster stays visible. The row picks the first tier
+/// that fits before the divider.
+enum SessionFilterTier: CaseIterable {
+    /// Live, hierarchy (+ collapse/expand), agent pills.
+    case regular
+    /// Same, with every agent in one Agents menu.
+    case compact
+    /// One Filters menu holding all of the above. Sized so the row still fits
+    /// above the narrowest macOS 26 list pane with a project filter active.
+    case minimal
+}
+
+/// macOS 26 session-list toolbar row (issue #92): filters, search and project
+/// badge. Filters and badge are offered space first and fall back to smaller
+/// forms; the single search field takes what is left down to its minimum, so it
+/// is never recreated and keeps focus and text while the divider moves.
+struct SessionListToolbarRow: View {
+    @ObservedObject var unified: UnifiedSessionIndexer
+    let search: SearchCoordinator
+    let focus: WindowFocusCoordinator
+    let searchState: UnifiedSearchState
+    let filters: SessionListFilterModel
+    /// True when sized to the divider; false lets search keep its 520 pt cap.
+    var fillsWidth: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ViewThatFits(in: .horizontal) {
+                SessionFilterCluster(model: filters, tier: .regular)
+                SessionFilterCluster(model: filters, tier: .compact)
+                SessionFilterCluster(model: filters, tier: .minimal)
+            }
+            .controlSize(.small)
+            .tint(UnifiedSessionsStyle.selectionAccent)
+            .layoutPriority(1)
+
+            UnifiedSearchFiltersView(unified: unified, search: search, focus: focus,
+                                     searchState: searchState, adaptive: true)
+                .frame(maxWidth: fillsWidth ? .infinity : 520)
+
+            if unified.projectSelection != nil {
+                ViewThatFits(in: .horizontal) {
+                    UnifiedProjectFilterBadgeView(unified: unified, onClear: filters.clearProject)
+                    UnifiedProjectFilterBadgeView(unified: unified, compact: true, onClear: filters.clearProject)
+                }
+                .layoutPriority(1)
+            }
+        }
+        // ViewThatFits may keep every tier alive, so no shortcut lives inside a
+        // tier; they are registered exactly once here.
+        .background { shortcuts }
+    }
+
+    @ViewBuilder
+    private var shortcuts: some View {
+        HiddenShortcutButton(key: "h", modifiers: [.command, .shift]) { filters.hierarchy.wrappedValue.toggle() }
+        ForEach(filters.allAgents) { spec in
+            if let key = spec.shortcut {
+                HiddenShortcutButton(key: key, modifiers: .command) { spec.isOn.wrappedValue.toggle() }
+            }
+        }
+    }
+}
+
+private struct HiddenShortcutButton: View {
+    let key: KeyEquivalent
+    let modifiers: EventModifiers
+    let action: () -> Void
+
+    var body: some View {
+        Button("", action: action)
+            .keyboardShortcut(key, modifiers: modifiers)
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+    }
+}
+
+/// One tier of the macOS 26 filter cluster. Holds no keyboard shortcuts.
+private struct SessionFilterCluster: View {
+    let model: SessionListFilterModel
+    let tier: SessionFilterTier
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if tier == .minimal {
+                SessionFiltersMenu(model: model)
+            } else {
+                ActiveSessionsOnlyToggle(isOn: model.liveOnly)
+                    .disabled(!model.liveFeatureEnabled)
+                    .help(
+                        model.liveFeatureEnabled
+                            ? "Show only live sessions in the list (Codex, Claude)"
+                            : "Enable live session detection (Beta) in Settings → Quota Meter."
+                    )
+
+                Button(action: { model.hierarchy.wrappedValue.toggle() }) {
+                    Image(systemName: model.hierarchy.wrappedValue ? "list.bullet.indent" : "list.bullet")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(model.hierarchy.wrappedValue ? Color.accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(model.hierarchy.wrappedValue ? "Flat session list (⇧⌘H)" : "Show subagent hierarchy (⇧⌘H)")
+
+                if model.isHierarchyBrowsing {
+                    ToolbarIconButton(help: "Collapse all visible parent sessions") { isHovering in
+                        ToolbarIcon(systemName: "arrow.down.right.and.arrow.up.left", opacity: isHovering ? 1 : 0.55)
+                    } action: {
+                        model.collapseAll()
+                    }
+                    .disabled(!model.canCollapseAll)
+
+                    ToolbarIconButton(help: "Expand all visible parent sessions") { isHovering in
+                        ToolbarIcon(systemName: "arrow.up.left.and.arrow.down.right", opacity: isHovering ? 1 : 0.55)
+                    } action: {
+                        model.expandAll()
+                    }
+                    .disabled(!model.canExpandAll)
+                }
+
+                if tier == .compact {
+                    AgentOverflowMenu(specs: model.allAgents)
+                } else {
+                    ForEach(model.pinnedAgents) { spec in
+                        AgentTabToggle(title: spec.title, color: spec.color,
+                                       isMonochrome: model.isMonochrome, isOn: spec.isOn)
+                            .help(spec.id == SessionSource.claude.rawValue
+                                  ? "Show or hide Claude sessions (⌘2)"
+                                  : "Show or hide Codex sessions (⌘1)")
+                    }
+                    // Same crowding rule as the classic toolbar: past four agents
+                    // the non-pinned ones collapse into the Agents menu.
+                    if model.allAgents.count > 4 {
+                        AgentOverflowMenu(specs: model.otherAgents)
+                    } else {
+                        ForEach(model.otherAgents) { spec in
+                            AgentTabToggle(title: spec.title, color: spec.color,
+                                           isMonochrome: model.isMonochrome, isOn: spec.isOn)
+                                .help("Show or hide \(spec.title) sessions in the list")
+                        }
+                    }
+                }
+            }
+        }
+        .fixedSize()
+    }
+}
+
+/// The minimal tier: every session-list filter in one menu, styled like the
+/// agent pills. The funnel fills while the live-only filter is on.
+private struct SessionFiltersMenu: View {
+    let model: SessionListFilterModel
+
+    var body: some View {
+        Menu {
+            Toggle("Live sessions only", isOn: model.liveOnly)
+                .disabled(!model.liveFeatureEnabled)
+            Toggle("Show subagent hierarchy (⇧⌘H)", isOn: model.hierarchy)
+            if model.isHierarchyBrowsing {
+                Button("Collapse All", action: model.collapseAll)
+                    .disabled(!model.canCollapseAll)
+                Button("Expand All", action: model.expandAll)
+                    .disabled(!model.canExpandAll)
+            }
+            Divider()
+            ForEach(model.allAgents) { spec in
+                Toggle(isOn: spec.isOn) { Text(spec.title) }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: model.liveOnly.wrappedValue
+                      ? "line.3.horizontal.decrease.circle.fill"
+                      : "line.3.horizontal.decrease.circle")
+                Text("Filters")
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundStyle(.primary)
+            .agentPillSurface()
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(Text("Filters"))
+        .accessibilityLabel(Text("Filters"))
+    }
+}
+
+/// Window-space measurements for the macOS 26 session-list toolbar group.
+final class SessionListToolbarAnchor: ObservableObject {
+    /// x of the list/transcript divider; `nil` when panes are not side by side.
+    @Published var dividerX: CGFloat?
+    /// x of the toolbar group's leading edge.
+    @Published var groupMinX: CGFloat?
+
+    var groupWidth: CGFloat? {
+        SessionListToolbarLayout.groupWidth(dividerX: dividerX, groupMinX: groupMinX)
+    }
+}
+
+/// The only view that observes the anchor, so divider drags re-render just the
+/// toolbar group.
+private struct SessionListToolbarGroup<Content: View>: View {
+    @ObservedObject var anchor: SessionListToolbarAnchor
+    @ViewBuilder var content: (CGFloat?) -> Content
+
+    var body: some View {
+        let width = anchor.groupWidth
+        content(width)
+            .frame(width: width, alignment: .leading)
+            // Last resort only: the compact variants are sized to fit the
+            // narrowest list pane, but nothing may ever draw past the divider.
+            .clipped()
+            .background(WindowFrameReader { [anchor] frame in
+                if SessionListToolbarLayout.hasMoved(anchor.groupMinX, to: frame.minX) {
+                    anchor.groupMinX = frame.minX
+                }
+            })
+    }
+}
+
+/// macOS 26: the window title would take ~120 pt from the session-list group at
+/// the leading edge (or float over the transcript after it), so it is not drawn
+/// in the toolbar. The window keeps its title for the Window menu and Mission
+/// Control. Older systems are unchanged.
+private struct PaneAnchoredToolbarTitle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.toolbar(removing: .title)
+        } else {
+            content
+        }
+    }
+}
+
+/// Reports where the list pane ends (the divider) on macOS 26. A no-op on older
+/// systems, whose toolbar does not align to the panes.
+private struct ListPaneDividerReporter: ViewModifier {
+    let anchor: SessionListToolbarAnchor
+
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content
+                .background(WindowFrameReader { [anchor] frame in
+                    if SessionListToolbarLayout.hasMoved(anchor.dividerX, to: frame.maxX) {
+                        anchor.dividerX = frame.maxX
+                    }
+                })
+                .onDisappear { [anchor] in anchor.dividerX = nil }
+        } else {
+            content
+        }
+    }
+}
+
+/// Reports the hosting view's frame in window coordinates. SwiftUI's `.global`
+/// space is per hosting view, and toolbar items live in a different hosting view
+/// from the split, so the two can only be compared in AppKit window space.
+private struct WindowFrameReader: NSViewRepresentable {
+    var onChange: (CGRect) -> Void
+
+    func makeNSView(context: Context) -> FrameReportingView {
+        let view = FrameReportingView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ view: FrameReportingView, context: Context) {
+        view.onChange = onChange
+        view.reportSoon()
+    }
+
+    final class FrameReportingView: NSView {
+        var onChange: ((CGRect) -> Void)?
+        private var resizeObserver: NSObjectProtocol?
+        private var lastReported: CGRect?
+        private var reportPending = false
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
+            resizeObserver = nil
+            lastReported = nil
+            guard let window else { return }
+            resizeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.reportSoon() }
+            }
+            reportSoon()
+        }
+
+        override func layout() {
+            super.layout()
+            reportSoon()
+        }
+
+        /// Deferred one runloop turn: the callback writes SwiftUI state, which must
+        /// not happen during a view update, and coalescing keeps live resize cheap.
+        func reportSoon() {
+            guard !reportPending else { return }
+            reportPending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.reportPending = false
+                guard self.window != nil else { return }
+                let frame = self.convert(self.bounds, to: nil)
+                guard frame != self.lastReported else { return }
+                self.lastReported = frame
+                self.onChange?(frame)
+            }
+        }
+
+        deinit {
+            if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
+        }
+    }
+}
+
+private struct ToolbarSearchTextField: NSViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+    @Binding var isFirstResponder: Bool
+    var focusRequestToken: Int
+    var onCommit: () -> Void
+    var onEscape: () -> Void
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: ToolbarSearchTextField
+        var didRequestFocus: Bool = false
+        var lastFocusRequestToken: Int = 0
+        init(parent: ToolbarSearchTextField) { self.parent = parent }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let tf = obj.object as? NSTextField else { return }
+            if parent.text != tf.stringValue { parent.text = tf.stringValue }
+        }
+
+        func controlTextDidBeginEditing(_ obj: Notification) {
+            parent.isFirstResponder = true
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            parent.isFirstResponder = false
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onCommit()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                // Clear the field editor directly so Escape visibly empties the field even
+                // though it stays first responder (updateNSView won't overwrite an
+                // actively-edited field).
+                textView.string = ""
+                if parent.text != "" { parent.text = "" }
+                parent.onEscape()
+                return true
+            }
+            return false
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let tf = NSTextField(string: text)
+        tf.placeholderString = placeholder
+        tf.isBezeled = false
+        tf.isBordered = false
+        tf.drawsBackground = false
+        tf.focusRingType = .none
+        tf.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        tf.delegate = context.coordinator
+        tf.lineBreakMode = .byTruncatingTail
+        return tf
+    }
+
+    func updateNSView(_ tf: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        // Only push the binding's value into the field when it is NOT being actively
+        // edited. While the user types, the NSTextField is authoritative; a lagging
+        // SwiftUI binding (`text`) arriving here mid-edit would overwrite the field and
+        // erase the characters typed since (the dropped-character bug). Programmatic
+        // clears either resign focus (✕ button) or clear the field editor directly
+        // (Escape, handled in the coordinator), so they still take effect.
+        if tf.currentEditor() == nil, tf.stringValue != text { tf.stringValue = text }
+        if tf.placeholderString != placeholder { tf.placeholderString = placeholder }
+        if focusRequestToken != context.coordinator.lastFocusRequestToken {
+            context.coordinator.lastFocusRequestToken = focusRequestToken
+            context.coordinator.didRequestFocus = false
+            requestFocus(tf, coordinator: context.coordinator)
+        } else if isFirstResponder {
+            // `NSTextField` becomes first responder via a field editor, so we can't reliably compare
+            // against `window.firstResponder`. Instead, request focus once when asked.
+            if !context.coordinator.didRequestFocus {
+                requestFocus(tf, coordinator: context.coordinator)
+            }
+        } else {
+            context.coordinator.didRequestFocus = false
+        }
+    }
+
+    private func requestFocus(_ tf: NSTextField, coordinator: Coordinator) {
+        coordinator.didRequestFocus = true
+        DispatchQueue.main.async { [weak tf] in
+            guard let tf, let window = tf.window else { return }
+            _ = window.makeFirstResponder(tf)
+        }
+    }
+}
+
+// MARK: - Analytics Button

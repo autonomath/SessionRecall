@@ -1,0 +1,49 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>AgentSessions</title>
+        <item>
+            <title>6.6</title>
+            <pubDate>Wed, 18 Nov 2026 13:01:23 -0800</pubDate>
+            <description><![CDATA[
+<style>
+.rn { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; font-size: 13px; line-height: 1.55; color: #1d1d1f; -webkit-font-smoothing: antialiased; padding: 2px; }
+.rn h2 { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 2px; }
+.rn h3 { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #86868b; margin: 18px 0 6px; }
+.rn h3.hl { color: #0071e3; }
+.rn ul { margin: 0; padding-left: 18px; }
+.rn li { margin: 5px 0; }
+.rn ul.highlights li { margin: 9px 0; }
+.rn strong { font-weight: 650; }
+.rn code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em; background: rgba(0,0,0,0.06); padding: 1px 5px; border-radius: 5px; }
+.rn a { color: #0071e3; text-decoration: none; }
+.rn .more { color: #86868b; font-size: 12px; margin-top: 16px; }
+@media (prefers-color-scheme: dark) {
+  .rn { color: #f5f5f7; }
+  .rn h3 { color: #98989d; }
+  .rn h3.hl { color: #2997ff; }
+  .rn code { background: rgba(255,255,255,0.13); }
+  .rn a { color: #2997ff; }
+}
+</style>
+<div class="rn">
+<h2>What&#x27;s New in 6.6</h2>
+<h3 class="hl">Highlights</h3>
+<ul class="highlights">
+<li><strong>Open Claude Code sessions in VS Code.</strong> Right-click a Claude Code session to open its local folder and resume in the verified VS Code or Insiders window. Install the Claude Code extension and trust the project folder. Resuming a removed worktree from its repository root requires Claude Code extension 2.1.300 or later. Contributed by @dobernhardt in #91.</li>
+<li><strong>Resume supported CLI sessions in Macterm.</strong> Select Macterm under Settings → General → Terminal App. Resume reuses the nearest local project and opens a new tab in the session folder. Contributed by @kian1991 in #94.</li>
+</ul>
+<h3>Improvements</h3>
+<ul>
+<li><strong>Updated model pricing.</strong> Session cost estimates and Quota Meter now use GPT-6.2 pricing and refreshed rates for other models.</li>
+</ul>
+<p class="more">Full release notes: <a href="https://github.com/jazzyalex/agent-sessions/releases/tag/v6.6">https://github.com/jazzyalex/agent-sessions/releases/tag/v6.6</a></p>
+</div>
+            ]]></description>
+            <sparkle:version>91</sparkle:version>
+            <sparkle:shortVersionString>6.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/jazzyalex/agent-sessions/releases/download/v6.6/AgentSessions-6.6.dmg" length="31935166" type="application/octet-stream" sparkle:edSignature="1YyrR1pEvkzXJTMypER7/lzQYlkOU9IHuZ3ot2gdf1ai2gjCD06brTJrSj6tWco8p2WtVRVW+yYF+NogRFPlAw=="/>
+        </item>
+    </channel>
+</rss>

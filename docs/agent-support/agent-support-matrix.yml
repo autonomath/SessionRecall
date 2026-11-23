@@ -1,0 +1,328 @@
+agent_sessions_version: "6.4+unreleased"
+as_of_commit: "20a1bbbb"
+as_of_date: 2026-11-08
+workflow_doc: "docs/agent-support/workflow.md"
+notes:
+  - "Current ceilings and holds derive from scripts/probe_scan_output/agent_watch/20261109-031213-556965Z-p64446/report.json; historical detail remains in the append-only ledger and tracker."
+
+agents:
+  codex_cli:
+    max_verified_version: "0.167.0"
+    notes:
+      - "Native tool/schema support verified at 0.167.0; guardian metadata, encrypted_content and realtime_item records are in the fixture. Replay: two unsent Codex Desktop drafts emit no usage, as expected."
+    version_field: "payload.cli_version"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/codex/small.jsonl"
+      - "Resources/Fixtures/stage0/agents/codex/large.jsonl"
+      - "Resources/Fixtures/stage0/agents/codex/schema_drift.jsonl"
+  claude_code:
+    max_verified_version: "2.1.319"
+    notes:
+      - "2.1.319 verified after re-sign-in; new session-owner record (account/org ids) stays hidden, with a test. The TUI usage probe failed with exit 16 again in the initial weekly."
+    version_field: "version"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/claude/small.jsonl"
+      - "Resources/Fixtures/stage0/agents/claude/large.jsonl"
+      - "Resources/Fixtures/stage0/agents/claude/schema_drift.jsonl"
+      - "Resources/Fixtures/stage0/agents/claude/subagent/0a1b2c3d-4e5f-4061-8071-2a3b4c5d6e7f.jsonl"
+      - "Resources/Fixtures/stage0/agents/claude/subagent/0a1b2c3d-4e5f-4061-8071-2a3b4c5d6e7f/subagents/agent-a0ad4f44468bdf20d.jsonl"
+  antigravity:
+    max_verified_version: "1.5.3"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "not_logged"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/antigravity/small.md"
+      - "Resources/Fixtures/stage0/agents/antigravity/cli_small.jsonl"
+      - "Resources/Fixtures/stage0/agents/antigravity/desktop_small.jsonl"
+      - "Resources/Fixtures/stage0/agents/antigravity/cli_schema_drift.jsonl"
+  copilot_cli:
+    max_verified_version: "1.0.107"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "data.copilotVersion"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/copilot/small.jsonl"
+      - "Resources/Fixtures/stage0/agents/copilot/large.jsonl"
+      - "Resources/Fixtures/stage0/agents/copilot/schema_drift.jsonl"
+      - "Resources/Fixtures/stage0/agents/copilot/subdir_v1/aaaabbbb-1111-2222-3333-ccccddddeeee/events.jsonl"
+  opencode:
+    max_verified_version: "2.2.6"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "session.version"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/session/proj_test/ses_s_stage0_small.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/session/proj_test/ses_s_stage0_large.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/message/s_stage0_small/msg_0001.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/message/s_stage0_small/msg_0002.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/message/s_stage0_large/msg_0001.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/message/s_stage0_large/msg_0002.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_user_small/001.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_small/001.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/001.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/002.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/003.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/004.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/005.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/006.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/007.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_v2/part/m_assistant_large_1/008.json"
+      - "Resources/Fixtures/stage0/agents/opencode/storage_legacy/session/proj_test/ses_s_stage0_drift.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_v2/ses_fixture_v2.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/user.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/assistant.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/system.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/synthetic.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/compaction.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/idle.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/shell.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/synthetic-job.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/idle-failed.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/model-switched.json"
+      - "Resources/Fixtures/stage0/agents/opencode/sqlite_v2/session_message/assistant-failed.json"
+  hermes:
+    max_verified_version: "0.23.0"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "not_logged"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/hermes/small.json"
+      - "Resources/Fixtures/stage0/agents/hermes/large.json"
+      - "Resources/Fixtures/stage0/agents/hermes/schema_drift.json"
+  openclaw:
+    # 2026.8.1-2026.9.x were blocked by OpenClaw's own deferred doctor migrations
+    # (openclaw/openclaw#133881, #133962); 2026.10.5 runs again from the owner's profile.
+    max_verified_version: "2026.11.2"
+    notes:
+      - "2026.11.2 needs openclaw doctor --fix (agent DB schema 25 -> 27, columns only). After the migration a real tool turn matches the schema-27 fixture."
+    version_field: "not_logged"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/openclaw/small.jsonl"
+      - "Resources/Fixtures/stage0/agents/openclaw/large.jsonl"
+      - "Resources/Fixtures/stage0/agents/openclaw/sqlite/openclaw-agent.sql"
+      - "Resources/Fixtures/stage0/agents/openclaw/schema_drift.jsonl"
+    evidence_tests:
+      - "AgentSessionsTests/OpenClawSqliteStoreTests.swift"
+      - "scripts/tests/test_openclaw_sqlite_monitoring.py"
+  cursor:
+    max_verified_version: "2026.11.5"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "not_logged"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/cursor/small.jsonl"
+      - "Resources/Fixtures/stage0/agents/cursor/large.jsonl"
+      - "Resources/Fixtures/stage0/agents/cursor/schema_drift.jsonl"
+      - "Resources/Fixtures/stage0/agents/cursor/subagent/parent.jsonl"
+      - "Resources/Fixtures/stage0/agents/cursor/subagent/subagents/child.jsonl"
+    evidence_tests:
+      - "AgentSessionsTests/CursorSessionParserTests.swift"
+      - "scripts/tests/test_cursor_sqlite_probe.py"
+  pi:
+    max_verified_version: "1.5.0"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "not_logged"
+    support_scope: "tier-2 local JSONL transcript discovery, browsing, search, Preferences controls, colors, resume/copy-resume commands, session-local token/cost telemetry, and weekly session-format monitoring"
+    unsupported_surfaces:
+      - "live/active status"
+      - "account-level quota/rate-limit feed"
+      - "subagent hierarchy"
+    evidence_docs:
+      - "https://pi.dev/docs/latest/quickstart"
+      - "https://pi.dev/docs/latest/usage"
+      - "https://pi.dev/docs/latest/session-format"
+      - "https://pi.dev/docs/latest/settings"
+    evidence_captures:
+      - "/tmp/as-agent-lab/pi-agent/sessions/2026-05-12T01-02-27-657Z_019e19b4-eb48-746a-aa6b-8dfcfa37954b.jsonl"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/pi/small.jsonl"
+    evidence_tests:
+      - "AgentSessionsTests/PiSessionParserTests.swift"
+      - "AgentSessionsTests/PiResumeCommandBuilderTests.swift"
+      - "AgentSessionsTests/PiCLIEnvironmentTests.swift"
+  kimi_code:
+    max_verified_version: "2.5.2"
+    notes:
+      - "2.5.2 completed a fresh tool turn, clearing the 2026-11-02 HTTP 429 hold; setup records environment.set_binding and tool_select.initialized are in the fixture."
+    version_field: "not_logged"
+    support_scope: "tier-2 local JSONL transcript discovery, browsing, search, Preferences controls, colors, copy-resume command, launch-in-terminal resume, analytics, and weekly session-format monitoring"
+    unsupported_surfaces:
+      - "live/active status"
+      - "quota/rate-limit tracking (Kimi publishes no limit or quota endpoint). NOT the same as token accounting: Kimi 0.38.0 writes per-turn `token_counting.measured` and `token_counting.turn_recorded` records carrying tokens, length, turnId and time. That data is on disk in every session and Agent Sessions does not yet read it — the gap is a missing surface, not a missing source."
+      - "subagent hierarchy"
+    evidence_docs:
+      - "https://github.com/MoonshotAI/kimi-code"
+      - "https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html"
+    evidence_captures:
+      - "~/.kimi-code/sessions/wd_project_ac3bb318f98e/session_9eb1bf57-c1af-48a5-b658-0e8d9fe794f5/"
+      - "~/.kimi-code/sessions/wd_codex-history_205016864bd1/session_1bcbe023-4f7e-4971-9dc9-43b8756045b0/"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/kimi/small.jsonl"
+      - "Resources/Fixtures/stage0/agents/kimi/state.json"
+      - "Resources/Fixtures/stage0/agents/kimi/assistant_tools.jsonl"
+      - "Resources/Fixtures/stage0/agents/kimi/assistant_tools.state.json"
+      - "Resources/Fixtures/stage0/agents/kimi/subagent_agent-0.jsonl"
+    evidence_tests:
+      - "AgentSessionsTests/KimiSessionParserTests.swift"
+      - "AgentSessionsTests/KimiSessionDiscoveryTests.swift"
+      - "AgentSessionsTests/KimiResumeCommandBuilderTests.swift"
+  grok_cli:
+    max_verified_version: "1.0.77"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    version_field: "not_logged"
+    support_scope: "tier-2 local JSONL transcript discovery, browsing, search, Preferences controls, colors, copy-resume command, launch-in-terminal resume, analytics, and subagent hierarchy"
+    unsupported_surfaces:
+      - "live/active status"
+      - "usage/rate-limit tracking"
+    evidence_docs:
+      - "grok --help at 1.0.3 (1a29d5bc12d4)"
+    evidence_captures:
+      - "~/.grok/sessions/<percent-encoded workdir>/<sessionId>/ (141 sessions surveyed at 1.0.0; 13 sessions across 2 workdir buckets at 1.0.3, including 9 subagents, web-search backend_tool_call, and an image content part)"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/grok/chat_history.jsonl"
+      - "Resources/Fixtures/stage0/agents/grok/summary.json"
+      - "Resources/Fixtures/stage0/agents/grok/subagent/chat_history.jsonl"
+      - "Resources/Fixtures/stage0/agents/grok/subagent/summary.json"
+    evidence_tests:
+      - "AgentSessionsTests/GrokSessionParserTests.swift"
+      - "AgentSessionsTests/GrokSessionDiscoveryTests.swift"
+    evidence_tools:
+      - "scripts/grok_chat_schema_probe.py"
+  qwen_code:
+    max_verified_version: "0.14.3"
+    notes:
+      - "Unavailable maintainer lane; no driver; ceiling unchanged and no install/auth chase."
+    version_field: "record.version"
+    support_scope: "tier-2 local JSONL transcript discovery, browsing, search, Preferences controls, colors, saved-session backfill, active-session copy-resume command and launch-in-terminal resume, analytics, and weekly session-format monitoring"
+    unsupported_surfaces:
+      - "live/active status"
+      - "quota/rate-limit tracking (Qwen publishes no limit or quota endpoint). NOT the same as token accounting: every Qwen transcript carries complete per-call counters in `systemPayload.uiEvent` (input, output, cached, thoughts, tool and total token counts, plus duration_ms and model) — 53 such records in one ordinary local session. That data is on disk and Agent Sessions does not yet read it — the gap is a missing surface, not a missing source."
+      - "images"
+      - "subagent hierarchy"
+      - "automatic QWEN_RUNTIME_DIR discovery (choose that runtime directory's projects folder in Settings)"
+      - "resume from an arbitrarily renamed copied projects root (those transcripts remain browseable and searchable)"
+      - "fresh authenticated 0.25.3 transcript and live resume validation"
+      - "prebump real-session validation (no agent_watch prebump driver yet; weekly monitoring is configured)"
+      - "Managed sessions (qwen serve --experimental-paired-engines): their history lives in managed_session_*_v1 journal records, which are not projected back into a conversation, so such a session shows metadata only"
+    evidence_captures:
+      - "one retained local 0.14.3 transcript (schema-only inspection; 32 records)"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/qwen/019f0000-0000-7000-8000-000000000001.jsonl"
+      - "Resources/Fixtures/stage0/agents/qwen/019f0000-0000-7000-8000-000000000002.jsonl"
+      - "Resources/Fixtures/stage0/agents/qwen/019f0000000070008000000000000003.jsonl"
+      - "Resources/Fixtures/stage0/agents/qwen/019f0000-0000-7000-8000-000000000004.jsonl"
+      - "Resources/Fixtures/stage0/agents/qwen/019f0000-0000-7000-8000-000000000005.jsonl"
+      - "Resources/Fixtures/stage0/agents/qwen/system_telemetry.jsonl"
+    evidence_tests:
+      - "AgentSessionsTests/QwenIntegrationTests.swift"
+  devin_cli:
+    max_verified_version: "3000.6.7 (260a97c8)"
+    notes:
+      - "Steward-owned; no local CLI; ceiling remains the steward's verified build."
+    version_field: "sessions.db records (steward-verified against the installed CLI; initial schema probe via scripts/devin_sessions_schema_probe.py)"
+    support_scope: "tier-2 identity-backed SQLite transcript discovery, browsing, search, Preferences controls, colors, active-session copy-resume command and launch-in-terminal resume, and analytics"
+    unsupported_surfaces:
+      - "live/active status"
+      - "images"
+      - "archive (Devin stores only active sessions in the sessions.db; archived history is not retained by the CLI)"
+      - "custom storage root with an arbitrary structure (point it at the devin data directory or the cli directory containing sessions.db; the Settings field accepts directories only)"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/devin/small.json"
+      - "Resources/Fixtures/stage0/agents/devin/schema_drift.json"
+      - "in-test schema fixture: AgentSessionsTests/DevinSqliteReaderTests.swift buildFixture() builds a miniature sessions.db (five-node main chain plus an abandoned two-node branch). No binary .db is committed: the JSON fixtures above are the logical projection agent_watch diffs the live database against, per the guide's DB-backed split."
+    evidence_tests:
+      - "AgentSessionsTests/DevinSqliteReaderTests.swift"
+      - "AgentSessionsTests/DevinSessionDiscoveryTests.swift"
+      - "AgentSessionsTests/DevinIntegrationSurfaceTests.swift"
+      - "AgentSessionsTests/DevinSessionParserTests.swift"
+    evidence_tools:
+      - "scripts/devin_sessions_schema_probe.py"
+  fx:
+    max_verified_version: "0.0.7"
+    notes:
+      - "Steward-owned; #83 already requests native schema-4 verification; ceiling unchanged."
+    version_field: "session.json schema_version 3 / storage_format event_log_v1 (verified via an on-disk survey of ~/.fx/sessions against the installed CLI, re-checked at upstream tag v0.0.5)"
+    support_scope: "tier-2 local per-session checkpoint transcript discovery, browsing, search, Preferences controls, colors, saved-session backfill, active-session copy-resume command and launch-in-terminal resume, and analytics"
+    unsupported_surfaces:
+      - "live/active status"
+      - "image extraction (records reference image files under the session directory via user.images[].snapshot_path; transcripts render [image] markers)"
+      - "subagent hierarchy (has_managed_children sessions and the subagent/ relationship index are not surfaced)"
+      - "fx sessions-v2 store (opt-in --sessions-v2 / FX_SESSIONS_V2=1 in 0.0.14, under ~/.fx/sessions/v2/; upstream main after v0.0.14 removes the schema-4 store and converts sessions into it, so the next fx release likely needs a new reader)"
+      - "pre-v3 legacy layout (session.json snapshot without checkpoint.json) is invisible to discovery until fx itself migrates the session on next open"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/fx/small/checkpoint.json (+ session.json, display.json)"
+      - "Resources/Fixtures/stage0/agents/fx/unsupported/checkpoint.json (malformed; sidecar facts must survive)"
+      - "Resources/Fixtures/stage0/agents/fx/schema4/events.jsonl (+ session.json, recovery.json, tool-results/; synthetic, built from upstream v0.0.14 writers)"
+    evidence_tests:
+      - "AgentSessionsTests/FxSessionParserTests.swift"
+      - "AgentSessionsTests/FxSessionDiscoveryTests.swift"
+      - "AgentSessionsTests/FxIntegrationSurfaceTests.swift"
+      - "scripts/tests/test_fx_schema4_monitoring.py"
+  cline:
+    max_verified_version: "3.0.74"
+    notes:
+      - "Native tool session and final weekly verified; see the ledger for evidence."
+    desktop_max_verified_version: "0.0.48"
+    version_field: "CLI release drift uses max_verified_version and cline --version; Desktop bundle 0.0.48 is recorded separately while the shared persisted v1 contract is monitored from both surfaces"
+    support_scope: "tier-2 shared local manifest/messages transcript discovery for Cline CLI and Desktop, browsing, search, Preferences controls, colors, saved-session backfill, and analytics source filtering"
+    unsupported_surfaces:
+      - "resume/copy-resume (the CLI's --id semantics were not proven as a safe existing-session resume contract)"
+      - "live/active status"
+      - "image extraction"
+      - "usage/rate-limit tracking"
+      - "subagent hierarchy"
+    evidence_docs:
+      - "https://docs.cline.bot/cli/cli-reference"
+      - "https://docs.cline.bot/getting-started/config"
+      - "https://cline.bot/"
+    evidence_captures:
+      - "local schema-only survey of ~/.cline/data/sessions and ~/.cline/data/db/sessions.db (13 sessions; no prompt/output text retained)"
+    evidence_fixtures:
+      - "Resources/Fixtures/stage0/agents/cline/cli_tool/cline-cli-tool.json (+ adjacent .messages.json)"
+      - "Resources/Fixtures/stage0/agents/cline/desktop_continued/cline-desktop-continued.json (+ adjacent .messages.json)"
+      - "Resources/Fixtures/stage0/agents/cline/desktop_tool/session_1792607722905_fixt1.json (+ adjacent .messages.json)"
+    evidence_tests:
+      - "AgentSessionsTests/ClineSessionParserTests.swift"
+      - "AgentSessionsTests/ClineSessionDiscoveryTests.swift"
+      - "AgentSessionsTests/ClineIntegrationTests.swift"
+      - "scripts/tests/test_cline_monitoring.py"
+  deepseek_harness:
+    max_verified_version: "0.2.2-rc.1"
+    notes:
+      - "0.2.2-rc.1 installed with owner approval on 2026-11-08; a fresh tool session matches the baseline with no drift."
+    version_field: "repository release/tag plus physical header version 0-4; fixtures pin source commits ddefc45fbc7f8e46dd73185e68295696d1297887, 639ed015397290b3745d163aafe02ffee4aa3f84 (tag dsh-v0.2.0-rc.2) and 687f282e8625c6b8d11ff58211a90524be2e4317 (tag dsh-v0.2.1-rc.2)"
+    support_scope: "read-only local discovery, browse, search, filtered archive snapshots, and normalized v0-v4 plain or independently framed Zstandard histories"
+    unsupported_surfaces:
+      - "resume and live ingestion"
+      - "DSH archive-state mirroring"
+      - "partial recovery publication"
+      - "source-reported per-message usage in Analytics (usage is present and validated, but not surfaced)"
+      - "live quota and rate-limit status"
+      - "image extraction"
+      - "custom required event extensions outside the 62-event v4 catalog (pinned 0.2.0-rc.2 plus the 0.2.1-rc.2 job/registered, job/settled and working-directory/change records)"
+    evidence_docs:
+      - "docs/superpowers/plans/2026-09-18-dsh-source-implementation-plan.md"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/manifest.json"
+    evidence_fixtures:
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v0_minimal_session.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v1_minimal_session.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v2_minimal_session.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v3_minimal_session.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v4_tool_session.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v3_agent_instructions_source.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/unknown_ignorable_event.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v0_minimal_session.jsonl.zstd"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v1_minimal_session.jsonl.zstd"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v2_minimal_session.jsonl.zstd"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v3_minimal_session.jsonl.zstd"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v4_tool_session.jsonl.zstd"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/unknown_ignorable_event.jsonl.zstd"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v4_job_failed_turn_session.jsonl"
+      - "AgentSessionsTests/Resources/Fixtures/stage0/agents/deepseek-harness/v4_job_failed_turn_session.jsonl.zstd"
+    evidence_tests:
+      - "AgentSessionsTests/DeepSeekHarnessFixtureParityTests.swift"
+      - "AgentSessionsTests/DeepSeekHarnessDiscoveryTests.swift"
+      - "scripts/tests/test_deepseek_harness_monitoring.py"

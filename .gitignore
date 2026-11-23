@@ -1,0 +1,113 @@
+# Xcode & macOS
+DerivedData/
+build/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+.DS_Store
+
+# Swift Package Manager
+.build/
+Package.resolved
+
+# Logs & reports
+*.log
+lint-report.json
+lint-xcode.txt
+build.bundle/
+
+# Local build artifacts
+/dist/
+
+# Local capture outputs
+artifacts/
+.codex-review-artifacts/
+.codex-review-control.md
+
+# Local release env (excluded)
+tools/release/.env
+
+# Fastlane (if added later)
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# Internal reviews and promo operations (local git only)
+docs/Sonnet-4.5-review.md
+docs/social/agent-sessions-outreach/
+Marketing/
+skills/promo-outreach/
+.codex/
+.venv/
+
+# Claude AI local settings
+.claude/settings.local.json
+.claude/worktrees/
+
+# Letta local settings
+.letta/
+
+# Temporary archives
+*.zip
+
+# Backup files created during development
+*.backup-*
+
+# Local scan outputs (can contain absolute paths / private data)
+scripts/probe_scan_output/
+scripts/agent_captures/
+scripts/energy_samples*/
+
+# Local research/probe scratch (not shipped)
+side-chat-probes-tmp/
+*-probes-tmp/
+
+# Local research corpus (local only, never published).
+# Holds derived data (corpus.db, financial.json) that must not reach the public repo.
+mycelium-lab/
+
+# Local release artifacts (use GitHub Releases instead of tracking binaries)
+*.dmg
+
+# Xcode project backup/working copies (keep only the canonical project.pbxproj)
+AgentSessions.xcodeproj/project.pbxproj.backup*
+AgentSessions.xcodeproj/project.pbxproj.bak*
+AgentSessions.xcodeproj/project.pbxproj.fix*
+AgentSessions.xcodeproj/project.pbxproj.final
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Local test derived data
+.deriveddata-*/
+.deriveddata-cpu-*/
+.deriveddata-review/
+.deriveddata-claudefix/
+.deriveddata-audit/
+.deriveddata-run/
+
+# stray local artifact (kept out of release clean-tree gate)
+docs/assets/geo-test-2.pdf
+
+# Local competitor/reference source (never shipped; excluded from remote)
+.reference/
+
+# repo triage automation runtime artifacts
+tools/triage/out/
+tools/triage/state.json
+
+# weekly agent-format drift scan launchd logs
+tools/agent-watch/out/
+
+# Local page mockups — built to preview before touching the real site
+docs/_preview/
+
+# Generated GitHub Pages output; canonical sources live directly under docs/.
+docs/_site/

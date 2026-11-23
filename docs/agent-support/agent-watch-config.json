@@ -1,0 +1,930 @@
+{
+  "report_root": "scripts/probe_scan_output/agent_watch",
+  "agents": {
+    "codex": {
+      "cadence": { "daily": true, "weekly": true },
+      "installed_version_cmd": ["codex", "--version"],
+      "install": {"argv":["npm","install","-g","@openai/codex@{version}"],"version_probe":["codex","--version"]},
+      "preflight": {"credential_files":["~/.codex/auth.json"],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.codex_cli.max_verified_version",
+      "upstream": [
+        { "kind": "github_latest_release", "repo": "openai/codex" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "transcript", "json", "jsonl", "format", "logging", "migration"],
+        "usage": ["usage", "token", "tokens", "rate", "limit", "quota", "status"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["$CODEX_HOME/sessions", "~/.codex/sessions"],
+          "glob": "**/rollout-*.jsonl*",
+          "exclude_globs": ["*.tmp"],
+          "compressed_glob": "rollout-*.jsonl.zst",
+          "required_types": ["session_meta"],
+          "max_lines": 2500
+        },
+        "freshness_window_days": 14,
+        "discovery_path_contract": {
+          "description": "Codex sessions should be discovered from day folders under a sessions root, as plain .jsonl or as a cold .jsonl.zst (local_thread_store_compression).",
+          "patterns": ["/sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}/rollout-[^/]+\\.jsonl(\\.zst)?$"]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "codex_status_probe",
+            "argv": ["./AgentSessions/Resources/codex_status_capture.sh"],
+            "timeout_seconds": 45,
+            "parse": "codex_status_json"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "codex_exec",
+        "sandbox": {"mode": "home_override", "subdir": "codex_sandbox"},
+        "prompt": "List files in the current directory.",
+        "timeout_seconds": 180,
+        "required_schema_buckets": [
+          "response_item.payload:message",
+          "response_item.payload:custom_tool_call",
+          "response_item.payload:custom_tool_call_output",
+          "event_msg.payload:token_count"
+        ],
+        "env_vars": ["OPENAI_API_KEY"],
+        "credential_files": ["~/.codex/auth.json"],
+        "discover_session": {
+          "kind": "jsonl_newest",
+          "roots": [".codex/sessions"],
+          "globs": ["**/rollout-*.jsonl"],
+          "required_types": ["session_meta"]
+        }
+      }
+    },
+    "claude": {
+      "cadence": { "daily": true, "weekly": true },
+      "installed_version_cmd": ["claude", "--version"],
+      "install": {"argv":["claude","update"],"version_probe":["claude","--version"]},
+      "preflight": {"credential_files":["~/.claude/.credentials.json"],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.claude_code.max_verified_version",
+      "upstream": [
+        { "kind": "github_latest_release", "repo": "anthropics/claude-code" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "transcript", "json", "jsonl", "format", "storage", "migration"],
+        "usage": ["usage", "token", "tokens", "rate", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["~/.claude/projects"],
+          "glob": "**/*.jsonl",
+          "required_types": ["user", "assistant"],
+          "max_lines": 2500
+        },
+        "freshness_window_days": 14,
+        "discovery_path_contract": {
+          "description": "Claude sessions should live under ~/.claude/projects/** with jsonl/ndjson files.",
+          "patterns": ["/\\.claude/projects/.+\\.(jsonl|ndjson)$"]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "claude_status",
+            "argv": ["./scripts/claude-status", "--json"],
+            "timeout_seconds": 15,
+            "parse": "claude_status_json"
+          },
+          {
+            "kind": "script",
+            "label": "claude_usage_probe",
+            "argv": ["./AgentSessions/Resources/claude_usage_capture.sh"],
+            "timeout_seconds": 45,
+            "parse": "claude_usage_json"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "claude_print",
+        "sandbox": {"mode": "home_override", "subdir": "claude_sandbox"},
+        "prompt": "Say hi, then use the Bash tool to run pwd.",
+        "model": "sonnet",
+        "real_home_session": true,
+        "timeout_seconds": 180,
+        "env_vars": ["ANTHROPIC_API_KEY"],
+        "credential_files": ["~/.claude/.credentials.json"],
+        "discover_session": {
+          "kind": "jsonl_newest",
+          "roots": [".claude/projects"],
+          "globs": ["**/*.jsonl"],
+          "required_types": ["user", "assistant"]
+        }
+      }
+    },
+    "opencode": {
+      "cadence": { "daily": true, "weekly": true },
+      "installed_version_cmd": ["opencode", "--version"],
+      "install": {"argv":["npm","install","-g","@opencode/cli@{version}"],"version_probe":["opencode","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.opencode.max_verified_version",
+      "upstream": [
+        {
+          "kind": "npm_latest",
+          "package": "@opencode/cli",
+          "note": "OpenCode 2.x ships as npm @opencode/cli. GitHub Releases stopped at 1.19.3 although v2.x tags exist, and the old opencode-ai package stays on 1.x."
+        }
+      ],
+      "risk_keywords": {
+        "schema": ["storage", "migration", "schema", "format", "json", "jsonl", "session", "sqlite", "bolt", "bbolt", "badger", "database", "db"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "opencode_latest_session",
+          "single_session_reason": "The sample is restricted to the newest session's writer-version cohort; older versions cannot fill its schema gaps.",
+          "db_roots": ["~/.local/share/opencode/opencode.db"],
+          "roots": ["~/.local/share/opencode/storage/session"],
+          "glob": "**/ses_*.json",
+          "max_messages": 250,
+          "max_parts": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "OpenCode sessions should come from opencode.db when SQLite is present, or storage/session/*/ses_*.json for legacy file storage.",
+          "patterns": ["/opencode/opencode\\.db$", "/opencode/storage/session/.+/ses_[^/]+\\.json$"]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "opencode_capture",
+            "argv": ["./scripts/capture_latest_agent_sessions.py", "--agent", "opencode"],
+            "timeout_seconds": 60,
+            "parse": "capture_latest_sessions"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "opencode_run",
+        "fallback_models": ["moonshotai/kimi-k2.7"],
+        "drop_env_prefixes": ["OPENCODE_"],
+        "model": "moonshotai/kimi-k2.7-code",
+        "opencode_api_key": {"provider": "moonshotai", "env_var": "MOONSHOT_API_KEY"},
+        "sandbox": {"mode": "home_override", "subdir": "opencode_sandbox"},
+        "prompt": "Use the shell tool to run pwd, then say hello in one sentence.",
+        "required_schema_buckets_by_store": {
+          "session_v2": [
+            "session_message.user",
+            "session_message.assistant",
+            "session_message.assistant.tool_state.completed"
+          ],
+          "legacy": ["message.user", "message.assistant", "part.tool"]
+        },
+        "timeout_seconds": 180,
+        "env_vars": [
+          "ANTHROPIC_API_KEY",
+          "OPENAI_API_KEY",
+          "GEMINI_API_KEY",
+          "GROQ_API_KEY",
+          "OPENROUTER_API_KEY"
+        ],
+        "credential_files": [],
+        "support_files": [
+          "~/.config/opencode/config.json",
+          "~/.config/opencode/opencode.json",
+          "~/.config/opencode/opencode.jsonc"
+        ],
+        "discover_session": {
+          "kind": "opencode_latest_session",
+          "roots": [".local/share/opencode"],
+          "globs": ["opencode.db", "storage/session/**/ses_*.json"],
+          "required_types": []
+        }
+      }
+    },
+    "hermes": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["hermes", "--version"],
+      "install": {"argv":["hermes","update"],"version_probe":["hermes","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.hermes.max_verified_version",
+      "upstream": [
+        {
+          "kind": "github_latest_release",
+          "repo": "NousResearch/hermes-agent",
+          "version_source": "name",
+          "note": "Hermes tags use calendar versions (v2026.x.y); the release name carries the CLI semver."
+        }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "json", "format", "storage", "migration", "messages", "tools"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "hermes_latest_session",
+          "db_roots": ["~/.hermes/state.db"],
+          "roots": ["~/.hermes/sessions"],
+          "glob": "session_*.json",
+          "max_messages": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Hermes sessions should come from ~/.hermes/state.db, with legacy canonical JSON files under ~/.hermes/sessions as fallback.",
+          "patterns": ["/\\.hermes/state\\.db$", "/\\.hermes/sessions/session_[^/]+\\.json$"]
+        }
+      },
+      "prebump": {
+        "driver": "hermes_oneshot",
+        "sandbox": {"mode": "home_override", "subdir": "hermes_sandbox"},
+        "prompt": "Say hi, then list the files in the current directory using your tools.",
+        "real_home_session": true,
+        "timeout_seconds": 180,
+        "env_vars": [
+          "ANTHROPIC_API_KEY",
+          "OPENAI_API_KEY",
+          "GEMINI_API_KEY",
+          "OPENROUTER_API_KEY"
+        ],
+        "credential_files": [],
+        "support_files": ["~/.hermes/config.yaml", "~/.hermes/.env"],
+        "discover_session": {
+          "kind": "hermes_latest_session",
+          "roots": [".hermes"],
+          "globs": ["state.db", "sessions/session_*.json"],
+          "required_types": []
+        }
+      }
+    },
+    "antigravity": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["agy", "--version"],
+      "install": {"argv":["agy","update"],"version_probe":["agy","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.antigravity.max_verified_version",
+      "upstream": [
+        {
+          "kind": "url_regex_semver_max",
+          "url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app",
+          "pattern": "Stable Version:\\s*([0-9]+\\.[0-9]+\\.[0-9]+)",
+          "note": "The CLI's OWN auto-updater service, extracted from the agy binary; it answers with the stable rollout version. agy is a self-updating standalone binary - there is no npm package, and the unrelated npm `antigravity-cli` (0.0.1) is a squat, the same trap as cursor-agent."
+        }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "transcript", "markdown", "format", "transcript.jsonl", "jsonl"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["~/.gemini/antigravity-cli/brain", "~/.gemini/antigravity/brain"],
+          "glob": "*/.system_generated/logs/transcript.jsonl",
+          "max_lines": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Antigravity transcripts should be at <brain>/<conversation-id>/.system_generated/logs/transcript.jsonl under ~/.gemini/antigravity-cli/brain (CLI) or ~/.gemini/antigravity/brain (desktop app 2.25.0+; older IDE conversations there keep *.md artifacts only).",
+          "patterns": [
+            "/\\.gemini/antigravity-cli/brain/[^/]+/\\.system_generated/logs/transcript\\.jsonl$",
+            "/\\.gemini/antigravity/brain/[^/]+/\\.system_generated/logs/transcript\\.jsonl$"
+          ]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "antigravity_capture",
+            "argv": ["./scripts/capture_latest_agent_sessions.py", "--agent", "antigravity"],
+            "timeout_seconds": 60,
+            "parse": "capture_latest_sessions"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "antigravity_print",
+        "sandbox": {"mode": "home_override", "subdir": "antigravity_sandbox"},
+        "prompt": "Use your tools for each step: create a file named probe.txt containing the word hello, read probe.txt back, run the shell command `date`, list the files in the current directory, then reply in one sentence.",
+        "timeout_seconds": 180,
+        "real_home_session": true,
+        "env_vars": [],
+        "credential_files": [],
+        "support_files": [],
+        "discover_session": {
+          "kind": "jsonl_newest",
+          "roots": [".gemini/antigravity-cli/brain"],
+          "globs": ["*/.system_generated/logs/transcript.jsonl"],
+          "required_types": []
+        }
+      }
+    },
+    "copilot": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["copilot", "--version"],
+      "install": {"argv":["copilot","update"],"version_probe":["copilot","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.copilot_cli.max_verified_version",
+      "upstream": [
+        { "kind": "github_latest_release", "repo": "github/copilot-cli" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "jsonl", "format", "schema"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["~/.copilot/session-state"],
+          "glob": "**/*.jsonl",
+          "max_lines": 2500
+        },
+        "freshness_window_days": 14,
+        "discovery_path_contract": {
+          "description": "Copilot sessions: flat *.jsonl at root (legacy <1.0) OR <uuid>/events.jsonl subdirectories (1.0+) under ~/.copilot/session-state.",
+          "patterns": [
+            "/\\.copilot/session-state/[^/]+\\.jsonl$",
+            "/\\.copilot/session-state/[^/]+/events\\.jsonl$"
+          ]
+        }
+      },
+      "prebump": {
+        "driver": "copilot_prompt",
+        "sandbox": {"mode": "home_override", "subdir": "copilot_sandbox"},
+        "prompt": "Use your terminal tool to list file names in the current directory. Do not open or modify any files.",
+        "model": "auto",
+        "real_home_session": true,
+        "timeout_seconds": 180,
+        "required_schema_buckets": [
+          "session.start",
+          "user.message",
+          "assistant.message",
+          "tool.execution_start",
+          "tool.execution_complete"
+        ],
+        "env_vars": ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+        "_credential_note": "Copilot no longer writes ~/.copilot/hosts.json, so there is no credential file to copy. Auth is env-var-first (env_vars above); when none is set the copilot_prompt driver falls back to `gh auth token`.",
+        "credential_files": [],
+        "discover_session": {
+          "kind": "jsonl_newest",
+          "roots": [".copilot/session-state"],
+          "globs": ["**/events.jsonl", "**/*.jsonl"],
+          "required_types": []
+        }
+      }
+    },
+    "openclaw": {
+      "cadence": { "daily": true, "weekly": true },
+      "installed_version_cmd": ["openclaw", "--version"],
+      "install": {"argv":["npm","install","-g","openclaw@{version}"],"version_probe":["openclaw","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.openclaw.max_verified_version",
+      "upstream": [
+        { "kind": "npm_latest", "package": "openclaw" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "jsonl", "transcript", "storage", "format", "schema", "model", "tool", "sqlite", "database", "migration"],
+        "usage": ["usage", "token", "tokens", "quota", "limit"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "openclaw_latest_session",
+          "note": "2026.10.5+ keeps transcripts in agents/<id>/agent/openclaw-agent.sqlite (transcript_events, zstd rows decoded). Without a store, falls back to the legacy JSONL glob below. Never glob deeper than agents/<id>/sessions: agents/<id>/agent/codex-home/sessions holds the embedded Codex harness's rollouts.",
+          "roots": [
+            "$OPENCLAW_STATE_DIR",
+            "~/.openclaw",
+            "~/.clawdbot"
+          ],
+          "db_globs": ["agents/*/agent/openclaw-agent.sqlite"],
+          "max_events": 5000,
+          "glob": "agents/*/sessions/*.jsonl",
+          "required_types": ["session", "message"],
+          "max_lines": 2500,
+          "exclude_globs": [
+            "backup",
+            "*/backup/*",
+            "*.jsonl.reset.*",
+            "*.jsonl.deleted.*",
+            "*.trajectory.jsonl",
+            "*.jsonl.lock"
+          ]
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "OpenClaw sessions should resolve to agents/<id>/agent/openclaw-agent.sqlite (2026.10.5+) or legacy agents/<id>/sessions/*.jsonl.",
+          "patterns": [
+            "/agents/[^/]+/agent/openclaw-agent\\.sqlite$",
+            "/agents/[^/]+/sessions/(?![^/]+\\.trajectory\\.jsonl$)[^/]+\\.jsonl$"
+          ]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "openclaw_capture",
+            "argv": ["./scripts/capture_latest_agent_sessions.py", "--agent", "openclaw"],
+            "timeout_seconds": 60,
+            "parse": "capture_latest_sessions"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "openclaw_local_agent",
+        "sandbox": {"mode": "home_override", "subdir": "openclaw_sandbox"},
+        "prompt": "Say hi, then list the files in the current directory using your tools.",
+        "real_home_session": true,
+        "timeout_seconds": 180,
+        "env_vars": [
+          "ANTHROPIC_API_KEY",
+          "OPENAI_API_KEY",
+          "GEMINI_API_KEY",
+          "OPENROUTER_API_KEY"
+        ],
+        "credential_files": [],
+        "required_schema_buckets": ["session", "message", "message.message.content:toolCall"],
+        "discover_session": {
+          "kind": "openclaw_latest_session",
+          "roots": [".openclaw"],
+          "globs": ["agents/*/agent/openclaw-agent.sqlite", "agents/*/sessions/*.jsonl"],
+          "required_types": ["session", "message"]
+        }
+      }
+    },
+    "cursor": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["cursor-agent", "--version"],
+      "install": {"argv":["cursor-agent","update"],"version_probe":["cursor-agent","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "installed_version_fallback_cmds": [
+        ["agent", "--version"],
+        ["cursor", "--version"],
+        ["/Applications/Cursor.app/Contents/Resources/app/bin/cursor", "--version"],
+        ["~/Applications/Cursor.app/Contents/Resources/app/bin/cursor", "--version"]
+      ],
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.cursor.max_verified_version",
+      "upstream": [
+        {
+          "kind": "url_regex_semver_max",
+          "url": "https://cursor.com/install",
+          "pattern": "downloads\\.cursor\\.com/lab/([^/]+)/\\$\\{OS\\}/\\$\\{ARCH\\}/agent-cli-package\\.tar\\.gz",
+          "note": "Official Cursor CLI installer script; do not use the unrelated npm cursor-agent package."
+        },
+        {
+          "kind": "url_regex_semver_max",
+          "url": "https://formulae.brew.sh/cask/cursor-cli",
+          "pattern": "downloads\\.cursor\\.com/lab/([^/]+)/darwin/(?:arm64|x64)/agent-cli-package\\.tar\\.gz",
+          "note": "Homebrew cask page fallback for Cursor CLI latest build."
+        }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "transcript", "json", "jsonl", "agent-transcripts", "format", "tool_result", "thinking"],
+        "usage": []
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "cursor_transcript_newest",
+          "roots": ["~/.cursor/projects"],
+          "glob": "**/agent-transcripts/**/*.jsonl",
+          "max_lines": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Cursor transcripts under ~/.cursor/projects/*/agent-transcripts/*/*.jsonl",
+          "patterns": ["/\\.cursor/projects/.+/agent-transcripts/.+\\.jsonl$"]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "cursor_sqlite_probe",
+            "argv": ["./scripts/cursor_sqlite_probe.py"],
+            "timeout_seconds": 30,
+            "parse": "cursor_sqlite_json"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "cursor_agent_print",
+        "sandbox": {"mode": "home_override", "subdir": "cursor_sandbox"},
+        "prompt": "Use your terminal tool only to list file names in the current directory. Do not open or modify files. Then say what you found.",
+        "real_home_session": true,
+        "timeout_seconds": 180,
+        "required_schema_buckets": ["content.tool_use"],
+        "env_vars": ["CURSOR_API_KEY"],
+        "credential_files": [],
+        "discover_session": {
+          "kind": "cursor_transcript_newest",
+          "roots": [".cursor/projects"],
+          "globs": ["**/agent-transcripts/**/*.jsonl"],
+          "required_types": []
+        }
+      }
+    },
+    "pi": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["pi", "--version"],
+      "install": {"argv":["npm","install","-g","@earendil-works/pi-coding-agent@{version}"],"version_probe":["pi","--version"]},
+      "preflight": {"credential_files":["~/.pi/agent/auth.json"],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.pi.max_verified_version",
+      "upstream": [
+        { "kind": "npm_latest", "package": "@earendil-works/pi-coding-agent" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "jsonl", "format", "schema", "transcript", "storage", "migration"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["$PI_CODING_AGENT_SESSION_DIR", "~/.pi/agent/sessions"],
+          "glob": "**/*.jsonl",
+          "required_types": ["session", "message"],
+          "max_lines": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Pi sessions should live under ~/.pi/agent/sessions/** as JSONL v3 files, or under the PI_CODING_AGENT_SESSION_DIR override.",
+          "patterns": [
+            "/\\.pi/agent/sessions/.+\\.jsonl$",
+            "/pi-agent/sessions/.+\\.jsonl$"
+          ]
+        }
+      },
+      "prebump": {
+        "driver": "pi_prompt",
+        "fallback_models": ["openai/gpt-6.1-sol"],
+        "model": "openai/gpt-6-luna",
+        "sandbox": {"mode": "home_override", "subdir": "pi_sandbox"},
+        "prompt": "Call the ls tool now with path '.'. Do not answer before making that tool call. List filenames only; do not open, read, or modify files.",
+        "timeout_seconds": 180,
+        "env_vars": [
+          "ANTHROPIC_API_KEY",
+          "ANTHROPIC_OAUTH_TOKEN",
+          "OPENAI_API_KEY",
+          "AZURE_OPENAI_API_KEY",
+          "DEEPSEEK_API_KEY",
+          "GEMINI_API_KEY",
+          "GROQ_API_KEY",
+          "CEREBRAS_API_KEY",
+          "XAI_API_KEY",
+          "FIREWORKS_API_KEY",
+          "TOGETHER_API_KEY",
+          "OPENROUTER_API_KEY",
+          "AI_GATEWAY_API_KEY",
+          "ZAI_API_KEY",
+          "MISTRAL_API_KEY",
+          "MINIMAX_API_KEY",
+          "MOONSHOT_API_KEY",
+          "OPENCODE_API_KEY",
+          "KIMI_API_KEY",
+          "CLOUDFLARE_API_KEY",
+          "XIAOMI_API_KEY",
+          "AWS_BEARER_TOKEN_BEDROCK"
+        ],
+        "credential_files": ["~/.pi/agent/auth.json"],
+        "support_files": ["~/.pi/agent/settings.json"],
+        "discover_session": {
+          "kind": "jsonl_newest",
+          "roots": [".pi/agent/sessions"],
+          "globs": ["**/*.jsonl"],
+          "required_types": ["session", "message"]
+        }
+      }
+    },
+    "kimi": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["kimi", "--version"],
+      "install": {"argv":["npm","install","-g","@moonshot-ai/kimi-code@{version}"],"version_probe":["kimi","--version"]},
+      "preflight": {"credential_files":["~/.kimi-code/config.toml"],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.kimi_code.max_verified_version",
+      "upstream": [
+        { "kind": "npm_latest", "package": "@moonshot-ai/kimi-code" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "jsonl", "format", "schema", "transcript", "storage", "migration", "wire", "protocol_version"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "kimi_wire_newest",
+          "roots": ["$KIMI_CODE_HOME", "~/.kimi-code"],
+          "glob": "sessions/**/agents/main/wire.jsonl",
+          "required_types": ["metadata", "context.append_message"],
+          "max_lines": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Kimi sessions live under <KIMI_CODE_HOME or ~/.kimi-code>/sessions/wd_<workdir-slug>_<hash>/session_<uuid>/agents/main/wire.jsonl; subagent transcripts hang off sibling agents/<agent-id>/wire.jsonl and are excluded.",
+          "patterns": ["/sessions/wd_[^/]+/session_[^/]+/agents/main/wire\\.jsonl$"]
+        }
+      },
+      "prebump": {
+        "driver": "kimi_prompt",
+        "sandbox": {"mode": "home_override", "subdir": "kimi_sandbox"},
+        "prompt": "Use the Bash tool to run pwd. Do not read or modify any files. Then say one sentence confirming the directory.",
+        "model": "kimi-k2.7-code",
+        "model_provider_type": "kimi",
+        "model_base_url": "https://api.moonshot.ai/v1",
+        "timeout_seconds": 180,
+        "env_vars": ["KIMI_API_KEY", "KIMI_MODEL_API_KEY"],
+        "credential_files": ["~/.kimi-code/config.toml"],
+        "_credential_note": "config.toml inlines providers.<name>.api_key alongside non-secret default_model/models routing, so it is declared as a credential_file (strict 0600-mode hygiene gate applies) rather than a support_file. Prefer exporting KIMI_API_KEY (or KIMI_MODEL_API_KEY): kimi-code's moonshot-ai/\"kimi\" provider requires providerConfig.apiKey in the *loaded* config (AuthTokenMissingError otherwise -- verified against dist/main.mjs, packages/agent-core-v2/src/app/auth/auth.ts), so the kimi_prompt driver normalizes a forwarded env-var key into kimi-code's own in-memory-only KIMI_MODEL_NAME/KIMI_MODEL_API_KEY provider-synthesis contract, which the CLI itself guarantees is never written back to config.toml.",
+        "required_schema_buckets": ["event.tool.call", "event.tool.result"],
+        "discover_session": {
+          "kind": "kimi_wire_newest",
+          "roots": [".kimi-code/sessions"],
+          "globs": ["**/agents/main/wire.jsonl"],
+          "required_types": ["metadata", "context.append_message"]
+        }
+      }
+    },
+    "grok": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["grok", "--version"],
+      "install": {"argv":["grok","update","--version","{version}"],"version_probe":["grok","--version"]},
+      "preflight": {"credential_files":["~/.grok/auth.json"],"credential_required":false,"auth_argv":["grok","models"]},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.grok_cli.max_verified_version",
+      "upstream": [
+        {
+          "kind": "url_regex_semver_max",
+          "url": "https://formulae.brew.sh/api/cask/grok-build.json",
+          "pattern": "grok-(\\d+\\.\\d+\\.\\d+)-macos-(?:aarch64|x86_64)",
+          "note": "Grok Build ships as a native binary via the grok-build Homebrew cask (x.ai/cli/...), not npm, and the cask can lag an x.ai release. The grok_update_check probe declares latest_version_key: latestVersion, and agent_watch reconciles the two by taking the HIGHER version, recording the provenance in upstream.parsed_version_provenance and printing a latest_disagree token on the weekly summary whenever they differ. Max, not replace: the CLI answers for its own pinned channel, so a lower CLI answer must never be allowed to hide a newer published release."
+        }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "jsonl", "chat_history", "summary", "format", "schema", "transcript", "storage", "migration", "chat_format_version", "subagent"],
+        "usage": ["usage", "token", "tokens", "limit", "quota"]
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["~/.grok/sessions"],
+          "glob": "*/*/chat_history.jsonl",
+          "required_types": ["user", "assistant"],
+          "max_lines": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Grok sessions live under ~/.grok/sessions/<percent-encoded workdir>/<sessionId>/chat_history.jsonl with a sibling summary.json; subagents hang off <session>/subagents/<childId>/meta.json.",
+          "patterns": [
+            "/\\.grok/sessions/[^/]+/[^/]+/chat_history\\.jsonl$"
+          ],
+          "required_companion_files": [
+            {
+              "path": "summary.json",
+              "must_parse": "json_object",
+              "note": "GrokSessionDiscovery.discoverSessionFiles() skips any session directory whose summary.json is absent, so losing this one file removes EVERY Grok session from the app. The schema fingerprint cannot see it - an unreadable sidecar just contributes no keys, and _schema_diff ignores missing_keys/missing_types by design - so before this contract existed a total discovery outage reported as 'compatible, no drift'. must_parse is stricter than discovery's own fileExists check on purpose: a present-but-corrupt sidecar still lists the session but strips its id, cwd, title and both timestamps, which is an app-visible break of its own."
+            }
+          ]
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "grok_update_check",
+            "argv": ["grok", "update", "--check", "--json"],
+            "timeout_seconds": 30,
+            "parse": "grok_update_json",
+            "latest_version_key": "latestVersion"
+          }
+        ]
+      },
+      "prebump": {
+        "driver": "grok_single",
+        "sandbox": { "mode": "home_override", "subdir": "grok_sandbox" },
+        "prompt": "Say hi, then use your file-listing tool to list the files in the current directory.",
+        "timeout_seconds": 240,
+        "credential_files": ["~/.grok/auth.json"],
+        "_credential_note": "Grok exposes NO api-key environment variable (its only documented one is GROK_SANDBOX), so the env-var-first branch of prepare_auth can never fire and the credential-file copy is the only auth path. ~/.grok/auth.json is an OAuth record keyed by issuer URL and carries account PII (email, name, user_id, team_id) alongside the token, which is why it is declared a credential_file - strict 0600-mode hygiene gate - and never a support_file. It is copied into the throwaway sandbox HOME and torn down with it.",
+        "discover_session": {
+          "kind": "grok_session_newest",
+          "roots": [".grok/sessions"],
+          "globs": ["*/*/chat_history.jsonl"],
+          "required_types": ["user", "assistant"]
+        }
+      }
+    },
+    "qwen": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["qwen", "--version"],
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.qwen_code.max_verified_version",
+      "upstream": [
+        { "kind": "npm_latest", "package": "@qwen-code/qwen-code" }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "jsonl", "format", "schema", "transcript", "storage", "migration", "chats", "archive", "uuid", "sessionid"],
+        "usage": []
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "jsonl_newest",
+          "roots": ["$QWEN_HOME/projects", "~/.qwen/projects"],
+          "glob": "**/*.jsonl",
+          "required_types": ["user", "assistant"],
+          "max_lines": 2500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Qwen sessions should be discovered under a projects root as <project>/chats/<id>.jsonl (active) or <project>/chats/archive/<id>.jsonl (archived); other JSONL under projects is not a session.",
+          "patterns": [
+            "/projects/[^/]+/chats/[^/]+\\.jsonl$",
+            "/projects/[^/]+/chats/archive/[^/]+\\.jsonl$"
+          ]
+        }
+      }
+    },
+    "devin": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["devin", "--version"],
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.devin_cli.max_verified_version",
+      "upstream": [
+        {
+          "kind": "url_regex_semver_max",
+          "url": "https://docs.devin.ai/cli/changelog/stable.md",
+          "pattern": "(?m)^\\*\\*v(\\d+\\.\\d+\\.\\d+)\\*\\*\\s*$",
+          "note": "Devin CLI stable-channel changelog (markdown). Each release is a bold heading line such as **v3000.11.92**; the anchored pattern skips versions quoted in release-note prose. The page also lists early calendar versions (v2026.8.18), which the 3000.x builds outrank, so the max is the current stable build. The matrix records the steward's build with its commit, 3000.6.7 (260a97c8); version comparison reads only the numeric triple. Devin is STEWARD-VERIFIED and normally not installed here (SKILL 1g): this source is the ping trigger, not a bump signal."
+        }
+      ],
+      "risk_keywords": {
+        "schema": ["session", "sessions.db", "sqlite", "schema", "migration", "format", "storage", "message_nodes", "main_chain", "transcript", "database", "db"],
+        "usage": []
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "devin_latest_session",
+          "single_session_reason": "Bounded main-chain topology probe; native verification is steward-owned and no local CLI is installed.",
+          "db_roots": ["~/.local/share/devin/cli/sessions.db"],
+          "max_nodes": 500
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Devin keeps every session in one shared SQLite database under the CLI data directory; there is no per-session file to discover.",
+          "patterns": [
+            "/devin/cli/sessions\\.db$"
+          ]
+        }
+      }
+    },
+    "fx": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["fx", "--version"],
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.fx.max_verified_version",
+      "upstream": [
+        {
+          "kind": "github_latest_release",
+          "repo": "vercel-labs/fx",
+          "note": "fx is STEWARD-VERIFIED and is normally not installed on the maintainer's machine, so installed_version resolves to unknown and the schema channel is silent here by design (SKILL 1g). This upstream source is the only signal a maintainer sweep can act on: it answers 'has upstream moved past what the steward last verified?', which is the ping trigger. Without it the steward rule is unenforceable -- on 2026-08-31 the record read 0.0.5 while v0.0.6 (08-25) and v0.0.7 (08-29) had already shipped, and the weekly reported upstream=unknown and saw nothing."
+        }
+      ],
+      "risk_keywords": {
+        "schema": [
+          "session", "checkpoint", "schema", "migration", "format", "storage",
+          "history", "transcript", "durable", "compaction", "event_log"
+        ],
+        "usage": []
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "fx_latest_session",
+          "roots": ["~/.fx/sessions"],
+          "glob": "*/{checkpoint.json,events.jsonl}",
+          "note": "fx_latest_session ignores the glob for selection (it is only echoed in a no_files_found report). agent_watch._fx_session_unit picks one file per session directory the way FxSessionDiscovery does: checkpoint.json for schema 3 (fx <= 0.0.7); events.jsonl for schema 4 (fx 0.0.8+) only when there is no checkpoint.json and no authority.json; latest/ and the opt-in sessions-v2 root v2/ are skipped. The newest five are unioned."
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "fx keeps one directory per session under ~/.fx/sessions. Schema 3 (fx <= 0.0.7): checkpoint.json is the transcript, and the sibling events.jsonl is write-ahead infrastructure that is never read. Schema 4 (fx 0.0.8+, built from upstream v0.0.14 source): no checkpoint.json; events.jsonl holds one conversation frame per line. session.json is the sidecar in both.",
+          "patterns": [
+            "/\\.fx/sessions/[^/]+/checkpoint\\.json$",
+            "/\\.fx/sessions/[^/]+/events\\.jsonl$"
+          ],
+          "required_companion_files": [
+            {
+              "path": "session.json",
+              "must_parse": "json_object",
+              "note": "FxSessionDiscovery skips a session directory without session.json in both layouts, and FxSessionParser refuses a schema-4 event log unless session.json reads schema_version >= 4. A missing or unreadable manifest is therefore a discovery outage the schema fingerprint cannot report."
+            }
+          ]
+        }
+      }
+    },
+    "cline": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["cline", "--version"],
+      "install": {"argv":["npm","install","-g","cline@{version}"],"version_probe":["cline","--version"]},
+      "preflight": {"credential_files":["~/.cline/data/settings/providers.json"],"credential_required":false,"models_argv":["curl","-fsS","--max-time","15","https://api.cline.bot/api/v1/ai/cline/recommended-models"],"models_format":"lines"},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.cline.max_verified_version",
+      "upstream": [
+        { "kind": "npm_latest", "package": "cline" }
+      ],
+      "risk_keywords": {
+        "schema": [
+          "session", "manifest", "messages", "schema", "migration", "format",
+          "storage", "transcript", "sessionhistoryorigin", "cline_data_dir"
+        ],
+        "usage": []
+      },
+      "weekly": {
+        "local_schema": {
+          "kind": "cline_latest_session",
+          "roots": ["$CLINE_DATA_DIR/sessions", "~/.cline/data/sessions"],
+          "glob": "*/*.json",
+          "exclude_globs": ["*.messages.json"]
+        },
+        "freshness_window_days": 30,
+        "discovery_path_contract": {
+          "description": "Cline CLI and Desktop share one session directory per id. The canonical <id>.json manifest must have an adjacent <id>.messages.json transcript; the manifest's absolute messages_path is never followed.",
+          "patterns": ["/sessions/([^/]+)/\\1\\.json$"],
+          "required_companion_files": [
+            {
+              "path": "{stem}.messages.json",
+              "must_parse": "cline_messages_v1",
+              "note": "Cline transcript support depends on an adjacent v1 transcript whose sessionId matches the v1 manifest session_id and whose messages field is an array. Missing, malformed, mismatched, or unsupported-version companions fail the monitoring contract. Following manifest.messages_path would escape the selected root."
+            }
+          ]
+        }
+      },
+      "prebump": {
+        "driver": "cline_headless",
+        "fallback_models": ["cline-free/solar-mini4"],
+        "model": "cline-free/nemotron-3.5-super-vl",
+        "sandbox": { "mode": "home_override", "subdir": "cline_sandbox" },
+        "prompt": "Use your tools to list the files in the current directory, then read a.txt and say what it contains.",
+        "real_home_session": true,
+        "timeout_seconds": 240,
+        "env_vars": [],
+        "credential_files": [],
+        "support_files": [],
+        "required_schema_buckets": [
+          "manifest", "transcript", "message.user", "message.assistant",
+          "content.tool_use", "content.tool_result"
+        ],
+        "discover_session": {
+          "kind": "cline_session_manifest",
+          "roots": [".cline/data/sessions"],
+          "globs": ["*/*.json"],
+          "required_types": []
+        },
+        "_real_home_note": "Cline signs in with an OAuth account (~/.cline/data/settings/providers.json). Copying that file into a sandbox would let a sandboxed token refresh rotate the owner's real refresh token, so run this driver with --allow-real-home: the session lands in the real store, while stdout/stderr and the seeded a.txt workspace stay in the disposable sandbox. The driver returns the <id>.json manifest; the fingerprinter opens the adjacent <id>.messages.json. Manifest and transcript are pretty JSON, not JSONL, so required_types stays empty and the driver itself requires a tool_use plus a tool_result block."
+      }
+    },
+    "deepseek_harness": {
+      "cadence": { "daily": false, "weekly": true },
+      "installed_version_cmd": ["dsh", "--version"],
+      "install": {"argv":["npm","install","-g","@deepseek-ai/dsh@{version}"],"version_probe":["dsh","--version"]},
+      "preflight": {"credential_files":[],"credential_required":false},
+      "verified_version_source": "docs/agent-support/agent-support-matrix.yml#agents.deepseek_harness.max_verified_version",
+      "upstream": [
+        { "kind": "github_latest_release_including_prerelease", "repo": "deepseek-ai/deepseek-harness" }
+      ],
+      "risk_keywords": {
+        "schema": [
+          "session", "format", "migration", "jsonl", "zstd", "event",
+          "persistence", "generation", "archive"
+        ],
+        "usage": []
+      },
+      "weekly": {
+        "freshness_window_days": 14,
+        "local_schema": {
+          "kind": "deepseek_harness_sessions",
+          "roots": ["~/.dsh/sessions"],
+          "root_env": "DSH_HOME",
+          "default_root": "~/.dsh/sessions",
+          "glob": "**/session[.vN].jsonl[.zstd]",
+          "sample_count": 5,
+          "max_lines": 5000
+        },
+        "discovery_path_contract": {
+          "patterns": ["(?:^|/)session(?:\\.v[1-9][0-9]*)?\\.jsonl(?:\\.zstd)?$"],
+          "description": "Selected canonical DSH generation under <root>/<project-key>/<encoded-session-id>; checks generation/header paths, duplicate selections, and root-wide compression consistency."
+        },
+        "probes": [
+          {
+            "kind": "script",
+            "label": "deepseek_harness_fixture_manifest",
+            "argv": ["./scripts/verify_dsh_fixture_manifest.py"],
+            "timeout_seconds": 15
+          }
+        ],
+        "_privacy_note": "Weekly monitoring reads headers and up to five recent real DSH session generations under $DSH_HOME/sessions (or ~/.dsh/sessions), validates their JSONL/zstd record structure, and records only schema keys, event types, counts, and private report paths. Prompt and tool payload values are not written to reports."
+      },
+      "prebump": {
+        "driver": "deepseek_harness_headless",
+        "sandbox": { "mode": "home_override", "subdir": "deepseek_harness_sandbox" },
+        "prompt": "Use the shell tool to run pwd exactly once, then report the directory in one short sentence.",
+        "real_home_session": true,
+        "timeout_seconds": 240,
+        "env_vars": [],
+        "credential_files": [],
+        "required_evidence_buckets": [
+          "message", "tool", "usage", "relationship", "integrity"
+        ],
+        "discover_session": {
+          "kind": "deepseek_harness_session_newest",
+          "roots": [".dsh/sessions"],
+          "globs": ["**/session.v*.jsonl", "**/session.v*.jsonl.zstd"],
+          "required_types": [
+            "user/message", "assistant/message", "tool/call", "tool/result"
+          ]
+        },
+        "_real_home_note": "The installed DSH profile, credentials, and durable Session store are one authority below DSH_HOME. Run this driver with --allow-real-home; stdout and stderr stay in the disposable prebump sandbox, while DSH writes only its normal Session artifact to the real store."
+      }
+    }
+  }
+}

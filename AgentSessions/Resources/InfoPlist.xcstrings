@@ -1,0 +1,108 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "CFBundleDisplayName" : {
+      "comment" : "The name shown by Finder and system UI. Keep SessionRecall unchanged as the product name.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall"
+          }
+        }
+      }
+    },
+    "CFBundleName" : {
+      "comment" : "The short bundle name used by system UI. Keep SessionRecall unchanged as the product name.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall"
+          }
+        }
+      }
+    },
+    "NSAppleEventsUsageDescription" : {
+      "comment" : "Why the app requests Apple Events access to resume sessions in Terminal.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall controls Terminal to resume Codex sessions on your behalf."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall 会控制 Terminal，代你继续 Codex 会话。"
+          }
+        }
+      }
+    },
+    "NSDownloadsFolderUsageDescription" : {
+      "comment" : "Why the app requests Downloads access for exported artifacts.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall saves exported images and terminal recordings to your Downloads folder."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall 会将导出的图像和终端录制保存到“下载”文件夹。"
+          }
+        }
+      }
+    },
+    "NSDesktopFolderUsageDescription" : {
+      "comment" : "Why the app requests Desktop access for session files.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall needs access to read session files in this location."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall 需要访问此位置，以读取其中的会话文件。"
+          }
+        }
+      }
+    },
+    "NSDocumentsFolderUsageDescription" : {
+      "comment" : "Why the app requests Documents access for session files.",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall needs access to read session files in this location."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SessionRecall 需要访问此位置，以读取其中的会话文件。"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

@@ -1,0 +1,593 @@
+import Foundation
+import Darwin
+
+struct CrashReportDetector {
+    private let fileManager: FileManager
+    private let reportsRootURL: URL
+    private let appName: String
+    private let bundleIdentifier: String
+    private let appVersion: String
+    private let appBuild: String
+    private let nowProvider: () -> Date
+    private let lookbackWindow: TimeInterval
+    private let maxReports: Int
+
+    init(fileManager: FileManager = .default,
+         reportsRootURL: URL? = nil,
+         appName: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Agent Sessions",
+         bundleIdentifier: String = Bundle.main.bundleIdentifier ?? "com.triada.AgentSessions",
+         appVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+         appBuild: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+         nowProvider: @escaping () -> Date = Date.init,
+         lookbackWindow: TimeInterval = 14 * 24 * 60 * 60,
+         maxReports: Int = 20) {
+        self.fileManager = fileManager
+        if let reportsRootURL {
+            self.reportsRootURL = reportsRootURL
+        } else {
+            self.reportsRootURL = fileManager.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Logs/DiagnosticReports", isDirectory: true)
+        }
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.appVersion = appVersion
+        self.appBuild = appBuild
+        self.nowProvider = nowProvider
+        self.lookbackWindow = lookbackWindow
+        self.maxReports = maxReports
+    }
+
+    /// macOS moves reports here within a few days, often before the next launch.
+    private static let retiredFolderName = "Retired"
+
+    func detectRecentCrashes() -> [CrashReportEnvelope] {
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: reportsRootURL.path, isDirectory: &isDir), isDir.boolValue else {
+            return []
+        }
+
+        let retiredURL = reportsRootURL.appendingPathComponent(Self.retiredFolderName, isDirectory: true)
+        let files = reportFiles(in: reportsRootURL) + reportFiles(in: retiredURL)
+
+        let cutoff = nowProvider().addingTimeInterval(-lookbackWindow)
+
+        let candidates = files
+            .filter { ["ips", "crash"].contains($0.pathExtension.lowercased()) }
+            .compactMap { url -> (URL, Date)? in
+                let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+                guard values?.isRegularFile == true else { return nil }
+                let mtime = values?.contentModificationDate ?? .distantPast
+                guard mtime >= cutoff else { return nil }
+                return (url, mtime)
+            }
+            .sorted { $0.1 > $1.1 }
+
+        var detected: [CrashReportEnvelope] = []
+        detected.reserveCapacity(maxReports)
+
+        for (url, modifiedAt) in candidates {
+            guard let envelope = makeEnvelope(from: url, fallbackDetectedAt: modifiedAt) else { continue }
+            detected.append(envelope)
+            if detected.count >= maxReports { break }
+        }
+
+        return detected.sorted { $0.detectedAt > $1.detectedAt }
+    }
+
+    /// Re-checks a queued report against the identity rule. Builds before that
+    /// rule queued crashes of child processes, and they read procName from the
+    /// .ips header only, which real headers lack. The report filename then names
+    /// the process. A report with no identity at all is kept.
+    func isAppReport(_ envelope: CrashReportEnvelope) -> Bool {
+        let filenameProcess = processName(fromReportFilename: envelope.reportFilename)
+        // A user fault is a report for a process that kept running.
+        if filenameProcess?.isUserFault == true { return false }
+
+        let bundleID = nonEmptyString(envelope.rawMetadata["bundleID"])
+        let processName = nonEmptyString(envelope.rawMetadata["procName"]) ?? filenameProcess?.name
+        guard bundleID != nil || processName != nil else { return true }
+        return isAppIdentity(bundleID: bundleID, processName: processName)
+    }
+
+    /// Reports are named "<process>-2026-10-22-113712.ips" or
+    /// "<process>_2026-10-22-113712[_host].crash"; user faults add an
+    /// "ExcUserFault_" prefix.
+    private func processName(fromReportFilename filename: String) -> (name: String, isUserFault: Bool)? {
+        let pattern = #"^(ExcUserFault_)?(.+?)[-_]\d{4}-\d{2}-\d{2}-\d{6}"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
+              let nameRange = Range(match.range(at: 2), in: filename) else {
+            return nil
+        }
+        return (String(filename[nameRange]), match.range(at: 1).location != NSNotFound)
+    }
+
+    private func reportFiles(in directory: URL) -> [URL] {
+        (try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+    }
+
+    /// Seen and dismissed history stores report ids, and the id hashes the
+    /// report path. Hash the path the report had before macOS retired it.
+    private func identityPath(of url: URL) -> String {
+        let folder = url.deletingLastPathComponent()
+        guard folder.lastPathComponent == Self.retiredFolderName else { return url.path }
+        return folder.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent).path
+    }
+
+    private func makeEnvelope(from url: URL, fallbackDetectedAt: Date) -> CrashReportEnvelope? {
+        guard let rawData = try? Data(contentsOf: url),
+              let text = String(data: rawData, encoding: .utf8) else {
+            return nil
+        }
+
+        // XCTest injects the production app bundle into its test host. Those
+        // runs can emit DiagnosticReports with this app's bundle identifier,
+        // but they are test failures, not end-user crashes to surface on the
+        // next normal launch.
+        guard !isXCTestInjectedReport(text) else { return nil }
+
+        let parsed: ParsedCrash?
+        switch url.pathExtension.lowercased() {
+        case "ips":
+            parsed = parseIPS(text: text)
+        case "crash":
+            parsed = parseCrashText(text)
+        default:
+            parsed = nil
+        }
+
+        guard let parsed else { return nil }
+
+        let metadata = parsed.metadata.reduce(into: [String: String]()) { partial, entry in
+            partial[entry.key] = CrashReportSanitizer.truncate(entry.value, limit: 220)
+        }
+
+        let topFrames = parsed.topFrames.prefix(10).map { CrashReportSanitizer.sanitizeFrame($0) }
+        let breadcrumbs = [
+            "launch.diagnostics_scan",
+            "source:\(url.lastPathComponent)",
+            "detected:\(AppDateFormatting.dateTimeMedium(fallbackDetectedAt))"
+        ]
+
+        let sourceHash = stableHash(identityPath(of: url))
+        let crashTime = parsed.crashTimestamp
+        let idSeed = "\(sourceHash)|\(parsed.idTimestamp?.timeIntervalSince1970 ?? 0)|\(parsed.terminationSummary)|\(topFrames.first ?? "")"
+
+        return CrashReportEnvelope(
+            id: stableHash(idSeed),
+            detectedAt: fallbackDetectedAt,
+            reportSourcePathHash: sourceHash,
+            reportFilename: url.lastPathComponent,
+            crashTimestamp: crashTime,
+            appVersion: parsed.appVersion ?? appVersion,
+            appBuild: parsed.appBuild ?? appBuild,
+            macOSVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            architecture: machineArchitecture(),
+            terminationSummary: CrashReportSanitizer.truncate(parsed.terminationSummary, limit: 400),
+            topFrames: topFrames,
+            exceptionReason: parsed.exceptionReason.map {
+                CrashReportSanitizer.sanitizeText($0, limit: CrashReportSanitizer.exceptionReasonLimit)
+            },
+            exceptionBacktrace: parsed.exceptionBacktrace.map { frames in
+                frames.prefix(CrashReportSanitizer.exceptionBacktraceLimit).map { CrashReportSanitizer.sanitizeFrame($0) }
+            },
+            breadcrumbs: breadcrumbs,
+            rawMetadata: metadata
+        )
+    }
+
+    /// Compares without spaces: reports name the executable ("AgentSessions"),
+    /// while `appName` is the display name ("Agent Sessions").
+    private func isAppProcessName(_ name: String?) -> Bool {
+        guard let name, !name.isEmpty else { return false }
+        let squashed = { (value: String) in value.replacingOccurrences(of: " ", with: "").lowercased() }
+        return squashed(name) == squashed(appName)
+    }
+
+    /// A bundle id, when the report has one, is authoritative: another app can
+    /// share the executable name. The process name decides only without one.
+    private func isAppIdentity(bundleID: String?, processName: String?) -> Bool {
+        if let bundleID, !bundleID.isEmpty {
+            return bundleID.caseInsensitiveCompare(bundleIdentifier) == .orderedSame
+        }
+        return isAppProcessName(processName)
+    }
+
+    /// Only 309 (and the legacy 109) are crash reports. Stackshots (288) and
+    /// other diagnostics share the folder and the .ips extension. A 309 report
+    /// can still describe a process that kept running: user faults are marked
+    /// simulated, and some conditions non-fatal.
+    private func isIPSCrashReport(headerJSON: [String: Any]?, payloadJSON: [String: Any]?) -> Bool {
+        let survivedMarkers = [headerJSON?["is_simulated"], payloadJSON?["isSimulated"], payloadJSON?["isNonFatal"]]
+        if survivedMarkers.contains(where: isTruthy) { return false }
+        guard let bugType = headerJSON?["bug_type"] ?? payloadJSON?["bug_type"] else { return true }
+        return ["109", "309"].contains("\(bugType)")
+    }
+
+    /// Apple documents these flags as strings; macOS writes integers.
+    private func isTruthy(_ value: Any?) -> Bool {
+        switch value {
+        case let bool as Bool: return bool
+        case let number as NSNumber: return number.boolValue
+        case let string as String: return ["1", "true", "yes"].contains(string.lowercased())
+        default: return false
+        }
+    }
+
+    private func nonEmptyString(_ value: Any?) -> String? {
+        guard let string = value as? String, !string.isEmpty else { return nil }
+        return string
+    }
+
+    private func isXCTestInjectedReport(_ text: String) -> Bool {
+        let lowercased = text.lowercased()
+        return lowercased.contains("libxctestbundleinject")
+            || lowercased.contains("com.apple.dt.xctest")
+            || lowercased.contains("xctest.framework")
+    }
+
+    private func parseCrashText(_ text: String) -> ParsedCrash? {
+        let lines = text.components(separatedBy: .newlines)
+        // Match only the crashed process itself. Child processes this app
+        // launches also name it under "Responsible:" and "Coalition:".
+        let processName = firstValue(after: "Process:", in: lines)?
+            .replacingOccurrences(of: #"\s*\[\d+\]$"#, with: "", options: .regularExpression)
+        let identifier = firstValue(after: "Identifier:", in: lines)
+        guard isAppIdentity(bundleID: identifier, processName: processName) else {
+            return nil
+        }
+        // "SIMULATED (this is NOT a crash)" or "NON-FATAL CONDITION": the
+        // process kept running.
+        if let note = firstValue(after: "Exception Note:", in: lines)?.uppercased(),
+           note.contains("SIMULATED") || note.contains("NON-FATAL") {
+            return nil
+        }
+
+        let crashTimestamp = parseCrashTimestamp(from: lines)
+        let rawVersion = firstValue(after: "Version:", in: lines)
+        let parsedVersionBuild = parseVersionAndBuild(from: rawVersion)
+
+        let exceptionType = firstValue(after: "Exception Type:", in: lines)
+        let exceptionCodes = firstValue(after: "Exception Codes:", in: lines)
+        let terminationReason = firstValue(after: "Termination Reason:", in: lines)
+
+        var summaryParts: [String] = []
+        if let exceptionType { summaryParts.append("\(exceptionType)") }
+        if let exceptionCodes { summaryParts.append("\(exceptionCodes)") }
+        if let terminationReason { summaryParts.append("\(terminationReason)") }
+        let summary = summaryParts.isEmpty ? "Crash report from macOS DiagnosticReports" : summaryParts.joined(separator: " | ")
+
+        let topFrames = parseTopFramesFromCrashLines(lines)
+
+        var meta = [
+            "format": "crash",
+            "exceptionType": exceptionType ?? "",
+            "terminationReason": terminationReason ?? ""
+        ]
+        if let appVersion = parsedVersionBuild.version {
+            meta["reportAppVersion"] = appVersion
+        }
+        if let appBuild = parsedVersionBuild.build {
+            meta["reportAppBuild"] = appBuild
+        }
+
+        return ParsedCrash(crashTimestamp: crashTimestamp,
+                           idTimestamp: crashTimestamp,
+                           terminationSummary: summary,
+                           topFrames: topFrames,
+                           exceptionReason: nil,
+                           exceptionBacktrace: nil,
+                           metadata: meta,
+                           appVersion: parsedVersionBuild.version,
+                           appBuild: parsedVersionBuild.build)
+    }
+
+    private func parseIPS(text: String) -> ParsedCrash? {
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        guard !lines.isEmpty else { return nil }
+
+        let headerJSON = parseJSONObject(lines.first)
+        let payloadText = lines.dropFirst().joined(separator: "\n")
+        let payloadJSON = parseJSONObject(payloadText) ?? firstJSONObject(in: lines.dropFirst())
+
+        guard isIPSCrashReport(headerJSON: headerJSON, payloadJSON: payloadJSON) else { return nil }
+
+        // Match only the crashed process itself. Child processes this app
+        // launches carry its bundle id as `coalitionName`, so a plain text
+        // search would report their crashes as ours. Fields are ranked by how
+        // directly they name the crashed process; the first one present decides.
+        let procName = nonEmptyString(payloadJSON?["procName"]) ?? (headerJSON?["procName"] as? String) ?? ""
+        let bundleInfo = payloadJSON?["bundleInfo"] as? [String: Any]
+        let bundleID = nonEmptyString(headerJSON?["bundleID"])
+            ?? nonEmptyString(headerJSON?["bundleIdentifier"])
+            ?? nonEmptyString(bundleInfo?["CFBundleIdentifier"])
+            ?? ""
+        let processName = nonEmptyString(procName)
+            ?? nonEmptyString(headerJSON?["name"])
+            ?? nonEmptyString(headerJSON?["app_name"])
+
+        guard isAppIdentity(bundleID: bundleID, processName: processName) else { return nil }
+
+        // Real headers write "2026-10-22 11:37:12.00 -0700". Older builds parsed
+        // only ISO 8601 and seeded the report id with that result, so the id
+        // keeps it: seen and dismissed history stores ids.
+        let rawTimestamp = headerJSON?["timestamp"] as? String ?? payloadJSON?["timestamp"] as? String
+        let isoTimestamp = rawTimestamp.flatMap(parseISOTimestamp)
+        let crashTimestamp = isoTimestamp ?? rawTimestamp.flatMap(parseIPSHeaderTimestamp)
+        let parsedVersionBuild = parseIPSVersionBuild(headerJSON: headerJSON, payloadJSON: payloadJSON)
+
+        var summaryParts: [String] = []
+        if let exception = payloadJSON?["exception"] as? [String: Any] {
+            if let type = exception["type"] as? String, !type.isEmpty { summaryParts.append(type) }
+            if let signal = exception["signal"] as? String, !signal.isEmpty { summaryParts.append(signal) }
+        }
+        if let termination = payloadJSON?["termination"] as? [String: Any] {
+            if let reason = termination["reason"] as? String, !reason.isEmpty { summaryParts.append(reason) }
+            if let namespace = termination["namespace"] as? String, !namespace.isEmpty { summaryParts.append("namespace=\(namespace)") }
+        }
+        if summaryParts.isEmpty {
+            summaryParts.append("Crash report from macOS DiagnosticReports")
+        }
+
+        let topFrames = parseTopFramesFromIPSPayload(payloadJSON, fallbackText: text)
+        let usedImages = payloadJSON?["usedImages"] as? [[String: Any]] ?? []
+        let exceptionBacktrace = (payloadJSON?["lastExceptionBacktrace"] as? [[String: Any]])
+            .map { frames in frames.prefix(CrashReportSanitizer.exceptionBacktraceLimit).map { describeIPSFrame($0, usedImages: usedImages) } }
+
+        var metadata: [String: String] = [:]
+        metadata["format"] = "ips"
+        metadata["procName"] = procName
+        if !bundleID.isEmpty { metadata["bundleID"] = bundleID }
+        if let incident = headerJSON?["incident"] as? String { metadata["incident"] = incident }
+        if let appVersion = parsedVersionBuild.version { metadata["reportAppVersion"] = appVersion }
+        if let appBuild = parsedVersionBuild.build { metadata["reportAppBuild"] = appBuild }
+
+        return ParsedCrash(crashTimestamp: crashTimestamp,
+                           idTimestamp: isoTimestamp,
+                           terminationSummary: summaryParts.joined(separator: " | "),
+                           topFrames: topFrames,
+                           exceptionReason: parseIPSApplicationSpecificInfo(payloadJSON?["asi"]),
+                           exceptionBacktrace: exceptionBacktrace,
+                           metadata: metadata,
+                           appVersion: parsedVersionBuild.version,
+                           appBuild: parsedVersionBuild.build)
+    }
+
+    private func parseTopFramesFromCrashLines(_ lines: [String]) -> [String] {
+        guard let crashThreadIndex = lines.firstIndex(where: { $0.contains("Crashed:") && $0.contains("Thread") }) else {
+            return []
+        }
+
+        var frames: [String] = []
+        var index = crashThreadIndex + 1
+        while index < lines.count, frames.count < 10 {
+            let line = lines[index].trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { break }
+            if line.hasPrefix("Thread") && !line.contains("Crashed") { break }
+            if line.first?.isNumber == true {
+                frames.append(line)
+            }
+            index += 1
+        }
+        return frames
+    }
+
+    private func parseTopFramesFromIPSPayload(_ payloadJSON: [String: Any]?, fallbackText: String) -> [String] {
+        guard let payloadJSON else {
+            return fallbackFrames(from: fallbackText)
+        }
+
+        guard let threads = payloadJSON["threads"] as? [[String: Any]], !threads.isEmpty else {
+            return fallbackFrames(from: fallbackText)
+        }
+
+        let faultingIndex = (payloadJSON["faultingThread"] as? Int) ?? 0
+        let thread = threads.indices.contains(faultingIndex) ? threads[faultingIndex] : threads[0]
+
+        guard let frames = thread["frames"] as? [[String: Any]], !frames.isEmpty else {
+            return fallbackFrames(from: fallbackText)
+        }
+
+        let usedImages = payloadJSON["usedImages"] as? [[String: Any]] ?? []
+        return frames.prefix(10).map { describeIPSFrame($0, usedImages: usedImages) }
+    }
+
+    /// Formats one .ips frame as "image symbol". Frames name their image through
+    /// `imageIndex` into `usedImages`; a frame without a symbol (stripped app code)
+    /// keeps its image offset so it can be symbolicated with the release dSYM.
+    private func describeIPSFrame(_ frame: [String: Any], usedImages: [[String: Any]]) -> String {
+        var image = frame["imageName"] as? String
+        if image == nil, let index = frame["imageIndex"] as? Int, usedImages.indices.contains(index) {
+            let entry = usedImages[index]
+            image = (entry["name"] as? String)
+                ?? (entry["path"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent }
+        }
+
+        let symbol: String
+        if let name = frame["symbol"] as? String {
+            symbol = name
+        } else if let offset = frame["imageOffset"] as? Int {
+            symbol = "+0x" + String(offset, radix: 16)
+        } else {
+            symbol = "<symbol>"
+        }
+        return "\(image ?? "<image>") \(symbol)"
+    }
+
+    /// Joins the .ips `asi` map (image name -> messages) into one line per image.
+    /// For an uncaught NSException this holds the exception reason.
+    private func parseIPSApplicationSpecificInfo(_ value: Any?) -> String? {
+        guard let asi = value as? [String: Any] else { return nil }
+        let lines = asi.keys.sorted().compactMap { key -> String? in
+            let messages = (asi[key] as? [String]) ?? (asi[key] as? String).map { [$0] } ?? []
+            let text = messages.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? nil : "\(key): \(text)"
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: " | ")
+    }
+
+    private func fallbackFrames(from text: String) -> [String] {
+        text
+            .components(separatedBy: .newlines)
+            .filter { $0.trimmingCharacters(in: .whitespaces).first?.isNumber == true }
+            .prefix(10)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private func parseJSONObject(_ text: String?) -> [String: Any]? {
+        guard let text,
+              let data = text.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private func firstJSONObject(in lines: ArraySlice<String>) -> [String: Any]? {
+        for line in lines {
+            if let object = parseJSONObject(line) {
+                return object
+            }
+        }
+        return nil
+    }
+
+    private func parseCrashTimestamp(from lines: [String]) -> Date? {
+        guard let raw = firstValue(after: "Date/Time:", in: lines) else { return nil }
+        let formatters: [DateFormatter] = [
+            dateFormatter("yyyy-MM-dd HH:mm:ss.SSS Z"),
+            dateFormatter("yyyy-MM-dd HH:mm:ss Z")
+        ]
+        for formatter in formatters {
+            if let date = formatter.date(from: raw) {
+                return date
+            }
+        }
+        return nil
+    }
+
+    private func parseISOTimestamp(_ timestamp: String) -> Date? {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: timestamp) { return date }
+        return ISO8601DateFormatter().date(from: timestamp)
+    }
+
+    private func parseIPSHeaderTimestamp(_ timestamp: String) -> Date? {
+        let formatters = [
+            dateFormatter("yyyy-MM-dd HH:mm:ss.SS Z"),
+            dateFormatter("yyyy-MM-dd HH:mm:ss.SSS Z"),
+            dateFormatter("yyyy-MM-dd HH:mm:ss Z")
+        ]
+        return formatters.lazy.compactMap { $0.date(from: timestamp) }.first
+    }
+
+    private func firstValue(after prefix: String, in lines: [String]) -> String? {
+        for line in lines {
+            guard line.hasPrefix(prefix) else { continue }
+            return line.replacingOccurrences(of: prefix, with: "")
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    private func dateFormatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = format
+        return formatter
+    }
+
+    private func parseVersionAndBuild(from versionField: String?) -> (version: String?, build: String?) {
+        guard let raw = versionField?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return (nil, nil)
+        }
+
+        guard let openParen = raw.lastIndex(of: "("),
+              let closeParen = raw.lastIndex(of: ")"),
+              openParen < closeParen else {
+            return (raw, nil)
+        }
+
+        let versionPart = String(raw[..<openParen]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let buildPart = String(raw[raw.index(after: openParen)..<closeParen]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = versionPart.isEmpty ? nil : versionPart
+        let build = buildPart.isEmpty ? nil : buildPart
+        return (version, build)
+    }
+
+    private func parseIPSVersionBuild(headerJSON: [String: Any]?, payloadJSON: [String: Any]?) -> (version: String?, build: String?) {
+        var version = firstNonEmptyString(from: headerJSON, keys: ["app_version", "appVersion", "appVersionString"])
+            ?? firstNonEmptyString(from: payloadJSON, keys: ["app_version", "appVersion", "appVersionString"])
+        var build = firstNonEmptyString(from: headerJSON, keys: ["build_version", "app_build", "appBuild", "buildVersion"])
+            ?? firstNonEmptyString(from: payloadJSON, keys: ["build_version", "app_build", "appBuild", "buildVersion"])
+
+        if let bundleInfo = headerJSON?["bundleInfo"] as? [String: Any] {
+            version = version ?? firstNonEmptyString(from: bundleInfo, keys: ["CFBundleShortVersionString", "CFBundleVersionString"])
+            build = build ?? firstNonEmptyString(from: bundleInfo, keys: ["CFBundleVersion"])
+        }
+        if let bundleInfo = payloadJSON?["bundleInfo"] as? [String: Any] {
+            version = version ?? firstNonEmptyString(from: bundleInfo, keys: ["CFBundleShortVersionString", "CFBundleVersionString"])
+            build = build ?? firstNonEmptyString(from: bundleInfo, keys: ["CFBundleVersion"])
+        }
+
+        if build == nil, let currentVersion = version {
+            let parsed = parseVersionAndBuild(from: currentVersion)
+            version = parsed.version ?? currentVersion
+            build = parsed.build
+        }
+
+        return (version, build)
+    }
+
+    private func firstNonEmptyString(from dictionary: [String: Any]?, keys: [String]) -> String? {
+        guard let dictionary else { return nil }
+        for key in keys {
+            guard let value = dictionary[key] as? String else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return nil
+    }
+
+    private func stableHash(_ value: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        let prime: UInt64 = 0x100000001b3
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* prime
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    private func machineArchitecture() -> String {
+        var size: size_t = 0
+        sysctlbyname("hw.machine", nil, &size, nil, 0)
+        guard size > 0 else { return "unknown" }
+
+        var machine = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("hw.machine", &machine, &size, nil, 0) == 0 else {
+            return "unknown"
+        }
+        return String(cString: machine)
+    }
+}
+
+private struct ParsedCrash {
+    let crashTimestamp: Date?
+    /// The timestamp the report id hashes; see parseIPS.
+    let idTimestamp: Date?
+    let terminationSummary: String
+    let topFrames: [String]
+    let exceptionReason: String?
+    let exceptionBacktrace: [String]?
+    let metadata: [String: String]
+    let appVersion: String?
+    let appBuild: String?
+}

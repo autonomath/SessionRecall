@@ -1,0 +1,653 @@
+import XCTest
+@testable import AgentSessions
+
+final class PriceManifestV2Tests: XCTestCase {
+    func testNovember62And52StandardFastAndContextRates() throws {
+        let snapshot = RunwayPriceTable.makeForTesting().snapshot()
+        for (slug, input, read, output, shortWrite, longWrite, threshold) in [
+            ("gpt-6.2-astra", 8.0, 0.40, 40.0, 10.0, 20.0, 272_000),
+            ("gpt-6.2-sol", 2.0, 0.10, 10.0, 2.5, 5.0, 272_000),
+            ("claude-fable-5-2", 8.0, 0.20, 40.0, 10.0, 16.0, 0),
+            ("claude-mythos-5-2", 8.0, 0.20, 40.0, 10.0, 16.0, 0)
+        ] {
+            let price = try XCTUnwrap(snapshot.resolvedPrice(forModel: slug)?.price)
+            let base = try XCTUnwrap(price.rates(for: .standard, contextInputTokens: 272_000))
+            XCTAssertEqual(base.inputPerMTok, input, slug)
+            XCTAssertEqual(base.cachedInputPerMTok, read, slug)
+            XCTAssertEqual(base.outputPerMTok, output, slug)
+            XCTAssertEqual(base.cacheWritePerMTok, shortWrite, slug)
+            XCTAssertEqual(base.cacheWrite1hPerMTok, longWrite, slug)
+            let fastLong = try XCTUnwrap(price.rates(for: .fast, contextInputTokens: 272_001))
+            let inputMultiplier = threshold == 0 ? 2.0 : 4.0
+            XCTAssertEqual(fastLong.inputPerMTok, input * inputMultiplier, slug)
+            XCTAssertEqual(fastLong.cachedInputPerMTok, read * inputMultiplier, slug)
+            XCTAssertEqual(fastLong.outputPerMTok, output * (threshold == 0 ? 2 : 3), slug)
+            XCTAssertEqual(fastLong.cacheWritePerMTok, shortWrite * inputMultiplier, slug)
+            XCTAssertEqual(fastLong.cacheWrite1hPerMTok, longWrite * inputMultiplier, slug)
+            XCTAssertEqual(price.inferenceGeoUSMultiplier, threshold == 0 ? 1.1 : nil, slug)
+            XCTAssertNil(snapshot.resolvedPrice(forModel: slug + "-preview"), slug)
+        }
+    }
+
+    func testPublishedRouteEstimatesAndAmbiguousModels() throws {
+        let snapshot = RunwayPriceTable.makeForTesting().snapshot()
+        for slug in ["cline-free/deepseek-v4.1-flash", "deepseek-v4.1-flash-free"] {
+            let resolved = try XCTUnwrap(snapshot.resolvedPrice(forModel: slug))
+            XCTAssertTrue(resolved.viaFreeRoute)
+            XCTAssertEqual(resolved.price.inputPerMTok, 0.30)
+            XCTAssertEqual(resolved.price.cachedInputPerMTok, 0.006)
+            XCTAssertEqual(resolved.price.outputPerMTok, 1.20)
+            XCTAssertNil(resolved.price.cacheWritePerMTok)
+        }
+        let console = try XCTUnwrap(snapshot.resolvedPrice(forModel: "opencode/deepseek-v4.1-flash"))
+        XCTAssertFalse(console.viaFreeRoute)
+        XCTAssertEqual(console.price.inputPerMTok, 0.30)
+        let nemotron = try XCTUnwrap(snapshot.resolvedPrice(forModel: "cline-free/nemotron-3.5-super-vl"))
+        XCTAssertTrue(nemotron.viaFreeRoute)
+        XCTAssertEqual(nemotron.price.inputPerMTok, 0.06)
+        XCTAssertEqual(nemotron.price.cachedInputPerMTok, 0.01)
+        XCTAssertEqual(nemotron.price.outputPerMTok, 0.35)
+        for slug in ["~anthropic/claude-fable-latest", "deepseek-flash", "deepseek-v4.1-flash",
+                     "deepseek/deepseek-v4.1-flash", "big-pickle"] {
+            XCTAssertNil(snapshot.resolvedPrice(forModel: slug), slug)
+        }
+    }
+
+    func testMAICode2FlashRateChangesOnThePublishedDate() throws {
+        let snapshot = RunwayPriceTable.makeForTesting().snapshot()
+        let price = try XCTUnwrap(snapshot.resolvedPrice(forModel: "mai-code-2-flash")?.price)
+        let launch = price.effective(at: utc("2027-05-16T23:59:59Z"))
+        XCTAssertEqual(launch.inputPerMTok, 0.05)
+        XCTAssertEqual(launch.cachedInputPerMTok, 0.005)
+        XCTAssertEqual(launch.outputPerMTok, 0.25)
+        let regular = price.effective(at: utc("2027-05-17T00:00:00Z"))
+        XCTAssertEqual(regular.inputPerMTok, 0.10)
+        XCTAssertEqual(regular.cachedInputPerMTok, 0.01)
+        XCTAssertEqual(regular.outputPerMTok, 0.50)
+        XCTAssertNil(regular.cacheWritePerMTok)
+        XCTAssertNil(snapshot.resolvedPrice(forModel: "mai-code-2-flash-preview"))
+    }
+
+    func testNovemberObservedModelsHaveVerifiedRatesWithoutPricingVariants() throws {
+        let snapshot = RunwayPriceTable.makeForTesting().snapshot()
+        let mini = try XCTUnwrap(snapshot.resolvedPrice(forModel: "openai/gpt-4o-mini")?.price)
+        XCTAssertEqual(mini.inputPerMTok, 0.15)
+        XCTAssertEqual(mini.cachedInputPerMTok, 0.075)
+        XCTAssertEqual(mini.outputPerMTok, 0.60)
+        let solar = try XCTUnwrap(snapshot.resolvedPrice(forModel: "cline-free/solar-mini4")?.price)
+        XCTAssertEqual(solar.inputPerMTok, 0.10)
+        XCTAssertEqual(solar.cachedInputPerMTok, 0.01)
+        XCTAssertEqual(solar.outputPerMTok, 0.40)
+        let kimi = try XCTUnwrap(snapshot.resolvedPrice(forModel: "moonshot-ai/kimi-k3")?.price)
+        XCTAssertEqual(kimi.inputPerMTok, 3)
+        XCTAssertEqual(kimi.cachedInputPerMTok, 0.30)
+        XCTAssertEqual(kimi.outputPerMTok, 15)
+        XCTAssertEqual(kimi.cacheWritePerMTok, 3)
+        XCTAssertEqual(kimi.cacheWrite1hPerMTok, 6)
+        // GitHub's Copilot model table, checked 2026-11-08; no cache-write rate is published.
+        let mai = try XCTUnwrap(snapshot.resolvedPrice(forModel: "mai-code-1.1-flash")?.price)
+        XCTAssertEqual(mai.inputPerMTok, 0.20)
+        XCTAssertEqual(mai.cachedInputPerMTok, 0.02)
+        XCTAssertEqual(mai.outputPerMTok, 1.20)
+        XCTAssertNil(mai.cacheWritePerMTok)
+        for slug in ["gpt-4o-mini-preview", "solar-mini4-pro", "kimi-k3-preview", "mai-code-1.1-pro"] {
+            XCTAssertNil(snapshot.resolvedPrice(forModel: slug), "Unverified variants keep their own price requirement")
+        }
+    }
+
+    private func rate(_ input: Double) -> RunwayModelPrice {
+        RunwayModelPrice(standard: RunwayRateSet(inputPerMTok: input, cachedInputPerMTok: input / 10,
+                                                 outputPerMTok: input * 5, cacheWritePerMTok: nil,
+                                                 cacheWrite1hPerMTok: nil),
+                         fast: nil, longContext: nil, inferenceGeoUSMultiplier: nil)
+    }
+
+    private func snapshot(_ models: [String: RunwayModelPrice],
+                          aliases: [String: String] = [:]) -> RunwayPriceSnapshot {
+        RunwayPriceSnapshot(models: models, aliases: aliases, updatedDate: "2026-10-13",
+                            revision: 1, manifestFingerprint: "test")
+    }
+
+    // MARK: - Strict matching
+
+    func testVendorKeyDoesNotPriceAnExtendedSlug() {
+        let s = snapshot(["kimi-k2.7-code": rate(1), "glm-4.7": rate(2)])
+        XCTAssertNotNil(s.price(forModel: "kimi-k2.7-code"))
+        XCTAssertNil(s.price(forModel: "kimi-k2.7-code-v2"),
+                     "a variant must not inherit the base model's rate")
+        XCTAssertNil(s.price(forModel: "glm-4.70"))
+        XCTAssertNil(s.price(forModel: "glm-4.7-preview"))
+    }
+
+    func testVendorKeyAcceptsDatedSnapshots() {
+        let s = snapshot(["glm-4.7": rate(2)])
+        XCTAssertEqual(s.price(forModel: "glm-4.7-20260901")?.inputPerMTok, 2)
+        XCTAssertEqual(s.price(forModel: "glm-4.7-2026-09-01")?.inputPerMTok, 2)
+        XCTAssertNil(s.price(forModel: "glm-4.7-2026090"))
+    }
+
+    func testCodexAutoReviewIsExactOrDatedOnly() {
+        let s = RunwayPriceTable.makeForTesting().snapshot()
+        XCTAssertNotNil(s.price(forModel: "codex-auto-review"))
+        XCTAssertNil(s.price(forModel: "codex-auto-review-v2"))
+    }
+
+    func testTableAndSnapshotAgreeOnEveryLookup() {
+        let table = RunwayPriceTable.makeForTesting()
+        let s = table.snapshot()
+        for slug in ["claude-opus-5", "claude-sonnet-5-20260101", "claude-sonnet-5-preview",
+                     "gpt-5.5", "gpt-5.5-2026-01-01", "gpt-5.5-turbo", "codex-auto-review",
+                     "kimi-k2.7-code-v2", ""] {
+            XCTAssertEqual(table.price(forModel: slug), s.price(forModel: slug), slug)
+        }
+    }
+
+    // MARK: - Resolved lookup
+
+    func testResolvedPricePrefersTheRawSlug() {
+        let s = snapshot(["gpt-5.5": rate(5)])
+        let hit = s.resolvedPrice(forModel: "gpt-5.5")
+        XCTAssertEqual(hit?.price.inputPerMTok, 5)
+        XCTAssertEqual(hit?.viaFreeRoute, false)
+    }
+
+    func testResolvedPriceUsesResolverAndReportsFreeRoute() {
+        let s = snapshot(["minimax-m2.5": rate(3), "gemini-3.5-flash": rate(4)],
+                         aliases: ["gemini 3.5 flash": "gemini-3.5-flash"])
+        XCTAssertEqual(s.resolvedPrice(forModel: "minimax-m2.5-free")?.price.inputPerMTok, 3)
+        XCTAssertEqual(s.resolvedPrice(forModel: "minimax-m2.5-free")?.viaFreeRoute, true)
+        XCTAssertEqual(s.resolvedPrice(forModel: "Gemini 3.5 Flash (Medium)")?.price.inputPerMTok, 4)
+        XCTAssertNil(s.resolvedPrice(forModel: "big-pickle"))
+        XCTAssertNil(s.resolvedPrice(forModel: nil))
+    }
+
+    // MARK: - Schema 2 lifecycle
+
+    private func manifest(sequence: Int, opusOutput: Double, version: Int = 2,
+                          aliases: String = "{}") -> Data {
+        Data("""
+        {"version":\(version),"sequence":\(sequence),"updated":"2026-10-13",
+         "aliases":\(aliases),
+         "models":{"claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":\(opusOutput)}}}
+        """.utf8)
+    }
+
+    func testSchemaOneDocumentIsRejected() throws {
+        let table = RunwayPriceTable.makeForTesting()
+        let before = table.manifestFingerprint
+        XCTAssertFalse(table.loadForTesting(json: manifest(sequence: 9_999_999_999, opusOutput: 1, version: 1)))
+        let served = try Data(contentsOf: FixturePaths.repoRootURL()
+            .appendingPathComponent("docs").appendingPathComponent("prices.json"))
+        XCTAssertFalse(table.loadForTesting(json: served),
+                       "the real legacy manifest must never become the v2 source")
+        XCTAssertEqual(table.manifestFingerprint, before)
+    }
+
+    func testHigherSequenceIsAdoptedAndEqualOrLowerIsNot() {
+        let table = RunwayPriceTable.makeForTesting()
+        let bundled = table.sequence
+        XCTAssertFalse(table.loadForTesting(json: manifest(sequence: bundled, opusOutput: 111)),
+                       "equal sequence with different content must keep the bundled table")
+        XCTAssertNotEqual(table.price(forModel: "claude-opus-4-8")?.outputPerMTok, 111)
+        XCTAssertFalse(table.loadForTesting(json: manifest(sequence: bundled - 1, opusOutput: 222)))
+        XCTAssertTrue(table.loadForTesting(json: manifest(sequence: bundled + 1, opusOutput: 333)))
+        XCTAssertEqual(table.price(forModel: "claude-opus-4-8")?.outputPerMTok, 333)
+    }
+
+    /// A fetched manifest is adopted automatically, so a higher sequence must not
+    /// install a price that cannot exist (it would show a negative or zero cost).
+    func testHigherSequenceWithAnImpossibleNumberIsRejected() {
+        let table = RunwayPriceTable.makeForTesting()
+        let before = table.manifestFingerprint
+        let next = table.sequence + 1
+        func row(_ fields: String) -> Data {
+            Data(#"{"version":2,"sequence":\#(next),"updated":"2026-10-15","models":{"claude-opus":{\#(fields)}}}"#.utf8)
+        }
+        let base = #""inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25"#
+        let invalid = [
+            #""inputPerMTok":-2,"cachedInputPerMTok":0.5,"outputPerMTok":25"#,
+            base + #","cacheWritePerMTok":-1"#,
+            base + #","fast":{"inputPerMTok":10,"cachedInputPerMTok":1,"outputPerMTok":-50}"#,
+            base + #","longContext":{"thresholdInputTokens":200000,"inputMultiplier":0,"outputMultiplier":1.5}"#,
+            base + #","longContext":{"thresholdInputTokens":-1,"inputMultiplier":2,"outputMultiplier":1.5}"#,
+            base + #","inferenceGeoUSMultiplier":-1.1"#,
+        ]
+        for fields in invalid {
+            XCTAssertFalse(table.loadForTesting(json: row(fields)), fields)
+            XCTAssertEqual(table.manifestFingerprint, before, "the accepted table stays: \(fields)")
+        }
+        // Control: the same shape with valid numbers is adopted.
+        XCTAssertTrue(table.loadForTesting(json: row(base + #","inferenceGeoUSMultiplier":1.1"#)))
+    }
+
+    func testManifestWithoutSequenceIsRejected() {
+        let table = RunwayPriceTable.makeForTesting()
+        let json = #"{"version":2,"updated":"2099-01-01","models":{"claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":1}}}"#
+        XCTAssertFalse(table.loadForTesting(json: Data(json.utf8)))
+    }
+
+    func testAliasWithMissingTargetIsDropped() {
+        let table = RunwayPriceTable.makeEmptyForTesting()
+        XCTAssertTrue(table.loadForTesting(json: manifest(
+            sequence: 1, opusOutput: 25,
+            aliases: #"{"opus latest":"claude-opus","ghost":"no-such-row"}"#)))
+        XCTAssertEqual(table.snapshot().aliases, ["opus latest": "claude-opus"])
+    }
+
+    func testCacheFileNamesDoNotCollide() {
+        XCTAssertEqual(RunwayPriceTable.cacheFileName, "prices-v2.json")
+        XCTAssertNotEqual(RunwayPriceTable.cacheFileName, RunwayPriceTable.legacyV1FileName)
+    }
+
+    /// A v2 client must never read, overwrite, or delete the v1 cache file that a
+    /// downgraded build would still use.
+    func testV2ClientLeavesTheLegacyCacheFileUntouched() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentSessions-PriceCache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir); RunwayPriceTable.cacheDirectoryOverride = nil }
+        RunwayPriceTable.cacheDirectoryOverride = dir
+
+        let legacyURL = dir.appendingPathComponent(RunwayPriceTable.legacyV1FileName)
+        // The sentinel at the legacy file name is a manifest the v2 decoder WOULD
+        // adopt (schema 2, a sequence far above the bundled one, a distinctive
+        // rate), so the "not read" assertion below can actually fail on a read.
+        let sentinel = manifest(sequence: 9_999_999_999, opusOutput: 1)
+        let control = RunwayPriceTable.makeForTesting()
+        XCTAssertTrue(control.loadForTesting(json: sentinel), "precondition: the sentinel is adoptable")
+        XCTAssertEqual(control.price(forModel: "claude-opus-4-8")?.outputPerMTok, 1,
+                       "precondition: adopting the sentinel changes the observed rate")
+        try sentinel.write(to: legacyURL)
+        let before = try FileManager.default.attributesOfItem(atPath: legacyURL.path)[.modificationDate] as? Date
+
+        let table = RunwayPriceTable(loadBundled: true, readCache: true)
+        XCTAssertNotEqual(table.price(forModel: "claude-opus-4-8")?.outputPerMTok, 1,
+                          "the v1 cache must not be read")
+        table.persistForTesting(manifest(sequence: table.sequence + 1, opusOutput: 25))
+
+        XCTAssertEqual(try Data(contentsOf: legacyURL), sentinel)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: legacyURL.path)[.modificationDate] as? Date, before)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent(RunwayPriceTable.cacheFileName).path))
+    }
+
+    // MARK: - Guards (data invariants)
+
+    private func json(_ relative: String) throws -> [String: Any] {
+        let url = FixturePaths.repoRootURL().appendingPathComponent("docs").appendingPathComponent(relative)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+    }
+
+    func testServedV2ManifestEqualsTheBundledTable() throws {
+        let served = try json("prices-v2.json")
+        let bundled = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(RunwayPriceTable.bundledJSON.utf8)) as? [String: Any])
+        XCTAssertEqual(NSDictionary(dictionary: served), NSDictionary(dictionary: bundled))
+    }
+
+    func testEveryAliasTargetExists() throws {
+        let served = try json("prices-v2.json")
+        let models = try XCTUnwrap(served["models"] as? [String: Any])
+        for (alias, target) in (served["aliases"] as? [String: String]) ?? [:] {
+            XCTAssertNotNil(models[target], "alias \(alias) points at a missing row")
+            XCTAssertEqual(alias, alias.lowercased(), "alias keys are lowercased")
+        }
+    }
+
+    /// Decodes the legacy v1 rows through the production decoder by re-labelling the
+    /// document as schema 2, so the comparison is between decoded `RunwayModelPrice`
+    /// values, not JSON representations.
+    private func decodedV1Models() throws -> [String: RunwayModelPrice] {
+        var v1 = try json("prices.json")
+        v1["version"] = 2
+        v1["sequence"] = 1
+        let data = try JSONSerialization.data(withJSONObject: v1)
+        let table = RunwayPriceTable.makeEmptyForTesting()
+        XCTAssertTrue(table.loadForTesting(json: data))
+        return table.snapshot().models
+    }
+
+    func testSharedRowsAreSemanticallyEqualInV1AndV2() throws {
+        let v1 = try decodedV1Models()
+        let v2 = RunwayPriceTable.makeForTesting().snapshot().models
+        for key in v1.keys.sorted() {
+            XCTAssertEqual(v1[key], v2[key], key)
+        }
+        XCTAssertTrue(v1.keys.allSatisfy { $0.hasPrefix("claude-") || $0.hasPrefix("gpt-") || $0 == "codex-auto-review" },
+                      "the legacy manifest must not gain vendor rows")
+    }
+
+    /// The 5.5.2 matching contract, frozen here on purpose. This is an independent
+    /// copy of the shipped matcher, NOT a call into production code: if the new
+    /// matcher changes Claude or GPT semantics, this side must not change with it.
+    /// Never "simplify" it to call `RunwayPriceSnapshot`.
+    private enum ShippedV1Matcher {
+        static let knownVersions: [String: Set<String>] = [
+            "opus": ["4-5", "4-6", "4-7", "4-8", "5"],
+            "sonnet": ["3", "3-5", "4", "4-5", "4-6", "5"],
+            "haiku": ["4-5"],
+            "fable": ["5"],
+            "mythos": ["5"]
+        ]
+
+        static func key(forModel slug: String, in keys: Set<String>) -> String? {
+            guard !slug.isEmpty else { return nil }
+            if keys.contains(slug) { return slug }
+            var best: String?
+            for key in keys where slug.hasPrefix(key) {
+                if key.hasPrefix("gpt-"), !isGPTSnapshot(slug, key) { continue }
+                if key.hasPrefix("claude-"), !isClaudeSlug(slug, key) { continue }
+                if best == nil || key.count > best!.count { best = key }
+            }
+            return best
+        }
+
+        static func isGPTSnapshot(_ slug: String, _ key: String) -> Bool {
+            let suffix = String(slug.dropFirst(key.count))
+            if suffix.count == 9, suffix.first == "-", suffix.dropFirst().allSatisfy(\.isNumber) { return true }
+            guard suffix.count == 11, suffix.first == "-" else { return false }
+            let date = Array(suffix.dropFirst())
+            return date[4] == "-" && date[7] == "-"
+                && date.enumerated().allSatisfy { i, c in i == 4 || i == 7 ? c == "-" : c.isNumber }
+        }
+
+        static func isClaudeSlug(_ slug: String, _ key: String) -> Bool {
+            let suffix = String(slug.dropFirst(key.count))
+            guard !suffix.isEmpty, suffix.first == "-" else { return false }
+            let keyParts = key.split(separator: "-")
+            let isGenericFamily = keyParts.count == 2 && keyParts[0] == "claude"
+                && knownVersions[String(keyParts[1])] != nil
+            if !isGenericFamily {
+                let digits = suffix.dropFirst()
+                return digits.count == 8 && digits.allSatisfy(\.isNumber)
+            }
+            var parts = suffix.dropFirst().split(separator: "-").map(String.init)
+            if parts.last?.count == 8, parts.last?.allSatisfy(\.isNumber) == true { parts.removeLast() }
+            return knownVersions[String(keyParts[1])]?.contains(parts.joined(separator: "-")) == true
+        }
+    }
+
+    func testV2ResolvesEveryClaudeAndGPTFormLikeTheShippedV1Client() throws {
+        let v1Rows = try XCTUnwrap(try json("prices.json")["models"] as? [String: Any])
+        let v1Keys = Set(v1Rows.keys)
+        let v2 = RunwayPriceTable.makeForTesting().snapshot()
+
+        var forms: Set<String> = []
+        for key in v1Keys {
+            forms.formUnion([key, key + "-20260101", key + "-2026-01-01",
+                             key + "-preview", key + "-v2", key + "x"])
+        }
+        // Forms come from the PRODUCTION version table, so a newly supported version
+        // is covered automatically. The frozen ShippedV1Matcher is only the oracle.
+        for (family, versions) in RunwayPriceSnapshot.knownClaudeVersions {
+            for version in versions {
+                forms.formUnion(["claude-\(family)-\(version)", "claude-\(family)-\(version)-20260101"])
+            }
+            forms.formUnion(["claude-\(family)-9", "claude-\(family)-5-2", "claude-\(family)-preview"])
+        }
+
+        for form in forms.sorted() where form.hasPrefix("claude-") || form.hasPrefix("gpt-") {
+            let shippedKey = ShippedV1Matcher.key(forModel: form, in: v1Keys)
+            let expected = shippedKey.flatMap { v2.models[$0] }
+            XCTAssertEqual(v2.price(forModel: form), expected,
+                           "\(form): shipped clients resolve to \(shippedKey ?? "nil")")
+        }
+    }
+
+    /// `codex-auto-review` is the one shipped key that is neither Claude nor GPT.
+    /// Shipped clients match it by bare prefix; v2 deliberately does not. Pin both.
+    func testCodexAutoReviewDivergenceFromV1IsIntentional() {
+        let v2 = RunwayPriceTable.makeForTesting().snapshot()
+        XCTAssertEqual(ShippedV1Matcher.key(forModel: "codex-auto-review-v2", in: ["codex-auto-review"]),
+                       "codex-auto-review")
+        XCTAssertNil(v2.price(forModel: "codex-auto-review-v2"))
+        XCTAssertNotNil(v2.price(forModel: "codex-auto-review"))
+    }
+
+    // MARK: - Released-sequence checkpoint
+
+    /// An edit to the served manifest without a higher `sequence` would never reach
+    /// clients that already hold the released one. The checkpoint records what the
+    /// last release shipped; it is advanced by the release process only.
+    func testSequenceIsRaisedWheneverTheManifestDiffersFromTheLastRelease() throws {
+        let released = try json("prices-v2.released.json")
+        let releasedSequence = try XCTUnwrap(released["sequence"] as? Int)
+        let releasedFingerprint = try XCTUnwrap(released["fingerprint"] as? String)
+        let table = RunwayPriceTable.makeForTesting()
+        // The exact fingerprint covers every byte that clients compare, including
+        // `_note` and `updated`; the semantic revision would miss a metadata-only edit.
+        if table.manifestFingerprint == releasedFingerprint {
+            XCTAssertEqual(table.sequence, releasedSequence,
+                           "an unchanged manifest keeps the released sequence")
+        } else {
+            XCTAssertGreaterThan(table.sequence, releasedSequence,
+                                 "the manifest changed since the last release, so sequence must be raised")
+        }
+    }
+
+    // MARK: - Provider rate revision
+
+    private func table(models: String, aliases: String = "{}", sequence: Int = 1,
+                       note: String = "n") -> RunwayPriceTable {
+        let t = RunwayPriceTable.makeEmptyForTesting()
+        let json = #"{"version":2,"sequence":\#(sequence),"updated":"2026-10-13","_note":"\#(note)","aliases":\#(aliases),"models":{\#(models)}}"#
+        XCTAssertTrue(t.loadForTesting(json: Data(json.utf8)))
+        return t
+    }
+
+    private let claudeRow = #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25}"#
+    private let gptRow = #""gpt-5":{"inputPerMTok":1.25,"cachedInputPerMTok":0.125,"outputPerMTok":10}"#
+    private let geminiRow = #""gemini-3.5-flash":{"inputPerMTok":1,"cachedInputPerMTok":0.1,"outputPerMTok":4}"#
+
+    func testForeignRowsAliasesAndMetadataDoNotMoveProviderRevisions() {
+        let base = table(models: "\(claudeRow),\(gptRow)")
+        let withGemini = table(models: "\(claudeRow),\(gptRow),\(geminiRow)")
+        let withAlias = table(models: "\(claudeRow),\(gptRow)", aliases: #"{"opus":"claude-opus"}"#)
+        let metadataOnly = table(models: "\(claudeRow),\(gptRow)", sequence: 77, note: "other")
+        for other in [withGemini, withAlias, metadataOnly] {
+            XCTAssertEqual(other.rateRevision(forProvider: "claude"), base.rateRevision(forProvider: "claude"))
+            XCTAssertEqual(other.rateRevision(forProvider: "codex"), base.rateRevision(forProvider: "codex"))
+        }
+        XCTAssertNotEqual(withGemini.revision, base.revision, "the global revision still tracks every row")
+        XCTAssertNotEqual(withAlias.revision, base.revision, "aliases change which rate a session gets")
+    }
+
+    func testOwnRateChangeMovesOnlyThatProvider() {
+        let base = table(models: "\(claudeRow),\(gptRow)")
+        let claudeChanged = table(models: #""claude-opus":{"inputPerMTok":6,"cachedInputPerMTok":0.5,"outputPerMTok":25},\#(gptRow)"#)
+        XCTAssertNotEqual(claudeChanged.rateRevision(forProvider: "claude"), base.rateRevision(forProvider: "claude"))
+        XCTAssertEqual(claudeChanged.rateRevision(forProvider: "codex"), base.rateRevision(forProvider: "codex"))
+
+        let codexAdded = table(models: #"\#(claudeRow),\#(gptRow),"codex-auto-review":{"inputPerMTok":4,"cachedInputPerMTok":0.4,"outputPerMTok":20}"#)
+        XCTAssertEqual(codexAdded.rateRevision(forProvider: "claude"), base.rateRevision(forProvider: "claude"))
+        XCTAssertNotEqual(codexAdded.rateRevision(forProvider: "codex"), base.rateRevision(forProvider: "codex"))
+    }
+
+    /// A non-rate annotation on a provider's own row must not move its revision.
+    func testNonRateRowAnnotationDoesNotMoveTheProviderRevision() {
+        let base = table(models: "\(claudeRow),\(gptRow)")
+        let annotated = table(models: #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"displayName":"Opus","deprecated":false},\#(gptRow)"#)
+        XCTAssertEqual(annotated.rateRevision(forProvider: "claude"), base.rateRevision(forProvider: "claude"))
+    }
+
+    func testEveryRateBearingFieldMovesTheProviderRevision() {
+        let base = table(models: claudeRow).rateRevision(forProvider: "claude")
+        for row in [
+            #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.6,"outputPerMTok":25}"#,
+            #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"cacheWritePerMTok":6.25}"#,
+            #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"cacheWrite1hPerMTok":10}"#,
+            #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"inferenceGeoUSMultiplier":1.1}"#,
+            #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"longContext":{"thresholdInputTokens":200000,"inputMultiplier":2,"outputMultiplier":1.5}}"#,
+            #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"fast":{"inputPerMTok":10,"cachedInputPerMTok":1,"outputPerMTok":50}}"#
+        ] {
+            XCTAssertNotEqual(table(models: row).rateRevision(forProvider: "claude"), base, row)
+        }
+    }
+
+    func testUnknownProviderHasNoRevision() {
+        XCTAssertEqual(RunwayPriceTable.makeForTesting().rateRevision(forProvider: "gemini"), 0)
+    }
+
+    /// Provider-scoped lookup uses the same prefix sets as the provider revision:
+    /// `claude-` for Claude, `gpt-` and `codex-` for Codex. Other vendors' rows and
+    /// unknown providers match nothing; own rows match exactly as the full lookup.
+    func testProviderScopedLookupSeesOnlyTheProvidersOwnRows() {
+        let t = RunwayPriceTable.makeForTesting()
+        let s = t.snapshot()
+        for slug in ["claude-sonnet-5", "claude-opus-4-8-20260101", "claude-sonnet-5-5"] {
+            XCTAssertNotNil(s.price(forModel: slug, provider: "claude"), slug)
+            XCTAssertEqual(s.price(forModel: slug, provider: "claude"), s.price(forModel: slug), slug)
+            XCTAssertNil(s.price(forModel: slug, provider: "codex"), slug)
+        }
+        for slug in ["gpt-5.6-sol", "gpt-5.5", "codex-auto-review"] {
+            XCTAssertNotNil(s.price(forModel: slug, provider: "codex"), slug)
+            XCTAssertEqual(s.price(forModel: slug, provider: "codex"), s.price(forModel: slug), slug)
+            XCTAssertNil(s.price(forModel: slug, provider: "claude"), slug)
+        }
+        for slug in ["glm-4.7", "kimi-k2.7-code", "gemini-3.8-flash", "muse-spark-1.3", "grok-4.6"] {
+            XCTAssertNotNil(s.price(forModel: slug), "precondition: \(slug) has a v2 row")
+            XCTAssertNil(s.price(forModel: slug, provider: "claude"), slug)
+            XCTAssertNil(s.price(forModel: slug, provider: "codex"), slug)
+            XCTAssertNil(t.price(forModel: slug, provider: "claude"), slug)
+            XCTAssertNil(t.price(forModel: slug, provider: "codex"), slug)
+        }
+        XCTAssertNil(s.price(forModel: "claude-sonnet-5", provider: "gemini"))
+        XCTAssertEqual(Set(RunwayPriceSnapshot.providerKeyPrefixes.keys), ["claude", "codex"])
+    }
+
+    // MARK: - Evidence strings
+
+    func testEvidenceStringsResolveAgainstTheBundledTable() {
+        let s = RunwayPriceTable.makeForTesting().snapshot()
+        for raw in ["anthropic/claude-sonnet-5", "openai/gpt-5.5", "claude-haiku-4.5",
+                    "Claude Sonnet 4.6 (Thinking)",
+                    "Gemini 3.8 Flash (High)", "Gemini 3.6 Flash (Medium)",
+                    "z-ai/glm-5.3-flash", "minimax-m2.5-free", "kimi-k2.7-code",
+                    "grok-4.6",
+                    "muse-spark-1.3-contributor-free", "cline-free/muse-spark-1.3-contributor"] {
+            XCTAssertNotNil(s.resolvedPrice(forModel: raw), raw)
+        }
+        // A free route is priced at its base model's list price. The contributor
+        // route's base model is `muse-spark-1.3-contributor` (Meta Contributor mode,
+        // $0.10 / $0.002 / $0.20), never the Standard rate.
+        for raw in ["muse-spark-1.3-contributor-free", "cline-free/muse-spark-1.3-contributor"] {
+            let resolved = s.resolvedPrice(forModel: raw)
+            XCTAssertEqual(resolved?.price.inputPerMTok, 0.10, raw)
+            XCTAssertEqual(resolved?.price.cachedInputPerMTok, 0.002, raw)
+            XCTAssertEqual(resolved?.price.outputPerMTok, 0.20, raw)
+            XCTAssertNil(resolved?.price.cacheWritePerMTok, raw)
+            XCTAssertNil(resolved?.price.longContext, raw)
+            XCTAssertEqual(resolved?.viaFreeRoute, true, raw)
+        }
+        XCTAssertEqual(s.resolvedPrice(forModel: "muse-spark-1.3")?.price.inputPerMTok, 1.25,
+                       "Standard mode keeps its own row")
+        XCTAssertEqual(s.resolvedPrice(forModel: "z-ai/glm-5.3-flash")?.price.inputPerMTok, 0.15)
+        // Antigravity display names resolve through the aliases to their own rows.
+        XCTAssertEqual(ModelPriceKeyResolver.resolve("Gemini 3.8 Flash (High)", aliases: s.aliases)?.key,
+                       "gemini-3.8-flash")
+        XCTAssertEqual(ModelPriceKeyResolver.resolve("Gemini 3.6 Flash (Medium)", aliases: s.aliases)?.key,
+                       "gemini-3.6-flash")
+        XCTAssertEqual(s.resolvedPrice(forModel: "Gemini 3.8 Flash (High)")?.price,
+                       s.price(forModel: "gemini-3.8-flash"))
+        XCTAssertEqual(s.resolvedPrice(forModel: "Gemini 3.6 Flash (Medium)")?.price,
+                       s.price(forModel: "gemini-3.6-flash"))
+        for raw in ["big-pickle", "x-preview-f-free", "gateway-injected", "coder-model",
+                    "qwen3.5-9b", "kimi-k2.7-code-v2",
+                    "Gemini 3.5 Flash (Medium)"] {
+            XCTAssertNil(s.resolvedPrice(forModel: raw), raw)
+        }
+    }
+
+    /// xAI bills the higher tier once the prompt reaches 200k tokens; the manifest
+    /// threshold is exclusive, so it is encoded as 199999.
+    func testGrokLongContextTierStartsAtTwoHundredThousandTokens() throws {
+        let grok = try XCTUnwrap(RunwayPriceTable.makeForTesting().snapshot().price(forModel: "grok-4.6"))
+        let below = try XCTUnwrap(grok.rates(for: .standard, contextInputTokens: 199_999))
+        XCTAssertEqual(below.inputPerMTok, 2.0)
+        XCTAssertEqual(below.cachedInputPerMTok, 0.5)
+        let at = try XCTUnwrap(grok.rates(for: .standard, contextInputTokens: 200_000))
+        XCTAssertEqual(at.inputPerMTok, 4.0)
+        XCTAssertEqual(at.cachedInputPerMTok, 1.0)
+        XCTAssertEqual(at.outputPerMTok, 12.0)
+    }
+
+    // MARK: - Dated price periods
+
+    private func utc(_ text: String) -> Date { ISO8601DateFormatter().date(from: text)! }
+
+    func testPeriodStartsAtUTCMidnightAndInheritsUnsetFields() throws {
+        let t = table(models: #""m":{"inputPerMTok":1,"cachedInputPerMTok":0.1,"outputPerMTok":4,"fast":{"inputPerMTok":2,"cachedInputPerMTok":0.2,"outputPerMTok":8},"longContext":{"thresholdInputTokens":1000,"inputMultiplier":2,"outputMultiplier":1.5},"periods":[{"from":"2027-01-01","inputPerMTok":3,"cachedInputPerMTok":0.3,"outputPerMTok":12},{"from":"2027-06-01","inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":20,"fast":{"inputPerMTok":9,"cachedInputPerMTok":0.9,"outputPerMTok":36}}]}"#)
+        let row = try XCTUnwrap(t.snapshot().price(forModel: "m"))
+        XCTAssertEqual(row.effective(at: utc("2026-12-31T23:59:59Z")).inputPerMTok, 1)
+        XCTAssertEqual(row.effective(at: utc("2027-01-01T00:00:00Z")).inputPerMTok, 3)
+        let june = row.effective(at: utc("2027-07-01T00:00:00Z"))
+        XCTAssertEqual(june.inputPerMTok, 5)
+        XCTAssertEqual(june.fast?.inputPerMTok, 9, "a period's own fast set wins")
+        let january = row.effective(at: utc("2027-02-01T00:00:00Z"))
+        XCTAssertEqual(january.fast?.inputPerMTok, 2, "an unset fast set is inherited from the row")
+        XCTAssertEqual(january.longContext?.thresholdInputTokens, 1000)
+        XCTAssertNil(row.effective(over: utc("2026-12-31T00:00:00Z")...utc("2027-01-02T00:00:00Z")),
+                     "an interval across a change has no single price")
+        XCTAssertEqual(row.effective(over: utc("2027-02-01T00:00:00Z")...utc("2027-03-01T00:00:00Z"))?.inputPerMTok, 3)
+    }
+
+    func testMalformedPeriodsRejectTheManifest() {
+        let base = #""inputPerMTok":1,"cachedInputPerMTok":0.1,"outputPerMTok":4"#
+        for periods in [
+            #"[{"from":"2027-13-01",\#(base)}]"#,
+            #"[{"from":"2027-01-01T00:00:00Z",\#(base)}]"#,
+            #"[{"from":"2027-06-01",\#(base)},{"from":"2027-01-01",\#(base)}]"#,
+            #"[{"from":"2027-01-01",\#(base)},{"from":"2027-01-01",\#(base)}]"#,
+            #"[{"from":"2027-01-01","inputPerMTok":-1,"cachedInputPerMTok":0.1,"outputPerMTok":4}]"#
+        ] {
+            let t = RunwayPriceTable.makeEmptyForTesting()
+            let json = #"{"version":2,"sequence":1,"updated":"2026-10-22","models":{"m":{\#(base),"periods":\#(periods)}}}"#
+            XCTAssertFalse(t.loadForTesting(json: Data(json.utf8)), periods)
+        }
+    }
+
+    func testPeriodsMoveOnlyTheirOwnProvidersRevision() {
+        let plain = table(models: claudeRow + "," + gptRow)
+        let dated = table(models: #""claude-opus":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":25,"periods":[{"from":"2027-01-01","inputPerMTok":6,"cachedInputPerMTok":0.6,"outputPerMTok":30}]},"# + gptRow)
+        XCTAssertNotEqual(plain.rateRevision(forProvider: "claude"), dated.rateRevision(forProvider: "claude"))
+        XCTAssertEqual(plain.rateRevision(forProvider: "codex"), dated.rateRevision(forProvider: "codex"))
+    }
+
+    /// The Gemini change Google published for 2027-01-01 is in both manifests.
+    func testBundledGeminiRowsChangePriceOnJanuaryFirst2027() throws {
+        let s = RunwayPriceTable.makeForTesting().snapshot()
+        for slug in ["gemini-3.6-flash", "gemini-3.8-flash"] {
+            let row = try XCTUnwrap(s.price(forModel: slug))
+            let old = row.effective(at: utc("2026-12-31T12:00:00Z"))
+            XCTAssertEqual([old.inputPerMTok, old.cachedInputPerMTok, old.outputPerMTok], [0.75, 0.075, 3.75], slug)
+            let new = row.effective(at: utc("2027-01-01T00:00:00Z"))
+            XCTAssertEqual([new.inputPerMTok, new.cachedInputPerMTok, new.outputPerMTok], [1.5, 0.15, 7.5], slug)
+        }
+    }
+
+    /// The row shape shipped in 6.1.1 and earlier, which knows nothing of `periods`.
+    /// JSONDecoder skips unknown keys, so those clients must still decode the served
+    /// manifest, accept every row, and keep the row's own (2026) Gemini rates.
+    private struct ShippedRawPrice: Decodable {
+        let inputPerMTok: Double
+        let cachedInputPerMTok: Double
+        let outputPerMTok: Double
+        let cacheWritePerMTok: Double?
+        let cacheWrite1hPerMTok: Double?
+    }
+    private struct ShippedManifest: Decodable {
+        let version: Int
+        let sequence: Int?
+        let models: [String: ShippedRawPrice]
+    }
+
+    func testOlderClientsStillDecodeTheServedManifest() throws {
+        let data = try Data(contentsOf: FixturePaths.repoRootURL().appendingPathComponent("docs/prices-v2.json"))
+        let manifest = try JSONDecoder().decode(ShippedManifest.self, from: data)
+        XCTAssertEqual(manifest.version, 2)
+        let gemini = try XCTUnwrap(manifest.models["gemini-3.8-flash"])
+        XCTAssertEqual(gemini.inputPerMTok, 0.75)
+        XCTAssertEqual(gemini.outputPerMTok, 3.75)
+        XCTAssertTrue(manifest.models.values.allSatisfy { $0.inputPerMTok >= 0 && $0.outputPerMTok >= 0 })
+    }
+}

@@ -1,0 +1,1015 @@
+# scripts/tests/test_prebump_framework.py
+import json
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "scripts"))
+
+import agent_watch
+
+
+def test_prebump_mode_argparse_accepts_new_flags(tmp_path, monkeypatch, capsys):
+    cfg = {
+        "report_root": str(tmp_path / "out"),
+        "agents": {},
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)  # agent_watch reads matrix yml via relative path
+    rc = agent_watch.main([
+        "--mode", "prebump",
+        "--config", str(cfg_path),
+        "--keep-sandbox",
+        "--timeout-seconds", "30",
+        "--allow-real-home",
+    ])
+    # No agents configured for prebump and no --agent restriction → exit 0.
+    assert rc == 0
+
+
+def test_prebump_mode_unknown_agent_exits_4(tmp_path, monkeypatch, capsys):
+    cfg = {
+        "report_root": str(tmp_path / "out"),
+        "agents": {},  # nothing has a prebump block
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump",
+        "--config", str(cfg_path),
+        "--agent", "codex",  # not in configured_prebump_agents
+    ])
+    assert rc == 4
+    err = capsys.readouterr().err
+    assert "codex" in err
+    assert "prebump" in err.lower()
+
+
+def test_driver_protocol_and_result_dataclass():
+    from agent_watch_prebump_drivers import PrebumpDriver, DriverResult, DRIVERS
+    assert hasattr(PrebumpDriver, "run")
+    res = DriverResult(
+        ok=True,
+        session_path=Path("/tmp/x"),
+        stdout_file=Path("/tmp/o"),
+        stderr_file=Path("/tmp/e"),
+        exit_code=0,
+        error=None,
+    )
+    assert res.ok is True
+    assert "codex_exec" in DRIVERS  # filled in by Task 3.1+
+
+
+def test_sandbox_creates_temp_home_and_teardown(tmp_path):
+    from agent_watch_prebump_drivers import make_sandbox, teardown_sandbox
+    sb = make_sandbox(parent=tmp_path, label="codex")
+    assert sb.exists()
+    assert sb.is_dir()
+    assert "codex" in sb.name
+    teardown_sandbox(sb, keep=False)
+    assert not sb.exists()
+
+
+def test_sandbox_keep_preserves_dir(tmp_path):
+    from agent_watch_prebump_drivers import make_sandbox, teardown_sandbox
+    sb = make_sandbox(parent=tmp_path, label="claude")
+    (sb / "marker.txt").write_text("x")
+    teardown_sandbox(sb, keep=True)
+    assert sb.exists()
+    assert (sb / "marker.txt").read_text() == "x"
+
+
+def _make_cred(tmp_path, name, content="secret", mode=0o600, age_days=0):
+    p = tmp_path / name
+    p.write_text(content)
+    os.chmod(p, mode)
+    if age_days:
+        ts = time.time() - age_days * 86400
+        os.utime(p, (ts, ts))
+    return p
+
+
+def test_credential_hygiene_accepts_small_mode0600_recent(tmp_path):
+    from agent_watch_prebump_drivers import check_credential_hygiene, HygieneError
+    p = _make_cred(tmp_path, "auth.json", mode=0o600)
+    warnings = check_credential_hygiene(p)
+    assert warnings == []
+
+
+def test_credential_hygiene_rejects_oversize(tmp_path):
+    from agent_watch_prebump_drivers import check_credential_hygiene, HygieneError
+    p = tmp_path / "huge.json"
+    p.write_text("x" * (65 * 1024))
+    os.chmod(p, 0o600)
+    try:
+        check_credential_hygiene(p)
+    except HygieneError as e:
+        assert "64" in str(e) or "size" in str(e).lower()
+    else:
+        raise AssertionError("expected HygieneError for oversize file")
+
+
+def test_credential_hygiene_rejects_world_readable(tmp_path):
+    from agent_watch_prebump_drivers import check_credential_hygiene, HygieneError
+    p = _make_cred(tmp_path, "auth.json", mode=0o644)
+    try:
+        check_credential_hygiene(p)
+    except HygieneError as e:
+        assert "0600" in str(e)
+    else:
+        raise AssertionError("expected HygieneError for 0644")
+
+
+def test_credential_hygiene_warns_on_old_mtime(tmp_path):
+    from agent_watch_prebump_drivers import check_credential_hygiene
+    p = _make_cred(tmp_path, "auth.json", mode=0o600, age_days=120)
+    warnings = check_credential_hygiene(p)
+    assert any("90" in w or "old" in w.lower() for w in warnings)
+
+
+def test_prepare_auth_uses_env_var_when_set(tmp_path, monkeypatch):
+    from agent_watch_prebump_drivers import prepare_auth
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-xyz")
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    pb_cfg = {
+        "env_vars": ["OPENAI_API_KEY"],
+        "credential_files": [str(tmp_path / "auth.json")],  # must NOT be read
+    }
+    env, warnings = prepare_auth(prebump_cfg=pb_cfg, sandbox=sb, real_home=tmp_path)
+    assert env["OPENAI_API_KEY"] == "sk-test-xyz"
+    assert env["HOME"] == str(sb)
+    assert warnings == []
+
+
+def test_prepare_auth_copies_credential_when_env_missing(tmp_path, monkeypatch):
+    from agent_watch_prebump_drivers import prepare_auth
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    real_home.mkdir()
+    cred = real_home / ".codex" / "auth.json"
+    cred.parent.mkdir()
+    cred.write_text('{"token":"abc"}')
+    os.chmod(cred, 0o600)
+
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    pb_cfg = {
+        "env_vars": ["OPENAI_API_KEY"],
+        "credential_files": [str(cred)],
+    }
+    env, warnings = prepare_auth(prebump_cfg=pb_cfg, sandbox=sb, real_home=real_home)
+    copied = sb / ".codex" / "auth.json"
+    assert copied.exists()
+    assert copied.read_text() == '{"token":"abc"}'
+    assert "OPENAI_API_KEY" not in env
+    assert env["HOME"] == str(sb)
+
+
+_MOONSHOT_SPEC = {"opencode_api_key": {"provider": "moonshotai", "env_var": "MOONSHOT_API_KEY"}}
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_opencode_paths(monkeypatch):
+    # The owner's shell must not decide which database these tests read.
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+
+def _opencode_credential_db(real_home: Path, rows: list[tuple[str, str, int | None, int]]) -> Path:
+    """Rows are (integration_id, value, active, time_created), in OpenCode 2.x's schema."""
+    import sqlite3
+    db = real_home / ".local/share/opencode/opencode.db"
+    db.parent.mkdir(parents=True)
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL,"
+        " value TEXT NOT NULL, connector_id TEXT, method_id TEXT, active INTEGER,"
+        " time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)"
+    )
+    con.executemany(
+        "INSERT INTO credential VALUES (?, ?, 'x', ?, NULL, NULL, ?, ?, ?)",
+        [(f"c{i}", provider, value, active, created, created)
+         for i, (provider, value, active, created) in enumerate(rows)],
+    )
+    con.commit()
+    con.close()
+    return db
+
+
+def _key(key: str) -> str:
+    return json.dumps({"type": "key", "key": key})
+
+
+_OAUTH = '{"type":"oauth","refresh":"r","access":"a"}'
+
+
+def _moonshot_env(tmp_path, real_home):
+    from agent_watch_prebump_drivers import prepare_auth
+    sb = tmp_path / "sb"
+    sb.mkdir(exist_ok=True)
+    return prepare_auth(prebump_cfg=_MOONSHOT_SPEC, sandbox=sb, real_home=real_home)
+
+
+def test_opencode_api_key_uses_the_active_credential_not_the_newest(tmp_path, monkeypatch):
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [
+        ("moonshotai", _key("sk-active"), 1, 1),
+        ("moonshotai", _key("sk-newer-inactive"), 0, 9),
+        ("openai", _OAUTH, None, 3),
+    ])
+    env, warnings = _moonshot_env(tmp_path, real_home)
+    assert env["MOONSHOT_API_KEY"] == "sk-active"
+    assert warnings == []
+
+
+def test_opencode_api_key_follows_a_switched_active_account(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    db = _opencode_credential_db(real_home, [
+        ("moonshotai", _key("sk-first"), 1, 1),
+        ("moonshotai", _key("sk-second"), 0, 2),
+    ])
+    con = sqlite3.connect(db)
+    con.execute("UPDATE credential SET active = (id = 'c1')")
+    con.commit()
+    con.close()
+    env, _ = _moonshot_env(tmp_path, real_home)
+    assert env["MOONSHOT_API_KEY"] == "sk-second"
+
+
+def test_opencode_api_key_uses_newest_row_when_none_is_marked_active(tmp_path, monkeypatch):
+    # Rows written before OpenCode added the `active` column carry NULL.
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [
+        ("moonshotai", _key("sk-old"), None, 1),
+        ("moonshotai", _key("sk-new"), None, 2),
+    ])
+    env, _ = _moonshot_env(tmp_path, real_home)
+    assert env["MOONSHOT_API_KEY"] == "sk-new"
+
+
+def test_opencode_api_key_refuses_an_active_oauth_credential(tmp_path, monkeypatch):
+    import pytest
+    from agent_watch_prebump_drivers import HygieneError
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [
+        ("moonshotai", _OAUTH, 1, 2),
+        ("moonshotai", _key("sk-inactive"), 0, 1),
+    ])
+    with pytest.raises(HygieneError, match="is oauth, not an API key"):
+        _moonshot_env(tmp_path, real_home)
+
+
+def test_opencode_api_key_failures_are_distinct_and_fatal(tmp_path, monkeypatch):
+    import sqlite3
+    import pytest
+    from agent_watch_prebump_drivers import HygieneError
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+
+    with pytest.raises(HygieneError, match="not found"):
+        _moonshot_env(tmp_path, real_home)
+
+    db = _opencode_credential_db(real_home, [("openai", _key("sk-other"), 1, 1)])
+    with pytest.raises(HygieneError, match="no credential for 'moonshotai'"):
+        _moonshot_env(tmp_path, real_home)
+
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE credential")
+    con.commit()
+    con.close()
+    with pytest.raises(HygieneError, match="cannot read"):
+        _moonshot_env(tmp_path, real_home)
+
+    locker = sqlite3.connect(db, timeout=0, isolation_level=None)
+    locker.execute("CREATE TABLE credential (id TEXT, integration_id TEXT, value TEXT,"
+                   " active INTEGER, time_created INTEGER)")
+    locker.execute("BEGIN EXCLUSIVE")
+    try:
+        import agent_watch_prebump_drivers as drv
+        real_connect = sqlite3.connect
+        monkeypatch.setattr(drv.sqlite3, "connect", lambda *a, **k: real_connect(*a, **{**k, "timeout": 0}))
+        with pytest.raises(HygieneError, match="cannot read .*locked"):
+            _moonshot_env(tmp_path, real_home)
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+
+
+def test_opencode_api_key_breaks_ties_like_opencode(tmp_path, monkeypatch):
+    # Same active flag and time_created: OpenCode's order falls back to id DESC.
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [
+        ("moonshotai", _key("sk-c0"), None, 5),
+        ("moonshotai", _key("sk-c1"), None, 5),
+    ])
+    env, _ = _moonshot_env(tmp_path, real_home)
+    assert env["MOONSHOT_API_KEY"] == "sk-c1"
+
+
+def test_opencode_api_key_reads_the_database_opencode_would_use(tmp_path, monkeypatch):
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [("moonshotai", _key("sk-default"), 1, 1)])
+
+    xdg = tmp_path / "xdg"
+    _opencode_credential_db(xdg / "x", [("moonshotai", _key("sk-xdg"), 1, 1)])
+    (xdg / "x" / ".local/share/opencode/opencode.db").rename(_mkparent(xdg / "opencode" / "opencode.db"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    assert _moonshot_env(tmp_path, real_home)[0]["MOONSHOT_API_KEY"] == "sk-xdg"
+
+    explicit = _opencode_credential_db(tmp_path / "elsewhere", [("moonshotai", _key("sk-explicit"), 1, 1)])
+    monkeypatch.setenv("OPENCODE_DB", str(explicit))
+    assert _moonshot_env(tmp_path, real_home)[0]["MOONSHOT_API_KEY"] == "sk-explicit", "OPENCODE_DB wins"
+
+
+def _mkparent(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_opencode_api_key_mode_never_copies_legacy_auth_json(tmp_path, monkeypatch):
+    # OpenCode 2.x imports auth.json into a fresh database, and a saved account
+    # there wins over MOONSHOT_API_KEY; auth.json also holds OAuth tokens.
+    from agent_watch_prebump_drivers import prepare_auth
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [("moonshotai", _key("sk-active"), 1, 1)])
+    auth = real_home / ".local/share/opencode/auth.json"
+    auth.write_text(json.dumps({"moonshotai": {"type": "api", "key": "sk-stale"},
+                                "openai": {"type": "oauth", "refresh": "r", "access": "a"}}))
+    os.chmod(auth, 0o600)
+    sb = tmp_path / "sb"
+    sb.mkdir()
+
+    env, _ = prepare_auth(prebump_cfg={**_MOONSHOT_SPEC, "credential_files": [str(auth)]},
+                          sandbox=sb, real_home=real_home)
+
+    assert env["MOONSHOT_API_KEY"] == "sk-active"
+    assert not (sb / ".local/share/opencode/auth.json").exists()
+    assert not any(p.name == "auth.json" for p in sb.rglob("*"))
+
+
+def test_real_opencode_config_copies_no_credential_file():
+    config = json.loads((REPO / "docs/agent-support/agent-watch-config.json").read_text())
+    assert config["agents"]["opencode"]["prebump"]["credential_files"] == []
+
+
+def test_opencode_api_key_respects_an_exported_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-from-env")
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [("moonshotai", _key("sk-stored"), 1, 1)])
+    env, _ = _moonshot_env(tmp_path, real_home)
+    assert env["MOONSHOT_API_KEY"] == "sk-from-env"
+
+
+def test_unrelated_env_var_does_not_skip_the_opencode_api_key(tmp_path, monkeypatch):
+    from agent_watch_prebump_drivers import prepare_auth
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    real_home = tmp_path / "realhome"
+    _opencode_credential_db(real_home, [("moonshotai", _key("sk-moon"), 1, 1)])
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    env, _ = prepare_auth(
+        prebump_cfg={"env_vars": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"], **_MOONSHOT_SPEC},
+        sandbox=sb, real_home=real_home,
+    )
+    assert env["MOONSHOT_API_KEY"] == "sk-moon"
+    assert env["OPENAI_API_KEY"] == "sk-openai"
+
+
+def test_real_opencode_config_names_the_moonshot_key():
+    config = json.loads((REPO / "docs/agent-support/agent-watch-config.json").read_text())
+    prebump = config["agents"]["opencode"]["prebump"]
+    assert prebump["model"].startswith("moonshotai/")
+    assert prebump["opencode_api_key"] == _MOONSHOT_SPEC["opencode_api_key"]
+
+
+def test_prepare_auth_copies_support_files_without_strict_mode(tmp_path, monkeypatch):
+    from agent_watch_prebump_drivers import prepare_auth
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    (real_home / ".gemini").mkdir(parents=True)
+    settings = real_home / ".gemini" / "settings.json"
+    settings.write_text('{"security":{"auth":{"selectedType":"oauth-personal"}}}')
+    os.chmod(settings, 0o644)
+
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    pb_cfg = {
+        "env_vars": ["GEMINI_API_KEY"],
+        "credential_files": [],
+        "support_files": [str(settings)],
+    }
+    env, warnings = prepare_auth(prebump_cfg=pb_cfg, sandbox=sb, real_home=real_home)
+    copied = sb / ".gemini" / "settings.json"
+    assert copied.exists()
+    assert copied.read_text() == settings.read_text()
+    assert oct(copied.stat().st_mode & 0o777) == "0o600"
+    assert env["HOME"] == str(sb)
+    assert warnings == []
+
+
+def test_prepare_auth_raises_on_hygiene_failure(tmp_path, monkeypatch):
+    from agent_watch_prebump_drivers import prepare_auth, HygieneError
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    real_home = tmp_path / "realhome"
+    (real_home / ".codex").mkdir(parents=True)
+    cred = real_home / ".codex" / "auth.json"
+    cred.write_text("x" * 16)
+    os.chmod(cred, 0o644)  # world-readable → hard fail
+    sb = tmp_path / "sb"
+    sb.mkdir()
+    pb_cfg = {"env_vars": ["OPENAI_API_KEY"], "credential_files": [str(cred)]}
+    try:
+        prepare_auth(prebump_cfg=pb_cfg, sandbox=sb, real_home=real_home)
+    except HygieneError:
+        pass
+    else:
+        raise AssertionError("expected HygieneError")
+
+
+def test_build_prebump_report_shape(tmp_path):
+    from agent_watch import _build_prebump_report_entry
+    entry = _build_prebump_report_entry(
+        agent_name="codex",
+        driver_name="codex_exec",
+        ok=True,
+        session_path=tmp_path / "session.jsonl",
+        stdout_file=tmp_path / "stdout.txt",
+        stderr_file=tmp_path / "stderr.txt",
+        error=None,
+        schema_diff={"is_empty": True, "unknown_types": [], "missing_types": [], "unknown_keys": {}, "missing_keys": {}, "unknown_only_is_empty": True},
+        fresh_session_matches_baseline=True,
+        sample_freshness={"is_stale": False, "stale_reason": "forced_fresh", "mode_context": "normal", "sample_mtime_utc": None, "cli_binary_mtime_utc": None, "cli_binary_path": None, "freshness_window_seconds": 1209600, "sample_older_than_cli": None, "sample_older_than_window": None},
+    )
+    assert entry["driver"] == "codex_exec"
+    assert entry["ok"] is True
+    ev = entry["evidence"]
+    assert ev["fresh_session_matches_baseline"] is True
+    # Spec §3.1: fresh_evidence_available is true ONLY when prebump
+    # produced fresh evidence AND it matched baseline.
+    assert ev["fresh_evidence_available"] is True
+    assert ev["schema_matches_baseline"] is True
+    assert ev["sample_freshness"]["stale_reason"] == "forced_fresh"
+
+
+def test_exit_code_for_prebump_results():
+    from agent_watch import _exit_code_for_prebump
+    assert _exit_code_for_prebump([{"ok": True, "evidence": {"fresh_session_matches_baseline": True}}]) == 0
+    assert _exit_code_for_prebump([{"ok": True, "evidence": {"fresh_session_matches_baseline": False}}]) == 2
+    assert _exit_code_for_prebump([{"ok": False, "error": "cli_failed"}]) == 3
+    assert _exit_code_for_prebump([{"ok": False, "error": "hygiene_failed", "fatal": "config"}]) == 4
+    # worst wins: any 4 beats 3 beats 2 beats 0
+    assert _exit_code_for_prebump([
+        {"ok": True, "evidence": {"fresh_session_matches_baseline": True}},
+        {"ok": False, "error": "cli_failed"},
+        {"ok": False, "error": "hygiene_failed", "fatal": "config"},
+    ]) == 4
+
+
+def test_prebump_schema_check_requires_valid_nonempty_evidence_and_required_buckets():
+    baseline = {
+        "assistant": ["message", "role"],
+        "content.tool_use": ["id", "type"],
+    }
+    fingerprint = {
+        "type_counts": {"assistant": 1, "content.tool_use": 1},
+        "type_keys": {
+            "assistant": ["message", "role"],
+            "content.tool_use": ["id", "type"],
+        },
+        "parsed_lines": 2,
+        "parse_errors": 0,
+    }
+
+    diff, matches = agent_watch._prebump_schema_check(
+        fingerprint=fingerprint,
+        baseline_type_keys=baseline,
+        required_schema_buckets=["content.tool_use"],
+    )
+    assert matches is True
+    assert diff["missing_required_schema_buckets"] == []
+
+    malformed = dict(fingerprint, parse_errors=1)
+    _diff, malformed_matches = agent_watch._prebump_schema_check(
+        fingerprint=malformed,
+        baseline_type_keys=baseline,
+        required_schema_buckets=["content.tool_use"],
+    )
+    assert malformed_matches is False
+
+    no_tool_use = dict(
+        fingerprint,
+        type_counts={"assistant": 1},
+        type_keys={"assistant": ["message", "role"]},
+    )
+    no_tool_diff, no_tool_matches = agent_watch._prebump_schema_check(
+        fingerprint=no_tool_use,
+        baseline_type_keys=baseline,
+        required_schema_buckets=["content.tool_use"],
+    )
+    assert no_tool_matches is False
+    assert no_tool_diff["unknown_only_is_empty"] is True
+    assert no_tool_diff["missing_required_schema_buckets"] == ["content.tool_use"]
+
+    _empty_baseline_diff, empty_baseline_matches = agent_watch._prebump_schema_check(
+        fingerprint=fingerprint,
+        baseline_type_keys={},
+        required_schema_buckets=["content.tool_use"],
+    )
+    assert empty_baseline_matches is False
+
+
+def _make_codex_cfg(tmp_path, *, timeout_cfg=10, required_types=("session_meta",)):
+    return {
+        "report_root": str(tmp_path / "out"),
+        "agents": {
+            "codex": {
+                "installed_version_cmd": ["codex", "--version"],
+                "prebump": {
+                    "driver": "fake",
+                    "sandbox": {"mode": "home_override", "subdir": "codex_sandbox"},
+                    "prompt": "hi",
+                    "timeout_seconds": timeout_cfg,
+                    "env_vars": [],
+                    "credential_files": [],
+                    "discover_session": {
+                        "kind": "jsonl_newest",
+                        "roots": [".codex/sessions"],
+                        "globs": ["**/*.jsonl"],
+                        "required_types": list(required_types),
+                    },
+                },
+            }
+        },
+    }
+
+
+class _FakeGoodDriver:
+    name = "fake"
+
+    def __init__(self):
+        self.last_env = None
+        self.last_timeout = None
+
+    def run(self, sandbox, env, prompt, timeout):
+        import agent_watch_prebump_drivers as drv_mod
+        self.last_env = dict(env)
+        self.last_timeout = timeout
+        # Write a session under the configured discovery root so
+        # _validate_session_discovery passes.
+        sp_dir = sandbox / ".codex" / "sessions"
+        sp_dir.mkdir(parents=True, exist_ok=True)
+        sp = sp_dir / "rollout-fake.jsonl"
+        sp.write_text('{"type":"session_meta","id":"x"}\n')
+        return drv_mod.DriverResult(
+            ok=True,
+            session_path=sp,
+            stdout_file=sandbox / "out.txt",
+            stderr_file=sandbox / "err.txt",
+            exit_code=0,
+            error=None,
+        )
+
+
+def test_run_prebump_uses_registered_driver_and_writes_report(tmp_path, monkeypatch):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    fake = _FakeGoodDriver()
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", fake)
+
+    cfg = _make_codex_cfg(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump",
+        "--config", str(cfg_path),
+        "--agent", "codex",
+        "--keep-sandbox",
+    ])
+    assert rc in (0, 2)  # driver ran cleanly; baseline diff may vary
+    reports = list((tmp_path / "out").glob("*-prebump/report.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text())
+    assert report["mode"] == "prebump"
+    codex_entry = report["results"]["codex"]
+    assert codex_entry["driver"] == "fake"
+    assert codex_entry["ok"] is True
+    # F2: env was constructed by prepare_auth and passed in.
+    assert "HOME" in fake.last_env
+    assert fake.last_env["HOME"] != os.environ.get("HOME", "")
+
+
+def test_run_prebump_applies_root_required_schema_buckets(tmp_path, monkeypatch):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _FakeGoodDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg["agents"]["codex"]["prebump"]["required_schema_buckets"] = ["tool.call"]
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+
+    assert rc == 2
+    report_path = next((tmp_path / "out").glob("*-prebump/report.json"))
+    evidence = json.loads(report_path.read_text())["results"]["codex"]["evidence"]
+    assert evidence["schema_diff"]["missing_required_schema_buckets"] == ["tool.call"]
+
+
+def test_run_prebump_preserves_sandbox_when_fresh_schema_drifts(tmp_path, monkeypatch):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    class _DriftDriver(_FakeGoodDriver):
+        def run(self, sandbox, env, prompt, timeout):
+            result = super().run(sandbox, env, prompt, timeout)
+            result.session_path.write_text(
+                '{"type":"session_meta","id":"x","brand_new_key":true}\n'
+            )
+            return result
+
+    kept = []
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _DriftDriver())
+    monkeypatch.setattr(
+        drv_mod,
+        "teardown_sandbox",
+        lambda sandbox, keep=False: kept.append((sandbox, keep)),
+    )
+    cfg = _make_codex_cfg(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path), "--agent", "codex",
+    ])
+
+    assert rc == 2
+    assert kept[-1][1] is True
+
+
+def test_run_prebump_timeout_cli_overrides_config(tmp_path, monkeypatch):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    fake = _FakeGoodDriver()
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", fake)
+
+    cfg = _make_codex_cfg(tmp_path, timeout_cfg=180)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    agent_watch.main([
+        "--mode", "prebump",
+        "--config", str(cfg_path),
+        "--agent", "codex",
+        "--timeout-seconds", "30",
+        "--keep-sandbox",
+    ])
+    # CLI flag (30) wins over per-agent config (180).
+    assert fake.last_timeout == 30
+
+
+def test_run_prebump_timeout_falls_back_to_config_when_cli_absent(tmp_path, monkeypatch):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    fake = _FakeGoodDriver()
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", fake)
+    cfg = _make_codex_cfg(tmp_path, timeout_cfg=77)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    agent_watch.main([
+        "--mode", "prebump",
+        "--config", str(cfg_path),
+        "--agent", "codex",
+        "--keep-sandbox",
+    ])
+    assert fake.last_timeout == 77
+
+
+def test_run_prebump_discovery_violation_maps_to_exit_3(tmp_path, monkeypatch):
+    """F4: a driver that returns a session outside the declared roots
+    or missing required_types is a driver-failed result (exit 3)."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    class _BadRootDriver:
+        name = "fake"
+
+        def run(self, sandbox, env, prompt, timeout):
+            # Write outside .codex/sessions → root violation
+            bad = sandbox / "elsewhere" / "rollout.jsonl"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_text('{"type":"session_meta"}\n')
+            return drv_mod.DriverResult(
+                ok=True, session_path=bad,
+                stdout_file=sandbox / "o", stderr_file=sandbox / "e",
+                exit_code=0, error=None,
+            )
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _BadRootDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 3
+
+
+def test_run_prebump_discovery_nested_glob_pattern_matches(tmp_path, monkeypatch):
+    """B: the **/ rewrite must match a file two directories below root."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    class _NestedDriver:
+        name = "fake"
+
+        def run(self, sandbox, env, prompt, timeout):
+            # Two levels below .codex/sessions: .codex/sessions/2026/04/11/
+            deep = sandbox / ".codex" / "sessions" / "2026" / "04" / "11"
+            deep.mkdir(parents=True, exist_ok=True)
+            sp = deep / "rollout-nested.jsonl"
+            sp.write_text('{"type":"session_meta","id":"x"}\n')
+            return drv_mod.DriverResult(
+                ok=True, session_path=sp,
+                stdout_file=sandbox / "o", stderr_file=sandbox / "e",
+                exit_code=0, error=None,
+            )
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _NestedDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    # Pattern with ** must match a nested file under the root.
+    cfg["agents"]["codex"]["prebump"]["discover_session"]["globs"] = ["**/rollout-*.jsonl"]
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc in (0, 2)
+
+
+def test_run_prebump_config_gate_missing_discover_session(tmp_path, monkeypatch):
+    """A: selected agent with no prebump.discover_session exits 4."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _FakeGoodDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg["agents"]["codex"]["prebump"].pop("discover_session", None)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 4
+
+
+def test_run_prebump_config_gate_empty_roots(tmp_path, monkeypatch, capsys):
+    """A: roots: [] exits 4 with a stderr message naming the agent."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _FakeGoodDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg["agents"]["codex"]["prebump"]["discover_session"]["roots"] = []
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 4
+    err = capsys.readouterr().err
+    assert "codex" in err
+    assert "roots" in err
+
+
+def test_run_prebump_config_gate_rejects_both_required_bucket_forms(tmp_path, monkeypatch, capsys):
+    """A per-store map and a single list together are ambiguous: exit 4, not a silent winner."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _FakeGoodDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg["agents"]["codex"]["prebump"]["required_schema_buckets"] = ["session_meta"]
+    cfg["agents"]["codex"]["prebump"]["required_schema_buckets_by_store"] = {"legacy": ["session_meta"]}
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 4
+    assert "not both" in capsys.readouterr().err
+
+
+def test_run_prebump_config_gate_rejects_malformed_store_map(tmp_path, monkeypatch, capsys):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _FakeGoodDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg["agents"]["codex"]["prebump"]["required_schema_buckets_by_store"] = {"legacy": "session_meta"}
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 4
+    assert "required_schema_buckets_by_store" in capsys.readouterr().err
+
+
+def test_run_prebump_config_gate_allows_empty_required_types(tmp_path, monkeypatch):
+    """A: valid contract with required_types: [] passes the gate
+    (Copilot case — must not regress)."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _FakeGoodDriver())
+    cfg = _make_codex_cfg(tmp_path, required_types=())
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc in (0, 2)
+
+
+def test_run_prebump_discovery_missing_required_type_maps_to_exit_3(tmp_path, monkeypatch):
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    class _NoTypesDriver:
+        name = "fake"
+
+        def run(self, sandbox, env, prompt, timeout):
+            sp_dir = sandbox / ".codex" / "sessions"
+            sp_dir.mkdir(parents=True, exist_ok=True)
+            sp = sp_dir / "rollout.jsonl"
+            # Has 'token_count' but no 'session_meta' → required_types fail
+            sp.write_text('{"type":"token_count","total":1}\n')
+            return drv_mod.DriverResult(
+                ok=True, session_path=sp,
+                stdout_file=sandbox / "o", stderr_file=sandbox / "e",
+                exit_code=0, error=None,
+            )
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _NoTypesDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 3
+
+
+def test_run_prebump_driver_claims_ok_but_no_session_exits_3(tmp_path, monkeypatch):
+    """P1: a driver that returns ok=True with session_path=None is a
+    silently-broken driver and must not pass the gate."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    class _NoSessionDriver:
+        name = "fake"
+
+        def run(self, sandbox, env, prompt, timeout):
+            return drv_mod.DriverResult(
+                ok=True,
+                session_path=None,
+                stdout_file=sandbox / "o",
+                stderr_file=sandbox / "e",
+                exit_code=0,
+                error=None,
+            )
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _NoSessionDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 3
+    reports = list((tmp_path / "out").glob("*-prebump/report.json"))
+    entry = json.loads(reports[0].read_text())["results"]["codex"]
+    assert entry["ok"] is False
+    assert entry["error"] == "no_session_produced"
+
+
+def test_run_prebump_driver_claims_ok_but_session_missing_exits_3(tmp_path, monkeypatch):
+    """P1: a driver that returns ok=True with a session_path that does
+    not exist is also a silently-broken driver."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    class _GhostSessionDriver:
+        name = "fake"
+
+        def run(self, sandbox, env, prompt, timeout):
+            ghost = sandbox / ".codex" / "sessions" / "does-not-exist.jsonl"
+            return drv_mod.DriverResult(
+                ok=True,
+                session_path=ghost,  # never written
+                stdout_file=sandbox / "o",
+                stderr_file=sandbox / "e",
+                exit_code=0,
+                error=None,
+            )
+
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", _GhostSessionDriver())
+    cfg = _make_codex_cfg(tmp_path)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc == 3
+    reports = list((tmp_path / "out").glob("*-prebump/report.json"))
+    entry = json.loads(reports[0].read_text())["results"]["codex"]
+    assert entry["ok"] is False
+    assert entry["error"] == "no_session_produced"
+
+
+def test_run_prebump_surfaces_stale_credential_warning(tmp_path, monkeypatch, capsys):
+    """P2: prepare_auth warnings (stale credential) must land in stderr
+    AND in the report entry's evidence.auth_warnings list."""
+    import agent_watch
+    import agent_watch_prebump_drivers as drv_mod
+
+    # Real credential file, passes size+mode hygiene but is old.
+    real_home = tmp_path / "realhome"
+    cred = real_home / ".codex" / "auth.json"
+    cred.parent.mkdir(parents=True)
+    cred.write_text('{"token":"abc"}')
+    os.chmod(cred, 0o600)
+    old_ts = time.time() - 120 * 86400
+    os.utime(cred, (old_ts, old_ts))
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    fake = _FakeGoodDriver()
+    monkeypatch.setitem(drv_mod.DRIVERS, "fake", fake)
+
+    cfg = _make_codex_cfg(tmp_path)
+    cfg["agents"]["codex"]["prebump"]["env_vars"] = ["OPENAI_API_KEY"]
+    cfg["agents"]["codex"]["prebump"]["credential_files"] = [str(cred)]
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    monkeypatch.chdir(REPO)
+    rc = agent_watch.main([
+        "--mode", "prebump", "--config", str(cfg_path),
+        "--agent", "codex", "--keep-sandbox",
+    ])
+    assert rc in (0, 2)
+    err = capsys.readouterr().err
+    assert "codex" in err
+    assert ("90" in err) or ("old" in err.lower())
+    reports = list((tmp_path / "out").glob("*-prebump/report.json"))
+    entry = json.loads(reports[0].read_text())["results"]["codex"]
+    warnings = entry["evidence"]["auth_warnings"]
+    assert any("90" in w or "old" in w.lower() for w in warnings)

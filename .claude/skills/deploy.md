@@ -1,0 +1,108 @@
+---
+name: deploy
+description: Use when shipping a release of Agent Sessions — bumping version, updating CHANGELOG, building, signing, notarizing, publishing appcast, and creating a GitHub release.
+---
+
+# Deployment Skill (Agent Sessions)
+
+This skill is an agent-facing entrypoint that avoids duplicating the deployment runbook.
+
+## Canonical Sources (Single Source of Truth)
+
+- Runbook: `docs/deployment.md`
+- Unified tool: `tools/release/deploy` (see `tools/release/deploy --help`)
+- Recommended pre-release QA checklist: `docs/release/pre-release-qa.md`
+
+If anything here disagrees with the runbook, follow `docs/deployment.md`.
+
+## Workspace Policy (Hard Rule)
+
+- Always run deployment from the user’s current local repository checkout.
+- Do not clone to temporary directories and do not switch to alternate worktrees as a deployment workaround.
+- If the local worktree is dirty, stop and tell the user to clean the tree first (commit, stash, or discard), then continue in the same local repo.
+
+## QA Gate (Mandatory — Run Automatically Before Deploy)
+
+- **Always run QA automatically** before any bump/release/verify step, unless the user explicitly says to skip it (e.g. "skip QA", "no QA").
+- Do not ask whether to run QA — just run it.
+- Preferred command: `tools/release/deploy qa --version <VERSION>`. The release command requires the fresh QA stamp from this command unless `--skip-qa` or `SKIP_QA=1` is explicit. QA stamps require a clean `main` checkout synced with `origin/main`, and release/resume rejects dirty or different-HEAD checkouts.
+- QA execution order:
+  1. **Scope** — `git log --oneline --decorate -n 30` and `git diff --name-only <LAST_TAG>..HEAD`; identify high-risk areas.
+  2. **CI-parity preflight** — select and verify the pinned Xcode toolchain, run the docs guards and committed localization catalog validation, and run the no-signing Debug build with `.deriveddata-localization`; after the build, run the localization extraction-drift validator against its `Objects-normal` output. `tools/release/deploy qa` performs these checks automatically.
+  3. **Full test suite** — `./scripts/xcode_test_stable.sh`
+  4. **Targeted tests** — run suites for touched high-risk areas (session parsing, usage tracking, onboarding, etc.)
+  5. **Warnings sweep** — flag any new actionable warnings in build output.
+  6. **Manual smoke reminder** — list the manual steps from `docs/release/pre-release-qa.md` §2–3. In interactive releases, ask the user to confirm GO/NO-GO after completing them. In unattended releases (`SKIP_CONFIRM=1` or explicit "fully automatic"), keep these as post-deploy reminders instead of blocking the release.
+- In Codex Desktop, run Swift/Xcode build and test commands with approved Xcode cache access up front when they will touch DerivedData, ModuleCache, SourcePackages, simulator caches, SwiftPM diagnostics, or `~/.cache/clang`. If a first run fails only because sandboxing blocked one of those paths, rerun the exact same command with approved Xcode access and report it as a sandbox access retry, not as a code or test failure.
+- If automated gates fail → stop, report failure, do not proceed to bump/release.
+- If user says "skip QA" or "no QA" → proceed without running, note it was skipped.
+
+### CI parity rule
+
+- A green XCTest run is not sufficient for release QA. The QA stamp is invalid unless the same localization extraction-drift gate used by `.github/workflows/ci.yml` passes.
+- The local QA toolchain must match `tools/release/ci-xcode-version.txt`; CI selects that same Xcode version on the pinned `macos-26` image.
+- When user-facing SwiftUI copy changes, update `AgentSessions/Resources/Localizable.xcstrings` in the same change. Use `Text(verbatim:)` for intentional raw paths, commands, identifiers, or examples; add a string to the validator's verbatim set only after reviewing why it must remain outside the catalog.
+- If the extraction gate fails, stop and repair the catalog/source classification, then rerun `tools/release/deploy qa --version <VERSION>` before pushing or releasing. Do not solve it by repeatedly retrying CI.
+- `tools/release/deploy bump` requires a passing QA stamp for the calculated target version before it changes release metadata. After the bump commit is pushed, rerun exact-commit QA before `release`.
+- The manual deployment fallback is valid only after the exact-HEAD QA gate has passed; it must not bypass a failed or omitted QA/extraction check.
+
+## Before Starting (Ask the User)
+
+1. Target version (`X.Y` for major/minor releases, `X.Y.Z` only for patch releases; never ship `X.Y.0`)
+2. Any headline changes (new agents, major features) that must be reflected in `docs/CHANGELOG.md`
+3. Whether this is a major release that requires onboarding updates
+4. Public copy updates needed for README/GitHub Pages (major changes to highlight, renamed features, or outdated wording to fix)
+
+**Do NOT ask about QA status** — QA always runs automatically as part of pre-deploy (see QA Gate above).
+
+## Public Copy Update (Required for Releases)
+
+- Update `README.md` with a short **TL;DR** and major highlights under “What’s New in X.Y”.
+- Ensure README feature copy matches current naming (for example, **Session view** instead of Color view) and agent list.
+- Update `docs/index.html` feature/hero copy to reflect major changes and avoid outdated references.
+- Do not add a versioned `What's New in X.Y` section to `docs/index.html` (GitHub Pages main page).
+- Keep detailed release notes in `docs/CHANGELOG.md` (README/GH Pages should stay concise).
+- For major feature/UI releases, update README/index narrative copy (not just the download link/version).
+- After pushing, verify GitHub Pages reflects the updated `docs/index.html`.
+
+## Sparkle Release Notes (Approval Gate)
+
+- The release pipeline generates **structured Sparkle notes** from `docs/CHANGELOG.md`:
+  - Highlights or grouped current-release changes
+  - Other changes (summary)
+  - Reminder from the baseline release (for patch releases: `A.B`)
+- During `tools/release/deploy release <VERSION>`, the deploy script prints a **Sparkle release notes preview** after build/sign/notarization and appcast validation.
+- Treat the preview as user-facing product copy, not raw commit history:
+  - Lead with the headline change the user should care about.
+  - Do not include internal cleanup, validation fixes, or pre-release stabilization as “Bug Fixes” if users never received that broken behavior.
+  - If the preview is misleading, stop and edit `docs/CHANGELOG.md` before publishing.
+- If `SKIP_CONFIRM` is not `1`, it will pause and ask for approval before publishing. After approval, the deployment publishes the GitHub Release assets and curated notes first, then publishes the appcast, then updates Homebrew.
+- `SKIP_CONFIRM=1` requires `RELEASE_NOTES_REVIEWED=1` at the appcast publish gate; set it only after manually inspecting the Sparkle preview or for a rerun whose notes were already reviewed.
+- The notes generator fails before publishing if notes contain obvious internal/process wording or put Bug Fixes ahead of a headline section.
+- GitHub Release notes must use the same curated/linted notes as Sparkle, not raw commit history or raw changelog extraction.
+- If the current release has no structured bullets, the generator adds a fallback highlight: `Small bug fixes and stability improvements.`
+
+## Standard Workflow (Use the Unified Tool)
+
+```bash
+tools/release/deploy changelog [FROM_TAG]
+tools/release/deploy qa --version <VERSION>
+tools/release/deploy bump [patch|minor|major]
+git push origin main
+tools/release/deploy qa --version <VERSION>
+tools/release/deploy release <VERSION> [--dry-run]
+tools/release/deploy verify <VERSION>
+```
+
+## After the Release Is Published
+
+- Set `sequence` and `fingerprint` in `docs/prices-v2.released.json` to the values the released build bundles (`RunwayPriceTable.makeForTesting().sequence` and `.manifestFingerprint`), in a commit of its own. Ordinary price edits never touch that file. `testSequenceIsRaisedWheneverTheManifestDiffersFromTheLastRelease` then forces a higher `sequence` on the next edit of any byte of `docs/prices-v2.json`.
+- Make sure `docs/prices-v2.json` is live on the docs site before or with the app release.
+
+## Failure Handling
+
+- First stop: `docs/deployment.md` → Troubleshooting, logs, and rollback guidance.
+- A Release build can spend several minutes inside `swift-frontend` during whole-module optimization. Treat periodic `swift-frontend` heartbeats from the build helper as normal progress, not a separate frontend task.
+- If interrupted after the notarized DMG is built, prefer `tools/release/deploy resume`; it validates the saved git `HEAD`, requires the fresh QA stamp, and uses idempotent GitHub release/appcast steps.
+- If post-deploy verification fails on a GitHub/network check with timeout or 5xx behavior, rerun `tools/release/deploy verify <VERSION>` before considering rollback. Treat repeated transient API failures differently from confirmed missing release assets, bad appcast entries, or SHA mismatches.
+- Rollback only after reviewing logs: `tools/release/rollback-release.sh <VERSION>`.

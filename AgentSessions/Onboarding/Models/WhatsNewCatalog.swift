@@ -1,0 +1,457 @@
+import Foundation
+
+/// A single row in the What's New panel. Kinds map to distinct visual treatments
+/// (highlights and provider announcements share the highlight look; promos carry a
+/// "Promo" tag; the feedback-ask and support rows are call-to-action rows).
+struct WhatsNewItem: Identifiable, Equatable {
+    enum Kind: String, Equatable {
+        case highlight
+        case tip
+        case promo
+        case feedbackAsk
+        case support
+    }
+
+    let kind: Kind
+    let iconSystemName: String
+    let title: LocalizedStringResource
+    let body: LocalizedStringResource
+    /// Optional external link (used by promo / support rows).
+    let linkTitle: LocalizedStringResource?
+    let linkURL: URL?
+
+    init(
+        kind: Kind,
+        iconSystemName: String,
+        title: LocalizedStringResource,
+        body: LocalizedStringResource,
+        linkTitle: LocalizedStringResource? = nil,
+        linkURL: URL? = nil
+    ) {
+        self.id = "\(kind.rawValue)|\(iconSystemName)|\(title.key)"
+        self.kind = kind
+        self.iconSystemName = iconSystemName
+        self.title = title
+        self.body = body
+        self.linkTitle = linkTitle
+        self.linkURL = linkURL
+    }
+
+    /// Stable, locale-independent identity used by SwiftUI diffing.
+    let id: String
+}
+
+/// Bundled, per-release What's New content. Assembly combines authored highlights,
+/// auto-generated "new agent support" items (carried over from the old
+/// `newProviderScreens` logic), and at most one promo.
+enum WhatsNewCatalog {
+    // MARK: - Public API
+
+    /// One-line teaser shown on the dismissible session-list card.
+    static func teaser(for majorMinor: String) -> LocalizedStringResource? {
+        teasers[majorMinor]
+    }
+
+    /// Assembles the ordered list of static What's New rows for a version:
+    /// authored highlights, then auto-generated new-provider items, then any
+    /// authored tip/promo/support rows (with promos capped at one).
+    ///
+    /// The `feedbackAsk` row is NOT included here — the panel injects it based on
+    /// the coordinator's timing rules so timing stays in one place.
+    static func assemble(for majorMinor: String) -> [WhatsNewItem] {
+        let authored = enforceSinglePromo(bundled[majorMinor] ?? [])
+        let highlights = authored.filter { $0.kind == .highlight }
+        let rest = authored.filter { $0.kind != .highlight }
+        let providerItems = providerHighlights(for: majorMinor)
+        return highlights + providerItems + rest
+    }
+
+    /// True if a version has any static What's New content (authored or auto-provider).
+    /// The coordinator gates the card on this so empty versions never flag.
+    static func hasContent(for majorMinor: String) -> Bool {
+        !assemble(for: majorMinor).isEmpty
+    }
+
+    // MARK: - Auto-generated provider items
+
+    /// "New agent support" rows for any providers introduced in this version.
+    static func providerHighlights(for majorMinor: String) -> [WhatsNewItem] {
+        SessionSource.allCases
+            .filter { $0.versionIntroduced == majorMinor }
+            .map { source in
+                WhatsNewItem(
+                    kind: .highlight,
+                    iconSystemName: source.iconName,
+                    title: "New: \(source.displayName)",
+                    body: source.featureDescription
+                )
+            }
+    }
+
+    // MARK: - Promo cap
+
+    private static func enforceSinglePromo(_ items: [WhatsNewItem]) -> [WhatsNewItem] {
+        var seenPromo = false
+        return items.filter { item in
+            guard item.kind == .promo else { return true }
+            if seenPromo { return false }
+            seenPromo = true
+            return true
+        }
+    }
+
+    // MARK: - Bundled content
+
+    private static let githubRepositoryURL = URL(string: "https://github.com/jazzyalex/agent-sessions")
+    private static let githubSponsorsURL = URL(string: "https://github.com/sponsors/jazzyalex")
+
+    private static let teasers: [String: LocalizedStringResource] = [
+        "4.3": "A calmer first run, and a What's New you open on your own terms.",
+        "4.7": "Kimi Code joins the lineup, and the Quota Meter now sees Claude's cloud sessions.",
+        "4.8": "Grok CLI joins the lineup, and Analytics now counts every agent you have enabled.",
+        "5.0": "Qwen Code joins the lineup, and agents are now plug-in adapters — adding the one you use is a documented recipe.",
+        "5.1": "Two more agents join the lineup: Devin CLI and fx.",
+        "5.2": "Simplified Chinese arrives, and Quota Meter weekly rates get a stricter evidence model.",
+        "5.3": "Session info shows what one session used, and a calmer toolbar keeps the essentials in reach.",
+        "5.4": "Cline CLI and Cline Desktop join the lineup, with local sessions you can browse and search in one place.",
+        "5.5": "DeepSeek joins the lineup, with local browse and search for supported v0–v3 plain or Zstandard histories.",
+        "5.6": "Session Info now opens for every agent, with quick facts up front and deeper telemetry where the source records it.",
+        "5.7": "Codex sessions stay in the list after Codex compresses them, and Session Info prices eight more agents.",
+        "6.0": "The Quota Meter moves into the notch, and OpenCode 2.x sessions join the list.",
+        "6.1": "Running OpenCode sessions now appear in the Quota Meter.",
+        "6.2": "OpenCode sessions in the Quota Meter now show their own burn rate.",
+        "6.3": "CLI sessions now resume in Ghostty, too.",
+        "6.4": "Tool calls in the transcript are now one readable row each, for every agent.",
+        "6.5": "The Session view now reads as prompt and answer, with tool work one click away."
+    ]
+
+    private static let bundled: [String: [WhatsNewItem]] = [
+        "6.5": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "text.bubble",
+                title: "Prompts and answers first",
+                body: "Each turn in the Session view shows the prompt and the agent's answer. Tool calls and the agent's working notes sit behind the Tools chip, which is off by default. Turn it on to see them. Find still searches them."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "person.text.rectangle",
+                title: "Only typed text is “User”",
+                body: "Injected instructions, page snapshots and skill files no longer look like messages the user typed. To see them, turn on Settings → General → Show harness context in Session view."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "6.4": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "wrench.and.screwdriver",
+                title: "A readable tool view",
+                body: "Each tool call in the Session view is one row, with its command or path first. Open a row to read the decoded output, which folds when it is long. Exit codes and errors show on the row. Works for all 17 agents."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "6.3": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "terminal",
+                title: "Resume in Ghostty",
+                body: "Choose Ghostty under Preferences → General → Terminal App. Resume then opens a new Ghostty window in the session folder. Requires a Ghostty build with AppleScript support. Contributed by @buildfolk."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "6.2": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "gauge.with.dots.needle.67percent",
+                title: "OpenCode burn rate",
+                body: "Each running OpenCode session in the Quota Meter shows its token rate, or its API-equivalent cost in the $ lens, with the same load bar as Codex and Claude. A row keeps its last rate for 5 minutes after a turn ends."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "6.1": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "gauge.with.dots.needle.33percent",
+                title: "OpenCode in the Quota Meter",
+                body: "Running OpenCode sessions appear under the OpenCode logo, below Codex and Claude, each marked working or idle. Limits and burn rate come later; OpenCode Go users can help add them on GitHub."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "6.0": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "macbook",
+                title: "Quota Meter in the notch",
+                body: "Codex and Claude limits sit beside the camera. Hover to open the full Quota Meter with live session burn; move away and it folds back. Choose Notch, Desktop or Automatic in Settings."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "square.stack.3d.up",
+                title: "OpenCode 2.x sessions",
+                body: "Sessions started in OpenCode 2.0 and later now appear in the list, and sessions carried over from 1.x keep their full history."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "5.7": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "archivebox",
+                title: "Compressed Codex sessions",
+                body: "The Codex desktop app now packs sessions idle for 7 days into compressed files. Agent Sessions reads them as before: transcripts, search, Session Info, images, stars and pins keep working."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "dollarsign.circle",
+                title: "Cost for eight more agents",
+                body: "Session Info shows an API-equivalent cost for OpenCode, OpenClaw, Hermes, Kimi, Cline, Qwen, Antigravity and DeepSeek Harness from first-party list prices, and says why when a session lacks the evidence."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "5.6": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "info.circle",
+                title: "Session Info for every agent",
+                body: "Open Session Info for any supported agent. Provider, model or configuration, and title metadata appear as soon as the local records provide them; detailed usage, pricing, and request history remain source-specific and clearly unavailable when they are not recorded."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "list.bullet.rectangle",
+                title: "Quick facts first",
+                body: "Session metadata appears immediately while deeper telemetry loads separately. Clear empty states and bounded refreshes keep the session list responsive without implying that an agent recorded information it did not."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "5.3": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "gauge.with.dots.needle.67percent",
+                title: "Session info",
+                body: "Open Session info beside a Codex or Claude transcript to see its API-equivalent price, cached, fresh, and output token mix, requests, model, thinking effort, activity, and configuration history."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "ellipsis.circle",
+                title: "A calmer toolbar",
+                body: "The actions you use most stay visible, while lower-frequency controls move into the ellipsis menu. Saved and Archived are now search chips, the transcript toolbar fits on one row, and Shift-Command-F opens Search Sessions."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "5.2": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "globe",
+                title: "Help translate",
+                body: "Agent Sessions is now available in English and Simplified Chinese. Help bring it to your language—no Swift required."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "speedometer",
+                title: "Quota Meter rates you can trust",
+                body: "Weekly rates now wait for enough recent evidence, reject mismatched quota data, and keep completed sessions attributable for five minutes. Astra and Sol long-context pricing are included, and unavailable inputs stay unavailable instead of producing a confident number."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "5.1": [
+            // Devin and fx are NOT authored here: `providerHighlights(for:)` generates
+            // their rows from `versionIntroduced == "5.1"`, same split as 5.0 and 4.8.
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "person.2.badge.plus",
+                title: "Contributed, not ported",
+                body: "Both new agents were added by @thedavidweng against the recipe 5.0 documented — the first real test of that path by someone outside the project. He stewards both formats, and verified each against his own live sessions before this release."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "speedometer",
+                title: "Weekly pace is measured, not averaged",
+                body: "The weekly Session Runway used to divide everything burned since the weekly reset by the time elapsed, so one heavy day set the displayed pace for days after. It now measures the burn between recent quota readings, and shows token throughput until it has a real reading to attribute."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "5.0": [
+            // Qwen itself is NOT authored here: `providerHighlights(for:)` generates its
+            // row from `SessionSource.qwen.versionIntroduced == "5.0"`. Same split as 4.7
+            // and 4.8.
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "square.stack.3d.up",
+                title: "Agents are plug-in adapters now",
+                body: "Each agent used to be wired in by hand, surface by surface, so a new one could land in the session list and still be missing from Analytics, the filter pills or search. Every agent is now described once, in its own adapter, and every surface reads that description. Adding an agent dropped from 26 shared-file edits to 12, each one listed in the guide with a test that fails if it's missed."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "person.2.badge.plus",
+                title: "Add the agent you use",
+                body: "If your coding agent is missing, there is now a written path to change that — a proposal form, an implementation brief you can hand to your own agent, and a pull-request template. Agents that ship can pick up a steward who keeps their format verified as the CLI moves."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "switch.2",
+                title: "The agent switches reach everywhere",
+                body: "Switching an agent off could leave its sessions in filter-view search results, Kimi and Grok never reported that their loading had finished, and OpenClaw could mark Analytics out of date on every launch. Each of those came from a separate hand-written list of agents, and none of those lists remain."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "4.8": [
+            // Grok itself is NOT authored here: `providerHighlights(for:)` generates its
+            // row from `SessionSource.grok.versionIntroduced == "4.8"`, and authoring it
+            // again would show it twice. Same split as 4.7, where Kimi's row is auto and
+            // these two are not.
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "chart.bar",
+                title: "Analytics counts every agent",
+                body: "Analytics ran on a hand-written list of agents, and Cursor and OpenClaw were never on it — their sessions showed up everywhere else but contributed to no total, chart or project breakdown. Every agent you enable is now counted, and Cursor gets its own entry in the agent picker."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "terminal",
+                title: "The right CLI wins",
+                body: "Cursor, Kimi, Pi and Grok used the first matching binary they found, so an unrelated tool of the same name earlier in your PATH could mask the real one — reporting its version and refusing to resume. Each now looks for the CLI that answers like the CLI."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "4.7": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "cloud",
+                title: "Cloud sessions in the Quota Meter",
+                body: "Claude sessions running on Anthropic's infrastructure now appear in the pinned Quota Meter beside your local agents, marked Cloud. Switch them on under Settings → Usage Tracking once you have saved a claude.ai cookie."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "dot.radiowaves.left.and.right",
+                title: "Headless runs show up too",
+                body: "An agent run started by launchd, a shell script, or another app has no terminal, and Live Sessions used to miss it entirely. Those runs now appear like any other session."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ],
+        "4.3": [
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "sparkles",
+                title: "A calmer first run",
+                body: "Onboarding is now a single setup screen — pick your agents, flip on the Quota Meter, and start exploring. No multi-slide tour."
+            ),
+            WhatsNewItem(
+                kind: .highlight,
+                iconSystemName: "bell.badge",
+                title: "What's New, on your terms",
+                body: "Updates no longer interrupt you with a modal. Release highlights live in this panel and a dismissible card you open when you want."
+            ),
+            WhatsNewItem(
+                kind: .tip,
+                iconSystemName: "lightbulb.max",
+                title: "Power Tip",
+                body: "Search across every session with ⌥⌘F, or find inside the open transcript with ⌘F. More tips live in Help → Power Tips."
+            ),
+            WhatsNewItem(
+                kind: .support,
+                iconSystemName: "heart.fill",
+                title: "Support the project",
+                body: "Agent Sessions is local-first, independent, and actively maintained. A GitHub star or sponsorship keeps it going.",
+                linkTitle: "Sponsor on GitHub",
+                linkURL: githubSponsorsURL
+            )
+        ]
+    ]
+}

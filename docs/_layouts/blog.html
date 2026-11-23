@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% comment %}
+    title=false suppresses only jekyll-seo-tag's <title>; og:title, twitter:title and the
+    JSON-LD headline still come from page.title. That lets a page carry a long editorial
+    headline (the H1) and a short `seo_title` that fits the ~60-char SERP budget.
+  {% endcomment %}
+  {% seo title=false %}
+  <title>{% if page.seo_title %}{{ page.seo_title }}{% else %}{{ page.title }} | {{ site.title }}{% endif %}</title>
+  <link rel="alternate" type="application/rss+xml" title="The Rollout — Agent Sessions" href="{{ '/feed.xml' | relative_url }}">
+  <link rel="icon" href="{{ '/assets/app-icon-32.png' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/guides/guide.css' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/blog/blog.css' | relative_url }}">
+  <script defer src="{{ '/guides/guide.js' | relative_url }}"></script>
+  <!-- GoatCounter: cookieless, privacy-first analytics (no consent banner needed) -->
+  <script data-goatcounter="https://agent-sessions.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="nav-brand" href="{{ '/' | relative_url }}">
+        <img src="{{ '/assets/app-icon-512.png' | relative_url }}" alt="Agent Sessions icon">
+        Agent Sessions
+      </a>
+      <div class="nav-links">
+        <a href="{{ '/guides/' | relative_url }}">Guides</a>
+        <a href="{{ '/bench/' | relative_url }}">Bench</a>
+        <a href="{{ '/blog/' | relative_url }}">The Rollout</a>
+        <a href="https://github.com/jazzyalex/agent-sessions">GitHub<span class="nav-star" id="github-stars-container" style="display:none;"> <span class="gh-star-icon">★</span> <span id="github-stars">–</span></span></a>
+      </div>
+    </div>
+  </nav>
+  <main class="guide-shell">
+    {{ content }}
+  </main>
+  <footer class="site-footer">&copy; <span id="year"></span> Agent Sessions. Local-first, open source, and independent.</footer>
+</body>
+</html>

@@ -1,0 +1,44 @@
+
+import Foundation
+
+@MainActor
+final class AntigravityCLISettings: ObservableObject {
+    static let shared = AntigravityCLISettings()
+
+    enum Keys {
+        static let binaryOverride = "AntigravityCLIBinaryOverride"
+        static let preferITerm = "AntigravityCLIPreferITerm"
+    }
+
+    @Published var binaryOverride: String
+    @Published var preferITerm: Bool
+
+    var terminalKind: TerminalKind {
+        ResumePreferenceHelpers.resolveTerminalKind()
+    }
+
+    private let defaults: UserDefaults
+
+    fileprivate init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        binaryOverride = defaults.string(forKey: Keys.binaryOverride) ?? ""
+        preferITerm = ResumePreferenceHelpers.resolvePreferITerm(ownKey: Keys.preferITerm, defaults: defaults)
+    }
+
+    func setBinaryOverride(_ path: String) {
+        binaryOverride = path
+        defaults.set(path, forKey: Keys.binaryOverride)
+    }
+
+    func setPreferITerm(_ value: Bool) {
+        preferITerm = value
+        defaults.set(value, forKey: Keys.preferITerm)
+    }
+
+    func effectiveWorkingDirectory(for session: Session) -> URL? {
+        if let s = session.cwd, !s.isEmpty {
+            return URL(fileURLWithPath: s)
+        }
+        return nil
+    }
+}

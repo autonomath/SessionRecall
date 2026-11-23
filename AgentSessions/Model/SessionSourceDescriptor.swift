@@ -1,0 +1,497 @@
+import Foundation
+import SwiftUI
+import AppKit
+import CryptoKit
+
+// MARK: - SessionSourceDescriptor
+//
+// Value data only (SPEC §3.1). One descriptor per `SessionSource`, each declared in that
+// source's own folder; this file holds the shared types they are built from.
+//
+// Every value in every descriptor is transcribed VERBATIM from the switch statement it
+// will later replace. Where the live code and the design draft disagreed, the live code
+// won. Identity metadata (displayName / iconName / versionIntroduced / featureDescription)
+// is deliberately absent: it stays on `SessionSource` itself, whose file compiles into the
+// standalone logic-test target and must not gain app-target dependencies (K15).
+//
+// Nothing in this file is wired into the app yet — Tasks 3–8 flip consumers over.
+
+// MARK: - BrandHue
+
+/// How a source's brand accent is produced by `TranscriptColorSystem.agentBrandAccent(source:)`.
+///
+/// The distinction is load-bearing (K6): ten sources use a hand-tuned, light-calibrated RGB
+/// triple that gets wrapped in `adaptiveBrand(_:)` (light value preserved, dark mode gets a
+/// brightened/desaturated variant); two sources (antigravity, opencode) pass an AppKit
+/// *system dynamic* color straight through, because system colors already adapt.
+enum BrandHue {
+    /// A system dynamic `NSColor` (e.g. `.systemTeal`), returned unwrapped.
+    case system(NSColor)
+    /// A light-mode-calibrated RGB triple. Reconstituting the real `NSColor` means passing
+    /// it through `TranscriptColorSystem.adaptiveBrand(NSColor(calibratedRed:green:blue:alpha:))`
+    /// exactly as the live switch does — see `SessionSourceRegistry.resolvedBrandAccent(for:)`.
+    case calibrated(red: CGFloat, green: CGFloat, blue: CGFloat)
+}
+
+// MARK: - EnablementDefault
+
+/// What `AgentEnablement.isEnabled(_:)` does when the user has expressed no preference (K7).
+enum EnablementDefault: Equatable {
+    /// Falls into `isEnabled`'s `default: return true` branch — on regardless of availability
+    /// (codex, claude, antigravity, opencode, copilot, droid).
+    case always
+    /// Has an explicit arm returning `isAvailable(_:)` — off unless the agent is present on
+    /// this machine (hermes, openclaw, cursor, pi, kimi, grok).
+    case whenAvailable
+}
+
+// MARK: - PillSpec
+
+/// The toolbar "other agent" pill (K10). Codex and Claude are excluded: they always render
+/// as fixed segmented pills, never through this path.
+///
+/// `shortcut` is frozen history, not derivable — ⌘3–⌘9 were allocated in toolbar order and
+/// the range ran out, so hermes, kimi and grok have none.
+///
+/// `color` is stored as a closure and resolved on read, which is load-bearing rather than
+/// stylistic. Nine of the ten pill colors are written as `Color.agentX` (or
+/// `TranscriptColorSystem.agentBrandAccent(source:)` outright), and since Task 3 those
+/// resolve *through this registry*. Evaluating them eagerly while a descriptor's own
+/// `static let` is being initialized re-enters the `swift_once` that is already running on
+/// this thread — a hard deadlock at first palette access, not a warning. Deferring the
+/// evaluation to `.color` breaks the cycle: by the time anything reads a pill color, the
+/// registry is fully built. The `@autoclosure` keeps every call site written as a plain
+/// color expression.
+struct PillSpec {
+    private let makeColor: () -> Color
+    let shortcut: String?
+
+    var color: Color { makeColor() }
+
+    init(color: @autoclosure @escaping () -> Color, shortcut: String?) {
+        self.makeColor = color
+        self.shortcut = shortcut
+    }
+}
+
+// MARK: - ArchiveCapability
+
+/// The filesystem unit an archive snapshots for one session: the root to copy and the
+/// primary file to parse back. Single-file sources snapshot the file itself; paired
+/// sources (Cline: manifest plus an adjacent messages file) snapshot the session
+/// directory so the companion survives alongside the primary.
+struct ArchiveUnit {
+    let root: URL
+    let isDirectory: Bool
+    let primaryRelativePath: String
+}
+
+/// A source's participation in pin/archive backfill. Optional on the descriptor because a
+/// DB-backed source can decline it outright (SPEC §4) — every currently registered source
+/// supplies one.
+struct ArchiveCapability {
+    /// Filesystem sweep producing `sessionID -> upstream file URL`, transcribed from
+    /// `SessionArchiveManager.resolveBackfillURLsFromFilesystem(source:)`.
+    let backfillURLs: (UserDefaults) -> [String: URL]
+    /// Best-effort session for a known `(sessionID, upstreamURL)` pair, transcribed from
+    /// `SessionArchiveManager.resolveSessionForBackfill(source:sessionID:upstreamURL:)`.
+    /// Sources whose parser accepts a forced ID keep passing it.
+    let sessionForBackfill: (String, URL) -> Session?
+    /// The archive unit for a primary file URL. nil (the default) snapshots the primary
+    /// file itself; a paired source returns its session directory with the primary's
+    /// filename so the copy carries the companion files the full parse needs.
+    let archiveUnit: ((URL) -> ArchiveUnit?)?
+    /// Optional provider-filtered manifest entry set for directory archives.
+    /// nil (the default) preserves the legacy recursive snapshot byte-for-byte.
+    /// A non-nil seam takes `(upstreamRoot, primaryRelativePath)` and returns the
+    /// sorted relative paths to snapshot/copy/size; the manager stats and copies
+    /// exactly that set with no re-scan or widening. A nil return fails closed
+    /// (the sync throws and commits nothing).
+    let manifestEntries: ((URL, String) -> [String]?)?
+    /// True when the source's upstream snapshot unit churns under concurrent
+    /// writers, so a snapshot that never settles across the retry budget must
+    /// fail closed instead of committing a best-effort copy. Default false
+    /// preserves the legacy fifth best-effort commit byte-for-byte for every
+    /// existing source; only DSH opts in.
+    let requiresStableSnapshot: Bool
+
+    init(backfillURLs: @escaping (UserDefaults) -> [String: URL],
+         sessionForBackfill: @escaping (String, URL) -> Session?,
+         archiveUnit: ((URL) -> ArchiveUnit?)? = nil,
+         manifestEntries: ((URL, String) -> [String]?)? = nil,
+         requiresStableSnapshot: Bool = false) {
+        self.backfillURLs = backfillURLs
+        self.sessionForBackfill = sessionForBackfill
+        self.archiveUnit = archiveUnit
+        self.manifestEntries = manifestEntries
+        self.requiresStableSnapshot = requiresStableSnapshot
+    }
+}
+
+// MARK: - AvailabilityContext
+
+/// Injected environment for the detection closures (K5). Descriptor closures never touch
+/// `FileManager.default`: every existence check goes through `fileProbe`, every home-relative
+/// path through `homeDirectory`, every PATH lookup through `detectBinary`. That is what makes
+/// availability testable without depending on the developer's own machine.
+struct AvailabilityContext {
+    let defaults: UserDefaults
+    let fileProbe: any FileProbing
+    let homeDirectory: URL
+    let environment: [String: String]
+    let detectBinary: (String) -> Bool
+
+    init(defaults: UserDefaults,
+         fileProbe: any FileProbing,
+         homeDirectory: URL,
+         environment: [String: String] = [:],
+         detectBinary: @escaping (String) -> Bool) {
+        self.defaults = defaults
+        self.fileProbe = fileProbe
+        self.homeDirectory = homeDirectory
+        self.environment = environment
+        self.detectBinary = detectBinary
+    }
+
+    /// The production seams.
+    ///
+    /// NOTE: `detectBinary` forwards to `AgentEnablement.binaryDetectedInPATH(_:)` rather
+    /// than the process-wide memoized `binaryDetectedCached(_:)`, which is `private` to
+    /// `AgentEnablement`. The two agree on every answer; only the caching differs. When
+    /// Task 4 moves `AgentEnablement` onto the registry it should build its context
+    /// in-file, where the cached form is visible — which is what `AgentEnablement.availabilityContext`
+    /// now does.
+    ///
+    /// Unavailable on purpose: it has no callers, and its `detectBinary` is the *uncached*
+    /// sweep. Adopting it on a hot path would reintroduce repeated PATH scans, so misuse is
+    /// a compile error rather than a comment someone has to notice.
+    @available(*, unavailable, message: "Uncached PATH detection. Build the context in AgentEnablement, where the memoized detector is in scope.")
+    @MainActor
+    static func live(defaults: UserDefaults = .standard) -> AvailabilityContext {
+        AvailabilityContext(
+            defaults: defaults,
+            fileProbe: DefaultFileProbe(),
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+            environment: ProcessInfo.processInfo.environment,
+            detectBinary: { AgentEnablement.binaryDetectedInPATH($0) }
+        )
+    }
+
+    /// `defaults.string(forKey:)` with the empty string normalized to nil — the shape every
+    /// `isAvailable` arm uses today (`custom.isEmpty ? nil : custom`).
+    func customRoot(_ key: String) -> String? {
+        let custom = defaults.string(forKey: key) ?? ""
+        return custom.isEmpty ? nil : custom
+    }
+
+    /// `FileManager.fileExists(atPath:isDirectory:) && isDir.boolValue`, through the seam.
+    func directoryExists(_ url: URL) -> Bool {
+        fileProbe.directoryExists(atPath: url.path)
+    }
+}
+
+// MARK: - Telemetry capability
+
+/// What one telemetry dimension can be produced for a source.
+///
+/// `partial` and `unavailable` carry a reason because the two read identically at
+/// a call site otherwise — and "we audited this format and it cannot express X" is
+/// a very different fact from "nobody has looked yet".
+enum TelemetryCapability: Equatable, Sendable {
+    case supported
+    case partial(String)
+    case unavailable(String)
+
+    /// True when this dimension can produce something worth showing.
+    var isAvailable: Bool {
+        if case .unavailable = self { return false }
+        return true
+    }
+}
+
+/// Per-source telemetry declarations, one per dimension.
+///
+/// Declared for every source rather than inferred, so `SessionTelemetryEngine`
+/// dispatches on capability instead of a hardcoded provider list: adding a provider
+/// later is a descriptor edit plus an accumulator, with no engine change.
+struct TelemetryCapabilities: Equatable, Sendable {
+    /// Initial/current model + reasoning effort, and the changes between them.
+    let configuration: TelemetryCapability
+    /// Token usage split into fresh input / cache read / cache write / output.
+    let tokens: TelemetryCapability
+    /// API-equivalent dollars, which needs both a priceable model and component tokens.
+    let cost: TelemetryCapability
+    /// Per-session share of an account's weekly quota. Unavailable everywhere until
+    /// account quota snapshots are persisted (Plan B).
+    let weeklyQuota: TelemetryCapability
+    /// True when this source's cache-write tokens are known to be 5-minute writes
+    /// (or the source splits 5m/1h itself). When false, a model that prices the two
+    /// writes differently cannot be priced from this source's cache-write tokens.
+    var cacheWriteTTLVerified: Bool = true
+    /// False when the source's format has no cache-write count and upstream may
+    /// fold cache writes into the input count. Such usage cannot be priced at a
+    /// row whose cache-write rate differs from its input rate, because the hidden
+    /// writes would be billed at the input rate.
+    var recordsCacheWrites: Bool = true
+
+    /// The common Plan A shape: one reason, all four dimensions unavailable.
+    static func allUnavailable(_ reason: String) -> TelemetryCapabilities {
+        TelemetryCapabilities(configuration: .unavailable(reason),
+                              tokens: .unavailable(reason),
+                              cost: .unavailable(reason),
+                              weeklyQuota: .unavailable("no account-level quota feed"))
+    }
+}
+
+// MARK: - SessionArtifactRevision
+
+/// Generic directory-artifact freshness token for sources whose logical session is a
+/// directory rather than a single file.
+///
+/// The selected generation is the physical parse anchor, while the sibling manifest
+/// revision is part of freshness even when the selected file itself did not change:
+/// a successor generation or a sibling-only write produces a different revision with
+/// an unchanged selected-file stat. Consumers resolve the revision through
+/// `SessionSourceDescriptor.artifactRevision` and treat it as an in-memory token —
+/// it never touches the DB schema.
+struct SessionArtifactRevision: Equatable, Sendable {
+    /// The currently selected physical generation to parse.
+    let selectedURL: URL
+    /// Revision over the artifact's sibling manifest (names plus physical stats).
+    let manifestRevision: String
+    /// Physical stat of `selectedURL` at resolution time.
+    let physicalStat: SessionFileStat
+}
+
+// MARK: - SessionSourceDescriptor
+
+struct SessionSourceDescriptor {
+    /// The source this descriptor describes.
+    let source: SessionSource
+
+    /// What telemetry this source can produce. Non-optional on purpose: the
+    /// compiler makes every source state a verdict.
+    let telemetry: TelemetryCapabilities
+    /// Source-specific transcript parser, created only for an on-demand telemetry
+    /// scan. nil means this source has no audited full-telemetry provider yet.
+    let makeTelemetryProvider: (@Sendable () -> any SessionTelemetryProvider)?
+    /// Source-specific scanner for a non-JSONL backend such as a shared SQLite
+    /// database. The engine supplies the whole Session so the scanner can scope
+    /// its read to one stable session identity.
+    let scanTelemetry: (@Sendable (Session) -> SessionTelemetryProviderScan?)?
+    /// Logical revision for the selected session. Shared-storage providers must
+    /// not use only the database file's physical stat because WAL writes can
+    /// leave that stat unchanged.
+    let telemetryRevision: (@Sendable (Session) -> SessionTelemetryRevision?)?
+    /// Optional session-aware backend eligibility. This is needed when one source
+    /// supports more than one storage format, but only one format has an audited
+    /// telemetry scanner.
+    let telemetryBackendAvailable: (@Sendable (Session) -> Bool)?
+
+    // MARK: Labels
+
+    /// Row/legend label (`UnifiedSessionsView`'s session-row switch). Differs from
+    /// `source.displayName` for codex ("Codex"), claude ("Claude") and copilot ("Copilot").
+    let shortLabel: String
+    /// Two letters on `AgentBadge`, except droid's single "D".
+    let badgeInitials: String
+
+    // MARK: Palette
+
+    let brandHue: BrandHue
+    /// `Color(white:)` value used by Analytics' monochrome mode.
+    let monochromeWhite: Double
+    /// Onboarding accent, taken from the palette instance so appearance-dependent accents
+    /// (claude/codex/antigravity) keep reading the palette's own colorScheme.
+    ///
+    /// WARNING — this must stay a closure. Four of these bodies return `Color.agentHermes`
+    /// / `agentPi` / `agentKimi` / `agentGrok`, which resolve *through this registry*; they
+    /// are inert only because a closure defers them past registry initialization. Flattening
+    /// this field to a stored `Color` would evaluate them during descriptor init and
+    /// resurrect the `swift_once` deadlock documented on `PillSpec`.
+    let onboardingAccent: (OnboardingPalette) -> Color
+
+    // MARK: UserDefaults keys (K1/K2 — named constants, never derived from rawValue)
+
+    let enablementKey: String
+    /// nil for openclaw, the only source with no persisted CLI-detection flag (K4).
+    let cliAvailableKey: String?
+    /// One key for every source except droid, which probes a sessions root and a projects
+    /// root (K3).
+    let rootOverrideKeys: [String]
+    let includeKey: String
+
+    // MARK: Detection (K5)
+
+    /// Executable name(s) accepted as evidence of this agent.
+    let binaryNames: [String]
+    let isBinaryInstalled: (AvailabilityContext) -> Bool
+    /// Filesystem-first availability: session roots, then the binary. Transcribed from
+    /// `AgentEnablement.isAvailable(_:defaults:)` minus its `AppRuntime.isHostedByTooling`
+    /// early return, which is a global harness concern rather than per-source data and stays
+    /// with the caller.
+    let isAvailable: (AvailabilityContext) -> Bool
+
+    // MARK: Enablement
+
+    let defaultEnabled: EnablementDefault
+
+    // MARK: Search ingest
+
+    /// Full parse of a session identified by its file path. nil means the source declines
+    /// path-identified parsing because every one of its sessions shares one database path
+    /// (SPEC §4).
+    let parseFullByPath: ((URL) -> Session?)?
+    /// Full parse of a session identified by both its storage URL and stable session ID.
+    /// DB-backed sources use this because many sessions can share the same database path.
+    /// File-backed sources leave it nil and continue through `parseFullByPath`.
+    let parseFullByIdentity: ((URL, String) -> Session?)?
+    /// Selects the storage URLs for which search freshness and parsing are session-ID based.
+    /// This stays separate because a source such as Hermes can support both JSON files and
+    /// a shared SQLite database.
+    let searchUsesIdentityAtURL: ((URL) -> Bool)?
+
+    // MARK: Pair-aware freshness
+
+    /// Logical freshness stat for a session's primary file URL. nil (the default) stats
+    /// the primary file itself. A paired source (Cline: manifest plus an adjacent
+    /// messages file) combines the pair so companion-only writes still trip the
+    /// focused-session monitor and search re-ingest/currency, both of which only see
+    /// the primary path.
+    let logicalFileStat: ((URL) -> SessionFileStat?)?
+
+    /// Generic directory-artifact revision resolver. Given any previously selected
+    /// canonical generation URL, it rescans the logical session directory/root and
+    /// returns the currently selected generation plus the sibling manifest revision
+    /// plus the selected file's stat. nil (the default) preserves every existing
+    /// source: only directory-artifact sources whose selected generation can move
+    /// underneath a stored anchor declare this.
+    let artifactRevision: ((URL) -> SessionArtifactRevision?)?
+
+    // MARK: Archive
+
+    /// nil = archiving unsupported for this source (SPEC §4).
+    let archive: ArchiveCapability?
+
+    // MARK: Resume
+
+    let supportsResume: Bool
+    /// Agent name shown in resume affordances; nil exactly where the legacy switch had no
+    /// arm (droid, openclaw — which never resume).
+    let resumeAgentLabel: String?
+
+    // MARK: Toolbar
+
+    /// nil for codex/claude (fixed segmented pills).
+    let otherAgentPill: PillSpec?
+
+    var hasTelemetryBackend: Bool {
+        makeTelemetryProvider != nil || scanTelemetry != nil
+    }
+
+    func hasTelemetryBackend(for session: Session) -> Bool {
+        guard hasTelemetryBackend else { return false }
+        return telemetryBackendAvailable?(session) ?? true
+    }
+
+    init(source: SessionSource,
+         telemetry: TelemetryCapabilities,
+         makeTelemetryProvider: (@Sendable () -> any SessionTelemetryProvider)? = nil,
+         scanTelemetry: (@Sendable (Session) -> SessionTelemetryProviderScan?)? = nil,
+         telemetryRevision: (@Sendable (Session) -> SessionTelemetryRevision?)? = nil,
+         telemetryBackendAvailable: (@Sendable (Session) -> Bool)? = nil,
+         shortLabel: String,
+         badgeInitials: String,
+         brandHue: BrandHue,
+         monochromeWhite: Double,
+         onboardingAccent: @escaping (OnboardingPalette) -> Color,
+         enablementKey: String,
+         cliAvailableKey: String?,
+         rootOverrideKeys: [String],
+         includeKey: String,
+         binaryNames: [String],
+         isBinaryInstalled: @escaping (AvailabilityContext) -> Bool,
+         isAvailable: @escaping (AvailabilityContext) -> Bool,
+         defaultEnabled: EnablementDefault,
+         parseFullByPath: ((URL) -> Session?)?,
+         parseFullByIdentity: ((URL, String) -> Session?)?,
+          searchUsesIdentityAtURL: ((URL) -> Bool)?,
+          logicalFileStat: ((URL) -> SessionFileStat?)? = nil,
+          artifactRevision: ((URL) -> SessionArtifactRevision?)? = nil,
+          archive: ArchiveCapability?,
+         supportsResume: Bool,
+         resumeAgentLabel: String?,
+         otherAgentPill: PillSpec?) {
+        self.source = source
+        self.telemetry = telemetry
+        self.makeTelemetryProvider = makeTelemetryProvider
+        self.scanTelemetry = scanTelemetry
+        self.telemetryRevision = telemetryRevision
+        self.telemetryBackendAvailable = telemetryBackendAvailable
+        self.shortLabel = shortLabel
+        self.badgeInitials = badgeInitials
+        self.brandHue = brandHue
+        self.monochromeWhite = monochromeWhite
+        self.onboardingAccent = onboardingAccent
+        self.enablementKey = enablementKey
+        self.cliAvailableKey = cliAvailableKey
+        self.rootOverrideKeys = rootOverrideKeys
+        self.includeKey = includeKey
+        self.binaryNames = binaryNames
+        self.isBinaryInstalled = isBinaryInstalled
+        self.isAvailable = isAvailable
+        self.defaultEnabled = defaultEnabled
+        self.parseFullByPath = parseFullByPath
+        self.parseFullByIdentity = parseFullByIdentity
+        self.searchUsesIdentityAtURL = searchUsesIdentityAtURL
+        self.logicalFileStat = logicalFileStat
+        self.artifactRevision = artifactRevision
+        self.archive = archive
+        self.supportsResume = supportsResume
+        self.resumeAgentLabel = resumeAgentLabel
+        self.otherAgentPill = otherAgentPill
+    }
+}
+
+// MARK: - Archive backfill helpers
+
+/// Internal copies of two `SessionArchiveManager` privates the archive closures need.
+/// Bodies are identical to the originals; Task 5 points `SessionArchiveManager` here and
+/// deletes its own copies.
+enum SessionArchiveBackfill {
+    /// Identical body to `SessionArchiveManager.minimalSession(source:id:url:)`.
+    static func minimalSession(source: SessionSource,
+                               id: String,
+                               url: URL,
+                               originator: String? = nil,
+                               originSource: String? = nil,
+                               surface: SessionSurface? = nil) -> Session {
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]
+        let size = (attrs[.size] as? NSNumber)?.intValue
+        let mtime = (attrs[.modificationDate] as? Date) ?? Date()
+        return Session(
+            id: id,
+            source: source,
+            startTime: mtime,
+            endTime: mtime,
+            model: nil,
+            filePath: url.path,
+            fileSizeBytes: size,
+            eventCount: 0,
+            events: [],
+            cwd: nil,
+            repoName: nil,
+            lightweightTitle: nil,
+            lightweightCommands: nil,
+            originator: originator,
+            originSource: originSource,
+            surface: surface
+        )
+    }
+
+    /// Identical body to `SessionArchiveManager.sha256Hex(_:)`.
+    static func sha256Hex(_ s: String) -> String {
+        let digest = SHA256.hash(data: Data(s.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}

@@ -1,0 +1,893 @@
+import XCTest
+@testable import AgentSessions
+
+final class TranscriptTelemetryPresentationTests: XCTestCase {
+    private func activityProjection(_ entries: [(SessionEventKind, MessageOrigin, String)]) -> [SessionTranscriptBuilder.LogicalBlock] {
+        let events = entries.enumerated().map { index, entry in
+            var event = SessionEvent(id: "activity-\(index)", timestamp: nil, kind: entry.0, role: nil,
+                                     text: entry.2, toolName: nil, toolInput: nil, toolOutput: nil,
+                                     messageID: "activity-\(index)", parentID: nil, isDelta: false, rawJSON: "{}")
+            event.messageOrigin = entry.1
+            return event
+        }
+        let session = Session(id: UUID().uuidString, source: .codex, startTime: nil, endTime: nil,
+                              model: nil, filePath: "/tmp/activity-projection.jsonl", eventCount: events.count, events: events)
+        return SessionTranscriptBuilder.coalescedBlocks(for: session, includeMeta: false, includeMessageContext: true)
+    }
+
+    func testSessionActivityCountsTypedMessagesIncludingRepeatsButNotRetainedPeer() {
+        var blocks = activityProjection([(.user, .typed, "same prompt"), (.meta, .peer(from: "Ada"), "peer reply"), (.user, .typed, "same prompt")])
+        blocks.append(TranscriptTestFixtures.block(.assistant, text: "answer"))
+        blocks.append(TranscriptTestFixtures.block(.toolCall, text: "tool"))
+        XCTAssertEqual(blocks.prefix(3).map(\.kind), [.user, .user, .user], "the projection retains a peer as a user-kind block")
+        let source = telemetry(events: [])
+        let activity = TranscriptTelemetryPresentation.activity(source, blocks: blocks, usesMessageOrigins: true)
+        XCTAssertEqual(activity.userBlocks, 2, "repeated typed messages are both real human messages")
+        XCTAssertEqual(activity.assistantBlocks, 1)
+        XCTAssertEqual(activity.toolBlocks, 1)
+        XCTAssertEqual(activity.requests, TranscriptTelemetryPresentation.activity(source, blocks: blocks).requests)
+        XCTAssertEqual(blocks.prefix(3).map(\.globalBlockIndex), [0, 1, 2], "history indices remain projected")
+    }
+
+    func testSessionActivityChildParentTaskDoesNotCountAsYou() {
+        let blocks = activityProjection([(.user, .parentTask, "delegated task"), (.meta, .peer(from: "coordinator"), "status")])
+        let activity = TranscriptTelemetryPresentation.activity(telemetry(events: []), blocks: blocks, usesMessageOrigins: true)
+        XCTAssertEqual(activity.userBlocks, 0)
+    }
+
+    func testActivityRawDefaultRetainsUserKindCounting() {
+        let blocks = activityProjection([(.user, .typed, "prompt"), (.meta, .peer(from: "Ada"), "reply"), (.user, .parentTask, "task")])
+        let source = telemetry(events: [])
+        let defaultActivity = TranscriptTelemetryPresentation.activity(source, blocks: blocks)
+        XCTAssertEqual(defaultActivity.userBlocks, blocks.filter { $0.kind == .user }.count)
+        XCTAssertEqual(defaultActivity.userBlocks, 3)
+        XCTAssertEqual(defaultActivity, TranscriptTelemetryPresentation.activity(source, blocks: blocks, usesMessageOrigins: false))
+    }
+
+    func testTelemetryLoadRequestDoesNotTrackSelectionWhileInspectorIsHidden() {
+        let selection = TranscriptTelemetrySelectionIdentity(
+            source: .codex, sessionID: "session-a", filePath: "/tmp/a.jsonl")
+        XCTAssertNil(TranscriptTelemetryLoadRequest.key(
+            isVisible: false, selection: selection, refresh: 0))
+        XCTAssertNil(TranscriptTelemetryLoadRequest.key(
+            isVisible: false,
+            selection: TranscriptTelemetrySelectionIdentity(
+                source: .codex, sessionID: "session-b", filePath: "/tmp/b.jsonl"),
+            refresh: 0))
+    }
+
+    func testTelemetryLoadRequestTracksVisibleSelectionAndRefresh() {
+        let selection = TranscriptTelemetrySelectionIdentity(
+            source: .codex, sessionID: "session-a", filePath: "/tmp/a.jsonl")
+        let request = TranscriptTelemetryLoadRequest.key(
+            isVisible: true, selection: selection, refresh: 2)
+        XCTAssertEqual(request?.selection, selection)
+        XCTAssertEqual(request?.refresh, 2)
+        XCTAssertNil(TranscriptTelemetryLoadRequest.key(
+            isVisible: true, selection: nil, refresh: 2))
+    }
+
+    func testTelemetrySelectionIdentityDoesNotUseDelimiterCollisions() {
+        let first = TranscriptTelemetrySelectionIdentity(
+            source: .codex, sessionID: "a|b", filePath: "/tmp/c")
+        let second = TranscriptTelemetrySelectionIdentity(
+            source: .codex, sessionID: "a", filePath: "b|/tmp/c")
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotEqual(
+            TranscriptTelemetryLoadRequest.key(isVisible: true, selection: first, refresh: 0),
+            TranscriptTelemetryLoadRequest.key(isVisible: true, selection: second, refresh: 0))
+    }
+
+    func testQuickPaintStateScopesTimingToSelectionAndRecordsOnlyOnce() {
+        let first = SessionInfoQuickPaintIdentity(source: .codex, sessionID: "first")
+        let second = SessionInfoQuickPaintIdentity(source: .claude, sessionID: "second")
+        let start = Date(timeIntervalSince1970: 100)
+        var state = SessionInfoQuickPaintState()
+
+        state.arm(identity: first, at: start)
+        XCTAssertEqual(state.recordIfNeeded(identity: first,
+                                            at: start.addingTimeInterval(1)), 1)
+        XCTAssertNil(state.recordIfNeeded(identity: first,
+                                          at: start.addingTimeInterval(2)))
+
+        // Refreshing the same selection does not restart the paint episode.
+        state.arm(identity: first, at: start.addingTimeInterval(3))
+        XCTAssertNil(state.recordIfNeeded(identity: first,
+                                          at: start.addingTimeInterval(4)))
+
+        // A different selection gets its own timestamp and one new sample.
+        state.arm(identity: second, at: start.addingTimeInterval(10))
+        XCTAssertEqual(state.recordIfNeeded(identity: second,
+                                            at: start.addingTimeInterval(12)), 2)
+        state.reset()
+        XCTAssertNil(state.recordIfNeeded(identity: second,
+                                          at: start.addingTimeInterval(13)))
+    }
+
+    func testModelFirstPaintRequiresKnownCurrentModel() {
+        let identity = SessionInfoQuickPaintIdentity(source: .codex, sessionID: "model-paint")
+        let start = Date(timeIntervalSince1970: 100)
+        var state = SessionInfoQuickPaintState()
+        state.arm(identity: identity, at: start)
+
+        XCTAssertNil(state.recordModelFirstPaintIfNeeded(
+            identity: identity, modelIsKnown: false, at: start.addingTimeInterval(1)))
+        XCTAssertEqual(state.recordModelFirstPaintIfNeeded(
+            identity: identity, modelIsKnown: true, at: start.addingTimeInterval(2)), 2)
+    }
+
+    func testModelFirstPaintRecordsTwoKnownSessionsWithTheSameModel() {
+        let first = SessionInfoQuickPaintIdentity(source: .codex, sessionID: "same-model-first")
+        let second = SessionInfoQuickPaintIdentity(source: .codex, sessionID: "same-model-second")
+        let start = Date(timeIntervalSince1970: 100)
+        var state = SessionInfoQuickPaintState()
+
+        // Both sessions already expose the same known current model. The
+        // selection identity, not the model string, must create the second
+        // paint episode.
+        state.arm(identity: first, at: start)
+        XCTAssertEqual(state.recordModelFirstPaintIfNeeded(
+            identity: first, modelIsKnown: true, at: start.addingTimeInterval(1)), 1)
+        state.arm(identity: second, at: start.addingTimeInterval(10))
+        XCTAssertEqual(state.recordModelFirstPaintIfNeeded(
+            identity: second, modelIsKnown: true, at: start.addingTimeInterval(12)), 2)
+    }
+
+    private func block(_ index: Int, record: Int, kind: SessionTranscriptBuilder.LogicalBlock.Kind = .assistant) -> SessionTranscriptBuilder.LogicalBlock {
+        .init(kind: kind, text: "Original message \(index)", timestamp: nil, messageID: nil,
+              toolName: nil, isDelta: false, toolInput: nil, isErrorOutput: false,
+              eventID: SessionIndexer.eventID(forPath: "/test.jsonl", index: record + 1),
+              rawJSON: "{}", globalBlockIndex: index, firstEventIndex: index)
+    }
+
+    private func change(_ record: Int) -> ConfigurationChange {
+        .init(field: .model, oldValue: "sol", newValue: "luna", observedAt: nil,
+              anchorLine: record, provenance: .effectiveTurnContext)
+    }
+
+    func testReaderAnchorsIncludeClaudeContentSuffixes() {
+        let id = SessionIndexer.eventID(forPath: "/test.jsonl", index: 12345)
+        XCTAssertEqual(TranscriptTelemetryPresentation.recordIndex(eventID: id + "-p02"), 12344)
+        XCTAssertNil(TranscriptTelemetryPresentation.recordIndex(eventID: "event-12345"))
+    }
+
+    func testChangesMapByRecordInsteadOfTimestampOrVisibleIndex() {
+        let blocks = [block(0, record: 1), block(1, record: 9)]
+        let markers = TranscriptTelemetryPresentation.markers(changes: [change(7)], blocks: blocks)
+        XCTAssertNil(markers[0])
+        XCTAssertEqual(markers[1], ["Model changed: sol → luna"])
+    }
+
+    func testChangeAfterFinalMessageHasTrailingAnchor() {
+        let markers = TranscriptTelemetryPresentation.markers(changes: [change(10)], blocks: [block(0, record: 1)])
+        XCTAssertEqual(markers[1]?.count, 1)
+    }
+
+    @MainActor
+    func testMarkerSplitsToolGroupAndPreservesBodyIDsAndText() {
+        let blocks = [block(0, record: 1, kind: .toolCall), block(1, record: 3, kind: .toolOut)]
+        // Unpaired (no index): two one-block invocations; the marker ends the run, so no group.
+        let rows = BlockTableController.rowsWithTelemetry(from: blocks[...], markers: [1: ["Model changed"]],
+                                                          totalBlockCount: 2, activeRoles: [])
+        XCTAssertEqual(rows.map(\.id), [0, -2, 1])
+        XCTAssertEqual(rows.map(\.anchorBlockIndex), [0, -2, 1])
+        for row in [rows[0], rows[2]] {
+            guard case .toolInvocation(let invocation) = row.content else { return XCTFail("expected an invocation row") }
+            XCTAssertEqual(invocation.position, .solo)
+            XCTAssertNil(invocation.groupID)
+        }
+        XCTAssertTrue(rows[1].isMeta)
+        XCTAssertFalse(rows[1].isToolCard)
+        XCTAssertEqual(rows[1].bodyText, "Model changed")
+
+        // Paired: the call and its output are one invocation row; the marker above the output
+        // stays, and every block id is untouched.
+        let index = ToolInvocationIndex.build(blocks: blocks, source: .codex)
+        let paired = BlockTableController.rowsWithTelemetry(from: blocks[...], markers: [1: ["Model changed"]],
+                                                            totalBlockCount: 2, activeRoles: [], index: index)
+        XCTAssertEqual(paired.map(\.id), [0, -2])
+        XCTAssertEqual(blocks.map(\.globalBlockIndex), [0, 1])
+        XCTAssertEqual(blocks.map(\.text), ["Original message 0", "Original message 1"])
+    }
+
+    @MainActor
+    func testRoleFilterKeepsConfigurationMarkers() {
+        let blocks = [block(0, record: 1), block(1, record: 4)]
+        let rows = BlockTableController.rowsWithTelemetry(from: blocks[...], markers: [1: ["Changed"]],
+                                                          totalBlockCount: 2, activeRoles: [.user])
+        XCTAssertEqual(rows.map(\.id), [-2])
+    }
+
+    @MainActor
+    func testWindowingDoesNotRepeatEarlierMarkersOrEmitTailEarly() {
+        let blocks = [block(0, record: 1), block(1, record: 4), block(2, record: 7)]
+        let markers = [0: ["Before"], 2: ["During"], 3: ["After"]]
+        let first = BlockTableController.rowsWithTelemetry(from: blocks[0...1], markers: markers,
+                                                           totalBlockCount: 3, activeRoles: [])
+        XCTAssertEqual(first.map(\.id), [-1, 0, 1])
+        let tail = BlockTableController.rowsWithTelemetry(from: blocks[2...2], markers: markers,
+                                                          totalBlockCount: 3, activeRoles: [])
+        XCTAssertEqual(tail.map(\.id), [-3, 2, -4])
+    }
+
+    func testMissingUsageDoesNotBecomeZero() {
+        let telemetry = SessionTelemetry(source: .claude, initialConfiguration: nil, currentConfiguration: nil,
+                                         configurationChanges: [], usageSlices: [],
+                                         usageSummary: .init(topLineTokens: 0, hasComponentBreakdown: false,
+                                                             recordedTotalTokens: nil, usageFamilies: [], usageFamilyConflict: false),
+                                         costEstimate: nil)
+        XCTAssertNil(TranscriptTelemetryPresentation.tokens(telemetry))
+        XCTAssertEqual(TranscriptTelemetryPresentation.costValue(telemetry).text, "—")
+        XCTAssertEqual(TranscriptTelemetryPresentation.weeklyValue(telemetry).text, "—")
+        XCTAssertEqual(TranscriptTelemetryPresentation.tokensValue(telemetry).text, "—")
+        XCTAssertEqual(TranscriptTelemetryPresentation.modelValue(nil).text, "—")
+        // The reason is a tooltip, never layout.
+        XCTAssertFalse(TranscriptTelemetryPresentation.weeklyValue(telemetry).help.isEmpty)
+    }
+
+    func testTotalOnlyUsagePrefersRecordedTotalOverZeroValuedEvents() {
+        let telemetry = SessionTelemetry(
+            source: .opencode,
+            initialConfiguration: nil,
+            currentConfiguration: nil,
+            configurationChanges: [],
+            usageSlices: [],
+            usageEvents: [TelemetryUsageEvent(
+                recordID: "legacy-total-only", observedAt: nil, anchorLine: 0,
+                usageFamily: "opencode.message.tokens", ownership: .session,
+                model: "shared-model", reasoningEffort: nil, speed: "standard-normalized",
+                freshInputTokens: 0, cacheReadTokens: 0, cacheWrite5mTokens: 0,
+                cacheWrite1hTokens: 0, outputTokens: 0, contextInputTokens: 0)],
+            usageSummary: .init(topLineTokens: 0, hasComponentBreakdown: false,
+                                recordedTotalTokens: 4_242,
+                                usageFamilies: ["opencode.message.tokens"],
+                                usageFamilyConflict: false,
+                                displayTotalTokens: 4_242),
+            costEstimate: nil)
+
+        XCTAssertEqual(TranscriptTelemetryPresentation.tokens(telemetry), 4_242)
+        XCTAssertEqual(TranscriptTelemetryPresentation.tokensValue(telemetry).text, "4,242")
+        XCTAssertTrue(TranscriptTelemetryPresentation.tokensValue(telemetry).help.contains(
+            "component breakdown is unavailable"))
+        let activity = TranscriptTelemetryPresentation.activity(telemetry, blocks: [block(0, record: 1)])
+        XCTAssertEqual(activity.requests, 0)
+        XCTAssertTrue(activity.usageUnavailableReason?.contains("Request-level usage is unavailable") == true)
+        let turnsHelp = TranscriptTelemetryPresentation.turnsHelp(
+            you: 0, agent: 1, tools: 0, requests: activity.requests,
+            usageUnavailableReason: activity.usageUnavailableReason,
+            locale: Locale(identifier: "en"))
+        XCTAssertTrue(turnsHelp.contains("Request total unavailable"))
+        XCTAssertFalse(turnsHelp.contains("records 0 requests"))
+    }
+
+    @MainActor
+    func testLongMarkersReserveMoreHeightAtNarrowWidth() {
+        let text = String(repeating: "Model changed: long-model-name → another-model-name ", count: 3)
+        XCTAssertGreaterThan(BlockTableController.telemetryMarkerHeight(text: text, width: 180),
+                             BlockTableController.telemetryMarkerHeight(text: text, width: 600))
+    }
+
+    /// The history-row jump targets the marker row, which sits ABOVE the anchored
+    /// block. If these two ever disagree the jump lands one row low and the change
+    /// the user clicked scrolls off the top of the viewport.
+    @MainActor
+    func testJumpTargetMatchesTheMarkerRowIDNotTheAnchoredBlock() {
+        let blocks = [block(0, record: 1), block(1, record: 9)]
+        let rows = BlockTableController.rowsWithTelemetry(
+            from: blocks[...], markers: [1: ["Model changed"]], totalBlockCount: 2, activeRoles: [])
+        let markerRowID = BlockTableController.telemetryMarkerRowID(forBlock: 1)
+        XCTAssertEqual(rows.map(\.id), [0, markerRowID, 1])
+        XCTAssertLessThan(rows.firstIndex(where: { $0.id == markerRowID })!,
+                          rows.firstIndex(where: { $0.id == 1 })!)
+    }
+
+    // MARK: - Fixtures for the Session info panel
+
+    private func usageEvent(model: String?,
+                            speed: String = "standard-normalized",
+                            geo: String? = nil,
+                            context: Int?,
+                            ownership: TelemetryUsageOwnership = .session,
+                            anchorLine: Int = 0) -> TelemetryUsageEvent {
+        TelemetryUsageEvent(recordID: nil, observedAt: nil, anchorLine: anchorLine,
+                            usageFamily: "token_count", ownership: ownership,
+                            model: model, reasoningEffort: nil, speed: speed, inferenceGeo: geo,
+                            freshInputTokens: 100, cacheReadTokens: 900,
+                            cacheWrite5mTokens: 0, cacheWrite1hTokens: 0,
+                            outputTokens: 10, reasoningOutputTokens: 4,
+                            contextInputTokens: context)
+    }
+
+    private func telemetry(events: [TelemetryUsageEvent],
+                           hasBreakdown: Bool = true,
+                           changes: [ConfigurationChange] = [],
+                           initial: SessionConfiguration? = nil,
+                           current: SessionConfiguration? = nil) -> SessionTelemetry {
+        let owned = events.filter { $0.ownership == .session }
+        return SessionTelemetry(
+            source: .codex,
+            initialConfiguration: initial,
+            currentConfiguration: current,
+            configurationChanges: changes,
+            usageSlices: [],
+            usageEvents: events,
+            usageSummary: TelemetryUsageSummary(
+                topLineTokens: owned.reduce(0) { $0 + $1.topLineTokens },
+                hasComponentBreakdown: hasBreakdown,
+                recordedTotalTokens: nil,
+                usageFamilies: ["token_count"],
+                usageFamilyConflict: false),
+            costEstimate: nil)
+    }
+
+    private func costOnlyTelemetry(_ estimate: TelemetryCostEstimate) -> SessionTelemetry {
+        SessionTelemetry(source: .codex, initialConfiguration: nil, currentConfiguration: nil,
+                         configurationChanges: [], usageSlices: [], usageEvents: [],
+                         usageSummary: nil, costEstimate: estimate)
+    }
+
+    private func telemetry(cost: TelemetryCostEstimate) -> SessionTelemetry {
+        costOnlyTelemetry(cost)
+    }
+
+    private func telemetry(summary: TelemetryUsageSummary) -> SessionTelemetry {
+        SessionTelemetry(source: .codex, initialConfiguration: nil, currentConfiguration: nil,
+                         configurationChanges: [], usageSlices: [], usageEvents: [],
+                         usageSummary: summary, costEstimate: nil)
+    }
+
+    // MARK: - Session Info prices: free routes and unpriced reasons
+
+    func testFreeRouteAddsTheListPriceNote() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: 1.5, unpricedModels: [],
+                                             missingPriceComponents: [],
+                                             freeRouteModels: ["minimax-m2.5-free"],
+                                             priceTableUpdated: "2026-10-13")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "$1.50")
+        XCTAssertTrue(value.help.contains("List price. This session ran on a free route."))
+    }
+
+    func testPaidRouteHasNoListPriceNote() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: 1.5, unpricedModels: [],
+                                             missingPriceComponents: [],
+                                             priceTableUpdated: "2026-10-13")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertFalse(value.help.contains("free route"))
+    }
+
+    func testFreeModelWithoutListPriceShowsFree() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: nil,
+                                             unpricedModels: ["big-pickle", "Nemotron-3-Ultra-Free"],
+                                             missingPriceComponents: [],
+                                             priceTableUpdated: "2026-10-15")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "Free")
+        XCTAssertTrue(value.help.contains("big-pickle"))
+        XCTAssertTrue(value.help.contains("Nemotron-3-Ultra-Free"))
+    }
+
+    func testFreeModelNextToAnUnpricedPaidModelStaysAbsent() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: nil,
+                                             unpricedModels: ["big-pickle", "grok-code"],
+                                             missingPriceComponents: [],
+                                             priceTableUpdated: "2026-10-15")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "—")
+    }
+
+    func testFreeModelNextToMissingEvidenceStaysAbsent() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: nil,
+                                             unpricedModels: ["big-pickle"],
+                                             missingPriceComponents: ["glm-4.7:cacheWrite"],
+                                             priceTableUpdated: "2026-10-15")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "—")
+    }
+
+    func testFreeModelNextToPricedUsageStaysAbsent() {
+        let paid = TelemetryUsageEvent(
+            recordID: "paid", observedAt: nil, anchorLine: 0,
+            usageFamily: "opencode.step-finish.tokens", ownership: .session,
+            model: "glm-4.7", reasoningEffort: nil, speed: "standard",
+            freshInputTokens: 10, cacheReadTokens: 0, cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: 0, outputTokens: 5, contextInputTokens: 10)
+            .priced(usd: 0.02, revision: 1, updated: "2026-10-15", manifestFingerprint: "f")
+        var base = telemetry(events: [paid])
+        base = SessionTelemetry(source: .opencode, initialConfiguration: nil, currentConfiguration: nil,
+                                configurationChanges: [], usageSlices: [], usageEvents: base.usageEvents,
+                                usageSummary: base.usageSummary,
+                                costEstimate: TelemetryCostEstimate(apiEquivalentUSD: nil,
+                                                                    unpricedModels: ["big-pickle"],
+                                                                    missingPriceComponents: [],
+                                                                    priceTableUpdated: "2026-10-15"))
+        let value = TranscriptTelemetryPresentation.costValue(base, locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "—", "a paid part must never read as Free")
+    }
+
+    func testUnpricedReasonsAreSpecific() {
+        XCTAssertEqual(TranscriptTelemetryPresentation.unpricedReason(forModel: "qwen3.5-9b", locale: Locale(identifier: "en_US")),
+                       "No published price for local model: qwen3.5-9b")
+        XCTAssertEqual(TranscriptTelemetryPresentation.unpricedReason(forModel: "big-pickle", locale: Locale(identifier: "en_US")),
+                       "No published price for unreleased model: big-pickle")
+        XCTAssertEqual(TranscriptTelemetryPresentation.unpricedReason(forModel: "acme-9", locale: Locale(identifier: "en_US")),
+                       "No price entry for: acme-9")
+    }
+
+    func testUnpricedModelsShowSpecificReasonsInHelp() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: nil,
+                                             unpricedModels: ["qwen3.5-9b", "acme-9"],
+                                             missingPriceComponents: ["cache_write"],
+                                             priceTableUpdated: "2026-10-13")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "—")
+        XCTAssertEqual(value.help,
+                       "No published price for local model: qwen3.5-9b. No price entry for: acme-9. No price entry for: cache_write")
+    }
+
+    /// Missing evidence is not a missing price row. `:cacheWrite`, `:cacheWriteTTL`
+    /// and `:contextInputTokens` each get their own sentence; every other component
+    /// (speed tier, inference region, cache-write rate) keeps "No price entry for".
+    func testMissingEvidenceComponentsReadAsEvidenceNotAsMissingRows() {
+        let estimate = TelemetryCostEstimate(
+            apiEquivalentUSD: nil,
+            unpricedModels: [],
+            missingPriceComponents: ["qwen3.6-plus:cacheWrite",
+                                     "anthropic/claude-sonnet-5:cacheWriteTTL",
+                                     "gpt-5.4:contextInputTokens",
+                                     "claude-opus-5:fast",
+                                     "claude-opus-5:inferenceGeo:moon",
+                                     "gpt-5.5:cacheWrite5m"],
+            priceTableUpdated: "2026-10-14")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "—")
+        // Parts are joined with ". " like the other unpriced reasons, so each
+        // sentence carries no period of its own.
+        XCTAssertEqual(value.help, [
+            "qwen3.6-plus cannot be priced: this agent does not record cache writes separately",
+            "anthropic/claude-sonnet-5 cannot be priced: this agent does not record how long cache writes are kept",
+            "gpt-5.4 cannot be priced: the request size needed for its long-context rate is not recorded",
+            "No price entry for: claude-opus-5:fast, claude-opus-5:inferenceGeo:moon, gpt-5.5:cacheWrite5m"
+        ].joined(separator: ". "))
+    }
+
+    /// A slug that itself contains a colon keeps it; only the trailing component
+    /// suffix is read.
+    func testMissingEvidenceKeepsAColonInTheModelSlug() {
+        let estimate = TelemetryCostEstimate(apiEquivalentUSD: nil, unpricedModels: [],
+                                             missingPriceComponents: ["poolside/laguna-s-2.1:free:cacheWriteTTL"],
+                                             priceTableUpdated: "2026-10-14")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(cost: estimate),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.help,
+                       "poolside/laguna-s-2.1:free cannot be priced: this agent does not record how long cache writes are kept")
+    }
+
+    func testCostUnavailableReasonIsShown() {
+        let summary = TelemetryUsageSummary(topLineTokens: 10, hasComponentBreakdown: true,
+                                            recordedTotalTokens: nil, usageFamilies: ["usage.record.session"],
+                                            usageFamilyConflict: false,
+                                            costUnavailableReason: "Kimi recorded only a whole-session summary.")
+        let value = TranscriptTelemetryPresentation.costValue(telemetry(summary: summary),
+                                                              locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "—")
+        XCTAssertTrue(value.help.contains("Kimi recorded only a whole-session summary."))
+    }
+
+    // MARK: - Task 1: deduplicated pricing basis
+
+    func testPricingBasisCollapsesRequestsThatDifferOnlyByContextSize() {
+        let telemetry = telemetry(events: [
+            usageEvent(model: "gpt-5.6-sol", context: 101_011),
+            usageEvent(model: "gpt-5.6-sol", context: 109_354),
+            usageEvent(model: "gpt-5.6-sol", context: 115_539)
+        ])
+        let basis = TranscriptTelemetryPresentation.pricingBasis(telemetry)
+        XCTAssertEqual(basis.count, 1)
+        XCTAssertEqual(basis[0].requestCount, 3)
+        XCTAssertEqual(basis[0].minContextInputTokens, 101_011)
+        XCTAssertEqual(basis[0].maxContextInputTokens, 115_539)
+    }
+
+    func testPricingBasisSeparatesModelSpeedAndRegionInFirstSeenOrder() {
+        let telemetry = telemetry(events: [
+            usageEvent(model: "gpt-5.6-sol", context: 100),
+            usageEvent(model: "gpt-5.6-sol", speed: "fast", context: 100),
+            usageEvent(model: "gpt-5.6-luna", context: 100),
+            usageEvent(model: "gpt-5.6-sol", geo: "us", context: 100)
+        ])
+        let basis = TranscriptTelemetryPresentation.pricingBasis(telemetry)
+        XCTAssertEqual(basis.count, 4)
+        XCTAssertEqual(basis.map(\.model),
+                       ["gpt-5.6-sol", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-sol"])
+        XCTAssertEqual(basis[1].speed, "fast")
+        XCTAssertEqual(basis[3].inferenceGeo, "us")
+    }
+
+    func testInferenceGeoPresentationHumanizesProviderUnavailableValues() {
+        XCTAssertEqual(TranscriptTelemetryPresentation.inferenceGeoValue("not_available").text,
+                       "Not available")
+        XCTAssertEqual(TranscriptTelemetryPresentation.inferenceGeoValue("").text,
+                       "Not provided")
+        XCTAssertEqual(TranscriptTelemetryPresentation.inferenceGeoValue("us").text, "us")
+        XCTAssertEqual(TranscriptTelemetryPresentation.inferenceGeoValue(nil).text, "—")
+    }
+
+    func testPricingBasisExcludesDelegatedWork() {
+        let telemetry = telemetry(events: [
+            usageEvent(model: "gpt-5.6-sol", context: 100),
+            usageEvent(model: "claude-opus-5", context: 100, ownership: .descendant)
+        ])
+        XCTAssertEqual(TranscriptTelemetryPresentation.pricingBasis(telemetry).map(\.model),
+                       ["gpt-5.6-sol"])
+    }
+
+    func testPricingBasisReportsNoContextRangeWhenNoRequestRecordedOne() {
+        let telemetry = telemetry(events: [usageEvent(model: "gpt-5.6-sol", context: nil)])
+        let basis = TranscriptTelemetryPresentation.pricingBasis(telemetry)
+        XCTAssertNil(basis[0].minContextInputTokens)
+        XCTAssertNil(basis[0].maxContextInputTokens)
+    }
+
+    // MARK: - Task 2: token share
+
+    func testTokenShareFoldsCacheWritesIntoFreshAndKeepsReasoningOutOfTheTotal() {
+        let event = TelemetryUsageEvent(
+            recordID: nil, observedAt: nil, anchorLine: 0, usageFamily: "token_count",
+            ownership: .session, model: "gpt-5.6-sol", reasoningEffort: nil,
+            speed: "standard-normalized", inferenceGeo: nil,
+            freshInputTokens: 300, cacheReadTokens: 600,
+            cacheWrite5mTokens: 60, cacheWrite1hTokens: 40,
+            outputTokens: 100, reasoningOutputTokens: 70, contextInputTokens: 900)
+        let share = TranscriptTelemetryPresentation.tokenShare(telemetry(events: [event]))
+        XCTAssertEqual(share?.cached, 600)
+        XCTAssertEqual(share?.fresh, 400)          // 300 fresh + 100 cache writes
+        XCTAssertEqual(share?.output, 100)
+        XCTAssertEqual(share?.total, 1100)         // reasoning is inside output, never added
+        XCTAssertEqual(share?.cacheWriteTokens, 100)
+        XCTAssertEqual(share?.reasoningTokens, 70)
+        XCTAssertEqual(share?.cachedFraction ?? 0, 600.0 / 1100.0, accuracy: 0.0001)
+        XCTAssertEqual(TranscriptTelemetryPresentation.tokenSharePercent(
+            share?.cachedFraction ?? 0, locale: Locale(identifier: "en_US")), "55%")
+    }
+
+    func testTokenShareKeepsNonzeroSubPercentValuesAndAccessibilityCopy() {
+        let share = TelemetryTokenShare(cached: 996, fresh: 1, output: 3,
+                                        cacheWriteTokens: 0, reasoningTokens: 0)
+        let locale = Locale(identifier: "en_US")
+        XCTAssertEqual(TranscriptTelemetryPresentation.tokenSharePercent(share.freshFraction, locale: locale),
+                       "<1%")
+        let accessibility = TranscriptTelemetryPresentation.tokenShareAccessibilityText(share, locale: locale)
+        XCTAssertTrue(accessibility.contains("cached 100%"))
+        XCTAssertTrue(accessibility.contains("fresh <1%"))
+        XCTAssertTrue(accessibility.contains("output <1%"))
+    }
+
+    func testTokenShareMinimumWidthsFitWithinTheBar() {
+        let widths = TokenShareLayout.segmentWidths(fractions: [0.997, 0.001, 0.002], totalWidth: 100)
+        XCTAssertEqual(widths.reduce(0, +), 100, accuracy: 0.0001)
+        XCTAssertGreaterThanOrEqual(widths[1], 1)
+        XCTAssertGreaterThanOrEqual(widths[2], 1)
+    }
+
+    func testTokenShareIsUnavailableWithoutAComponentBreakdown() {
+        XCTAssertNil(TranscriptTelemetryPresentation.tokenShare(
+            telemetry(events: [usageEvent(model: "x", context: 1)], hasBreakdown: false)))
+    }
+
+    func testTokenShareIsUnavailableWhenOnlyDelegatedWorkExists() {
+        XCTAssertNil(TranscriptTelemetryPresentation.tokenShare(
+            telemetry(events: [usageEvent(model: "x", context: 1, ownership: .descendant)])))
+    }
+
+    // MARK: - Task 3: history rows
+
+    func testHistoryRowsLeadWithTheStartedConfigurationAndMarkInference() {
+        let started = SessionConfiguration(model: "gpt-5.6-sol", reasoningEffort: "medium",
+                                           observedAt: nil, anchorLine: 0,
+                                           provenance: .inferredFirstObservation)
+        let rows = TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: [], changes: [], initial: started, current: started),
+            blocks: [block(0, record: 1)])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].kind, .started)
+        XCTAssertEqual(rows[0].title, "Started gpt-5.6-sol · medium")
+        XCTAssertTrue(rows[0].isInferred)
+    }
+
+    func testHistoryRowsAndInlineMarkersResolveToTheSameBlock() {
+        let blocks = [block(0, record: 1), block(1, record: 9)]
+        let changes = [change(7)]
+        let markers = TranscriptTelemetryPresentation.markers(changes: changes, blocks: blocks)
+        let rows = TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: [], changes: changes), blocks: blocks)
+        XCTAssertEqual(rows.first { $0.kind == .change }?.blockIndex, 1)
+        XCTAssertEqual(markers.keys.sorted(), [1])
+    }
+
+    func testHistoryRowTitleReadsAsAChangeNotAFieldName() {
+        let effort = ConfigurationChange(field: .reasoningEffort, oldValue: "medium",
+                                         newValue: "high", observedAt: nil, anchorLine: 3,
+                                         provenance: .effectiveTurnContext)
+        let rows = TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: [], changes: [effort]),
+            blocks: [block(0, record: 1), block(1, record: 9)])
+        XCTAssertEqual(rows.first { $0.kind == .change }?.title, "Thinking effort medium → high")
+    }
+
+    func testHistoryRowsAreEmptyWhenNothingWasRecorded() {
+        XCTAssertTrue(TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: []), blocks: []).isEmpty)
+    }
+
+    func testHistoryVisibilityRequiresAConfigurationChange() {
+        let started = SessionConfiguration(model: "gpt-5.6-sol", reasoningEffort: "medium",
+                                           observedAt: nil, anchorLine: 0,
+                                           provenance: .effectiveTurnContext)
+        XCTAssertFalse(TranscriptTelemetryPresentation.shouldShowHistory(
+            telemetry(events: [], initial: started, current: started)))
+        XCTAssertTrue(TranscriptTelemetryPresentation.shouldShowHistory(
+            telemetry(events: [], changes: [change(3)], initial: started, current: started)))
+    }
+
+    func testSessionInfoPresentationResolvesCompleteLocalizedCopy() {
+        let locale = Locale(identifier: "en")
+        XCTAssertEqual(
+            TranscriptTelemetryPresentation.pricedOnBasisHelp(2, locale: locale),
+            "2 requests priced on this basis."
+        )
+        XCTAssertEqual(
+            TranscriptTelemetryPresentation.rowAccessibilityLabel(
+                label: "Model", value: "—", locale: locale),
+            "Model: unavailable"
+        )
+    }
+
+    func testActivityHelpUsesProviderNeutralRecordedRequestLanguage() {
+        let help = TranscriptTelemetryPresentation.turnsHelp(
+            you: 1, agent: 2, tools: 3, requests: 4, locale: Locale(identifier: "en"))
+        XCTAssertTrue(help.contains("records 4 requests"))
+        XCTAssertFalse(help.contains("priced"))
+    }
+
+    func testSessionInfoCompleteSentencesPluralizeWithoutNounPhraseInsertion() {
+        let locale = Locale(identifier: "en")
+        XCTAssertEqual(
+            TranscriptTelemetryPresentation.delegatedSummary(
+                compactTokens: "12K", requestCount: 2, locale: locale),
+            "12K · 2 requests"
+        )
+        let help = TranscriptTelemetryPresentation.delegatedHelp(
+            tokens: 12_000, requestCount: 2, locale: locale)
+        XCTAssertTrue(help.hasPrefix("12,000 tokens across 2 requests,"))
+    }
+
+    func testQuickFactsPresentationKeepsCurrentAndFirstObservedProvenanceSeparate() {
+        let session = Session(
+            id: "quick-info-session",
+            source: .qwen,
+            startTime: nil,
+            endTime: nil,
+            model: "qwen3-coder",
+            filePath: "/tmp/quick-info.jsonl",
+            fileSizeBytes: 12,
+            eventCount: 0,
+            events: [],
+            cwd: "/tmp",
+            repoName: "repo",
+            lightweightTitle: "  Quick title  ",
+            reasoningEffort: "high")
+        let facts = SessionInfoQuickFacts(session: session)
+
+        let current = TranscriptTelemetryPresentation.quickFactValue(facts.currentModel)
+        XCTAssertEqual(current.text, "qwen3-coder")
+        XCTAssertTrue(current.help.contains("Current model"))
+
+        let beforeTelemetry = TranscriptTelemetryPresentation.firstObservedModelValue(
+            facts, telemetry: nil)
+        XCTAssertEqual(beforeTelemetry.text, "—")
+        XCTAssertTrue(beforeTelemetry.help.contains("Not supported"))
+        XCTAssertFalse(beforeTelemetry.help.contains("Detailed telemetry"))
+
+        let initial = SessionConfiguration(
+            model: "first-model", reasoningEffort: "medium", observedAt: nil,
+            anchorLine: 0, provenance: .inferredFirstObservation)
+        let afterTelemetry = TranscriptTelemetryPresentation.firstObservedModelValue(
+            facts, telemetry: telemetry(events: [], initial: initial, current: initial))
+        XCTAssertEqual(afterTelemetry.text, "first-model")
+        XCTAssertTrue(afterTelemetry.help.contains("inferred"))
+
+        let fieldRecorded = SessionConfiguration(
+            model: "field-recorded", reasoningEffort: "medium", observedAt: nil,
+            anchorLine: 0, provenance: .inferredFirstObservation,
+            modelProvenance: .assistantRecord)
+        let fieldRecordedValue = TranscriptTelemetryPresentation.firstObservedModelValue(
+            facts, telemetry: telemetry(events: [], initial: fieldRecorded, current: fieldRecorded))
+        XCTAssertEqual(fieldRecordedValue.text, "field-recorded")
+        XCTAssertTrue(fieldRecordedValue.help.contains("recorded"))
+        XCTAssertFalse(fieldRecordedValue.help.contains("inferred"))
+
+        let failedTelemetry = TranscriptTelemetryPresentation.firstObservedModelValue(
+            facts,
+            telemetry: nil,
+            telemetryLoadState: .unavailable(.parseFailed))
+        XCTAssertEqual(failedTelemetry.text, "—")
+        XCTAssertTrue(failedTelemetry.help.contains("Could not read"))
+        XCTAssertFalse(failedTelemetry.help.contains("Not loaded"))
+
+        XCTAssertEqual(
+            TranscriptTelemetryPresentation.quickFactValue(facts.title).text,
+            "Quick title")
+        let missingTitle = TranscriptTelemetryPresentation.titleValue(
+            .unavailable(.notLoaded))
+        XCTAssertTrue(missingTitle.help.contains("No title is available"))
+    }
+
+    func testTokenShareHelpResolvesCompleteLocalizedSentences() {
+        let locale = Locale(identifier: "en")
+        let share = TelemetryTokenShare(
+            cached: 900, fresh: 100, output: 10,
+            cacheWriteTokens: 20, reasoningTokens: 4)
+        XCTAssertEqual(
+            TranscriptTelemetryPresentation.tokenShareHelp(share, locale: locale),
+            "Cached input 900, fresh input 100, output 10. Fresh includes 20 cache-write tokens. Output includes 4 reasoning tokens."
+        )
+    }
+
+    // MARK: - Task 4: value formatting
+
+    func testAbsentValuesRenderAsAnEmDashWithTheReasonInHelp() {
+        let weekly = TranscriptTelemetryPresentation.weeklyValue(
+            telemetry(events: [], hasBreakdown: false))
+        XCTAssertEqual(weekly.text, "—")
+        XCTAssertFalse(weekly.help.isEmpty)
+        XCTAssertFalse(weekly.text.contains("Unavailable"))
+    }
+
+    func testCostShowsTwoDecimalsAndKeepsFullPrecisionInHelp() {
+        let value = TranscriptTelemetryPresentation.costValue(costOnlyTelemetry(
+            TelemetryCostEstimate(apiEquivalentUSD: 12.3655, unpricedModels: [],
+                                  missingPriceComponents: [], priceTableUpdated: "2026-09-10",
+                                  priceTableRevision: 7)))
+        XCTAssertEqual(value.text, "$12.37")
+        XCTAssertTrue(value.help.contains("12.3655"))
+    }
+
+    func testCostPreservesSubCentPrecision() {
+        let value = TranscriptTelemetryPresentation.costValue(costOnlyTelemetry(
+            TelemetryCostEstimate(apiEquivalentUSD: 0.0042, unpricedModels: [],
+                                  missingPriceComponents: [], priceTableUpdated: "2026-09-10",
+                                  priceTableRevision: 7)), locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(value.text, "$0.0042")
+        XCTAssertTrue(value.help.contains("Reference value"))
+    }
+
+    func testModelAndThinkingValuesStaySeparate() {
+        let configuration = SessionConfiguration(model: "gpt-5.6-sol", reasoningEffort: "high",
+                                                 observedAt: nil, anchorLine: 0,
+                                                 provenance: .effectiveTurnContext)
+        XCTAssertEqual(TranscriptTelemetryPresentation.modelValue(configuration).text, "gpt-5.6-sol")
+        XCTAssertEqual(TranscriptTelemetryPresentation.thinkingValue(configuration)?.text, "high")
+        XCTAssertNil(TranscriptTelemetryPresentation.thinkingValue(
+            SessionConfiguration(model: "gpt-5.6-sol", reasoningEffort: nil,
+                                 observedAt: nil, anchorLine: 0,
+                                 provenance: .effectiveTurnContext)))
+
+        let mixed = SessionConfiguration(
+            model: "recorded-model", reasoningEffort: "inferred-effort",
+            observedAt: nil, anchorLine: 0,
+            provenance: .inferredFirstObservation,
+            modelProvenance: .assistantRecord,
+            reasoningEffortProvenance: .inferredFirstObservation)
+        XCTAssertTrue(TranscriptTelemetryPresentation.modelValue(mixed).help.contains("Recorded"))
+        XCTAssertFalse(TranscriptTelemetryPresentation.modelValue(mixed).help.contains("Inferred"))
+        XCTAssertTrue(TranscriptTelemetryPresentation.thinkingValue(mixed)?.help.contains("Inferred") == true)
+    }
+
+    func testUnpricedModelsAreNamedInHelpNotInTheValue() {
+        let value = TranscriptTelemetryPresentation.costValue(costOnlyTelemetry(
+            TelemetryCostEstimate(apiEquivalentUSD: nil, unpricedModels: ["mystery-model"],
+                                  missingPriceComponents: [], priceTableUpdated: "2026-09-10",
+                                  priceTableRevision: 7)))
+        XCTAssertEqual(value.text, "—")
+        XCTAssertTrue(value.help.contains("mystery-model"))
+    }
+
+    func testUnsupportedPricingExplainsCapabilityInsteadOfClaimingNoUsage() {
+        let telemetry = SessionTelemetry(
+            source: .opencode,
+            initialConfiguration: nil,
+            currentConfiguration: nil,
+            configurationChanges: [],
+            usageSlices: [],
+            usageEvents: [TelemetryUsageEvent(
+                recordID: "step-1", observedAt: nil, anchorLine: 0,
+                usageFamily: "opencode.step-finish.tokens", ownership: .session,
+                model: "big-pickle", reasoningEffort: nil, speed: "standard-normalized",
+                freshInputTokens: 10, cacheReadTokens: 0, cacheWrite5mTokens: 0,
+                cacheWrite1hTokens: 0, outputTokens: 5, contextInputTokens: 10)],
+            usageSummary: .init(topLineTokens: 15, hasComponentBreakdown: true,
+                                recordedTotalTokens: 15,
+                                usageFamilies: ["opencode.step-finish.tokens"],
+                                usageFamilyConflict: false),
+            costEstimate: nil)
+
+        let value = TranscriptTelemetryPresentation.costValue(
+            telemetry,
+            capability: .unavailable("OpenCode native pricing is not yet audited"))
+        XCTAssertEqual(value.text, "—")
+        XCTAssertTrue(value.help.contains("OpenCode native pricing is not yet audited"))
+        XCTAssertFalse(value.help.contains("No priceable usage"))
+        XCTAssertTrue(TranscriptTelemetryPresentation.pricingBasis(
+            telemetry,
+            capability: .unavailable("OpenCode native pricing is not yet audited")).isEmpty,
+                       "unsupported pricing must not render pricing-specific basis rows")
+    }
+
+    func testUnavailableUsageDoesNotPresentFailClosedEvidenceAsEmptyTotals() {
+        let reason = "OpenCode fork usage is unavailable because the session creation boundary is missing."
+        let telemetry = SessionTelemetry(
+            source: .opencode,
+            initialConfiguration: nil,
+            currentConfiguration: nil,
+            configurationChanges: [],
+            usageSlices: [],
+            usageEvents: [],
+            usageSummary: .init(topLineTokens: 0, hasComponentBreakdown: false,
+                                recordedTotalTokens: nil, usageFamilies: [],
+                                usageFamilyConflict: false, unavailableReason: reason),
+            costEstimate: nil)
+
+        XCTAssertNil(TranscriptTelemetryPresentation.tokens(telemetry))
+        XCTAssertEqual(TranscriptTelemetryPresentation.tokensValue(telemetry).text, "—")
+        XCTAssertTrue(TranscriptTelemetryPresentation.tokensValue(telemetry).help.contains(reason))
+        XCTAssertTrue(TranscriptTelemetryPresentation.costValue(telemetry).help.contains(reason))
+        XCTAssertTrue(TranscriptTelemetryPresentation.pricingBasis(telemetry).isEmpty)
+        XCTAssertNil(TranscriptTelemetryPresentation.tokenShare(telemetry))
+
+        let activityHelp = TranscriptTelemetryPresentation.turnsHelp(
+            you: 1, agent: 2, tools: 3, requests: 4,
+            usageUnavailableReason: reason, locale: Locale(identifier: "en"))
+        XCTAssertTrue(activityHelp.contains("Request total unavailable"))
+        XCTAssertTrue(activityHelp.contains(reason))
+        XCTAssertFalse(activityHelp.contains("records 4 requests"))
+    }
+
+    // MARK: - Task 7: jump-target contract
+
+    func testHistoryRowBlockIndexIsAValidScrollTargetOrNil() {
+        // A change past the final block anchors one past the end; the controller
+        // widens and no-ops rather than scrolling to a row that does not exist.
+        let blocks = [block(0, record: 1)]
+        let rows = TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: [], changes: [change(99)]), blocks: blocks)
+        XCTAssertEqual(rows.first { $0.kind == .change }?.blockIndex, blocks.count)
+    }
+
+    func testHistoryRowsHaveNoJumpTargetWithoutBlocks() {
+        let rows = TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: [], changes: [change(3)]), blocks: [])
+        XCTAssertNil(rows.first { $0.kind == .change }?.blockIndex)
+    }
+
+    /// The panel is handed an empty block array while the transcript snapshot
+    /// still belongs to a previously selected session. Every row must then be
+    /// target-less, so a click cannot resolve into the wrong transcript.
+    func testStaleSnapshotYieldsRowsWithNoTargetsAtAll() {
+        let started = SessionConfiguration(model: "gpt-5.6-sol", reasoningEffort: "medium",
+                                           observedAt: nil, anchorLine: 0,
+                                           provenance: .effectiveTurnContext)
+        let rows = TranscriptTelemetryPresentation.historyRows(
+            telemetry: telemetry(events: [], changes: [change(3), change(9)], initial: started),
+            blocks: [])
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertTrue(rows.allSatisfy { $0.blockIndex == nil })
+    }
+}

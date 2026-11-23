@@ -1,0 +1,1022 @@
+import Foundation
+
+/// Parser for OpenCode sessions stored under ~/.local/share/opencode/storage
+final class OpenCodeSessionParser {
+    private static let generatedDefaultTitleRegex = try! NSRegularExpression(
+        pattern: #"^New session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"#
+    )
+
+    private enum StorageSchemaVersion: Int {
+        case legacy = 1
+        case v2 = 2
+    }
+
+    private struct SessionJSON: Decodable {
+        struct Time: Decodable {
+            let created: Int64?
+            let updated: Int64?
+        }
+        struct Summary: Decodable {
+            let additions: Int?
+            let deletions: Int?
+            let files: Int?
+        }
+        let id: String
+        let version: String?
+        let projectID: String?
+        let directory: String?
+        let parentID: String?
+        let title: String?
+        let time: Time?
+        let summary: Summary?
+    }
+
+    struct MessageJSON: Decodable {
+        struct Time: Decodable {
+            let created: Int64?
+        }
+        struct Summary: Decodable {
+            let title: String?
+            let body: String?
+            // `diffs` is not decoded: OpenCode stores it as an array of
+            // {file, patch, ...} objects, and a [String] field failed the whole
+            // message, which dropped the user prompt from the transcript.
+        }
+        struct Model: Decodable {
+            let providerID: String?
+            let modelID: String?
+        }
+        struct Tools: Decodable {
+            let todowrite: Bool?
+            let todoread: Bool?
+            let task: Bool?
+        }
+        let id: String?
+        let sessionID: String?
+        let role: String?
+        let time: Time?
+        let summary: Summary?
+        let agent: String?
+        let model: Model?
+        // Some OpenCode message records store model fields at the top level.
+        let providerID: String?
+        let modelID: String?
+        let tools: Tools?
+    }
+
+    private protocol OpenCodeStorageLayout {
+        var schemaVersion: StorageSchemaVersion { get }
+        func partFiles(forMessageID messageID: String, storageRoot: URL, legacyIndex: inout [String: [URL]]?) -> [URL]
+    }
+
+    private struct V2Layout: OpenCodeStorageLayout {
+        let schemaVersion: StorageSchemaVersion = .v2
+
+        func partFiles(forMessageID messageID: String, storageRoot: URL, legacyIndex: inout [String: [URL]]?) -> [URL] {
+            let partDir = storageRoot
+                .appendingPathComponent("part", isDirectory: true)
+                .appendingPathComponent(messageID, isDirectory: true)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: partDir.path, isDirectory: &isDir), isDir.boolValue else {
+                return []
+            }
+            guard let files = try? FileManager.default.contentsOfDirectory(at: partDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
+                return []
+            }
+            return files
+                .filter { $0.pathExtension.lowercased() == "json" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }
+    }
+
+    private struct LegacyLayout: OpenCodeStorageLayout {
+        let schemaVersion: StorageSchemaVersion = .legacy
+
+        func partFiles(forMessageID messageID: String, storageRoot: URL, legacyIndex: inout [String: [URL]]?) -> [URL] {
+            // Prefer v2-style folder when present even if migration is missing.
+            let v2Files = V2Layout().partFiles(forMessageID: messageID, storageRoot: storageRoot, legacyIndex: &legacyIndex)
+            if !v2Files.isEmpty { return v2Files }
+
+            if legacyIndex == nil {
+                legacyIndex = buildLegacyPartIndex(storageRoot: storageRoot)
+            }
+            return (legacyIndex?[messageID] ?? []).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }
+
+        private func buildLegacyPartIndex(storageRoot: URL) -> [String: [URL]] {
+            let partRoot = storageRoot.appendingPathComponent("part", isDirectory: true)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: partRoot.path, isDirectory: &isDir), isDir.boolValue else {
+                return [:]
+            }
+
+            guard let enumerator = FileManager.default.enumerator(at: partRoot,
+                                                                 includingPropertiesForKeys: [.isRegularFileKey],
+                                                                 options: [.skipsHiddenFiles]) else {
+                return [:]
+            }
+
+            var index: [String: [URL]] = [:]
+            for case let url as URL in enumerator {
+                guard url.pathExtension.lowercased() == "json",
+                      url.lastPathComponent.hasPrefix("prt_") else {
+                    continue
+                }
+                guard let data = try? Data(contentsOf: url),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let messageID = obj["messageID"] as? String else {
+                    continue
+                }
+                index[messageID, default: []].append(url)
+            }
+            return index
+        }
+    }
+
+    /// Lightweight parse of an OpenCode session file into a Session with no events.
+    /// Uses message metadata to estimate message count, preferred model, and command count.
+    static func parseFile(at url: URL) -> Session? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        guard let obj = try? decoder.decode(SessionJSON.self, from: data) else { return nil }
+
+        let createdDate = obj.time?.created.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+        let updatedDate = obj.time?.updated.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+
+        let storedTitle = Self.normalizedSessionTitle(obj.title)
+        let generatedDefaultTitle = Self.isGeneratedDefaultSessionTitle(storedTitle)
+        // OpenCode's timestamp-only default carries no recognition value. Pay the
+        // part-read cost only for those rows; named sessions keep the old fast path.
+        let (eventCount, modelID, commandCount, firstUserTitle) = lightweightMessageMetadata(
+            for: obj.id,
+            sessionURL: url,
+            includeFirstUserTitle: generatedDefaultTitle
+        )
+        let sessionTitle = Self.effectiveSessionTitle(storedTitle: storedTitle, firstUserText: firstUserTitle)
+        let customTitle = generatedDefaultTitle ? nil : storedTitle
+        let subagentType = Self.deriveSubagentTypeFromTitle(storedTitle)
+        return Session(
+            id: obj.id,
+            source: .opencode,
+            startTime: createdDate,
+            endTime: updatedDate,
+            model: modelID,
+            filePath: url.path,
+            fileSizeBytes: (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
+            eventCount: eventCount,
+            events: [],
+            cwd: obj.directory,
+            repoName: nil,
+            lightweightTitle: sessionTitle,
+            lightweightCommands: commandCount > 0 ? commandCount : nil,
+            parentSessionID: obj.parentID,
+            subagentType: subagentType,
+            customTitle: customTitle
+        )
+    }
+
+    /// Full parse of an OpenCode session, including all message events.
+    /// OpenCode wraps a subagent's final answer in an XML envelope
+    /// (`<task id=… state=…><task_result>…</task_result></task>` on current builds,
+    /// a trailing `<task_metadata>session_id: …</task_metadata>` on older ones).
+    /// Strip it so the transcript card shows the report itself, and surface the
+    /// child session id on the first line so the reader can find where the work happened.
+    static func unwrapTaskOutput(_ raw: String, childSessionID: String?) -> String {
+        var body = raw
+        var childID = childSessionID
+
+        if let open = body.range(of: "<task_result>"),
+           let close = body.range(of: "</task_result>", options: .backwards),
+           open.upperBound <= close.lowerBound {
+            if childID == nil,
+               let idRange = body.range(of: #"<task id="([^"]+)""#, options: .regularExpression) {
+                let attr = body[idRange]
+                if let q1 = attr.firstIndex(of: "\""), let q2 = attr.lastIndex(of: "\""), q1 < q2 {
+                    childID = String(attr[attr.index(after: q1)..<q2])
+                }
+            }
+            body = String(body[open.upperBound..<close.lowerBound])
+        }
+
+        if let metaOpen = body.range(of: "<task_metadata>"),
+           let metaClose = body.range(of: "</task_metadata>", options: .backwards),
+           metaOpen.upperBound <= metaClose.lowerBound {
+            let meta = body[metaOpen.upperBound..<metaClose.lowerBound]
+            if childID == nil,
+               let line = meta.split(separator: "\n").first(where: { $0.contains("session_id:") }),
+               let colon = line.firstIndex(of: ":") {
+                let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty { childID = value }
+            }
+            body.removeSubrange(metaOpen.lowerBound..<metaClose.upperBound)
+        }
+
+        // Truncated envelope (no closing tag): drop OpenCode's own "task_id: … (for resuming…)"
+        // preamble so it is not shown twice next to our header.
+        if body.hasPrefix("task_id: "), let newline = body.firstIndex(of: "\n") {
+            body = String(body[body.index(after: newline)...])
+        }
+        body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let header = childID.map { "Subagent session: \($0)" }
+        if body.isEmpty {
+            return [header, "(subagent returned no result)"].compactMap { $0 }.joined(separator: "\n")
+        }
+        return [header, body].compactMap { $0 }.joined(separator: "\n\n")
+    }
+
+    static func parseFileFull(at url: URL) -> Session? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        guard let obj = try? decoder.decode(SessionJSON.self, from: data) else { return nil }
+
+        let createdDate = obj.time?.created.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+        let updatedDate = obj.time?.updated.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+
+        let (events, modelID, commandCount) = loadMessages(for: obj.id, sessionURL: url)
+        let storageRootURL = storageRoot(for: url)
+        let warningEvents = storageDiagnosticsEvents(storageRoot: storageRootURL)
+        let allEvents = warningEvents + events
+
+        let nonMetaCount = allEvents.filter { $0.kind != .meta }.count
+        let storedTitle = Self.normalizedSessionTitle(obj.title)
+        let generatedDefaultTitle = Self.isGeneratedDefaultSessionTitle(storedTitle)
+        let firstUserTitle = allEvents.first(where: { $0.kind == .user })?.text
+        let sessionTitle = Self.effectiveSessionTitle(storedTitle: storedTitle, firstUserText: firstUserTitle)
+        let customTitle = generatedDefaultTitle ? nil : storedTitle
+        let subagentType = Self.deriveSubagentTypeFromTitle(storedTitle)
+        return Session(
+            id: obj.id,
+            source: .opencode,
+            startTime: createdDate,
+            endTime: updatedDate,
+            model: modelID,
+            filePath: url.path,
+            fileSizeBytes: (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
+            eventCount: nonMetaCount,
+            events: allEvents,
+            cwd: obj.directory,
+            repoName: nil,
+            lightweightTitle: sessionTitle,
+            lightweightCommands: commandCount > 0 ? commandCount : nil,
+            parentSessionID: obj.parentID,
+            subagentType: subagentType,
+            customTitle: customTitle
+        )
+    }
+
+    static func normalizedSessionTitle(_ title: String?) -> String? {
+        let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// OpenCode assigns this exact timestamp shape before it has generated or
+    /// received a meaningful name. Do not reject user titles that merely start
+    /// with "New session -".
+    static func isGeneratedDefaultSessionTitle(_ title: String?) -> Bool {
+        guard let title else { return false }
+        let range = NSRange(title.startIndex..<title.endIndex, in: title)
+        return generatedDefaultTitleRegex.firstMatch(in: title, range: range)?.range == range
+    }
+
+    static func effectiveSessionTitle(storedTitle: String?, firstUserText: String?) -> String? {
+        guard isGeneratedDefaultSessionTitle(storedTitle) else {
+            return normalizedSessionTitle(storedTitle)
+        }
+        let collapsed = firstUserText?
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ") ?? ""
+        guard !collapsed.isEmpty else { return nil }
+        return String(collapsed.prefix(512))
+    }
+
+    static func preferredUserSummaryText(from message: MessageJSON) -> String? {
+        for candidate in [message.summary?.title, message.summary?.body] {
+            guard let candidate else { continue }
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return candidate }
+        }
+        return nil
+    }
+
+    private static func ordersBefore<T: Comparable>(
+        _ lhs: (value: T?, fileName: String),
+        _ rhs: (value: T?, fileName: String)
+    ) -> Bool {
+        switch (lhs.value, rhs.value) {
+        case let (l?, r?) where l != r: return l < r
+        case (_?, nil): return true
+        case (nil, _?): return false
+        default: return lhs.fileName < rhs.fileName
+        }
+    }
+
+    /// Derive subagent type from OpenCode title pattern: "... (@<agent> subagent)"
+    static func deriveSubagentTypeFromTitle(_ title: String?) -> String? {
+        guard let title else { return nil }
+        let pattern = #"\(@(\w+) subagent\)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)),
+              let captureRange = Range(match.range(at: 1), in: title) else { return nil }
+        return String(title[captureRange])
+    }
+
+    // MARK: - Message loading helpers
+
+    private static func storageRoot(for sessionURL: URL) -> URL {
+        // sessionURL: ~/.local/share/opencode/storage/session/<projectID>/ses_<ID>.json
+        // Strip /ses_<ID>.json -> .../storage/session/<projectID>
+        // Strip project -> .../storage/session
+        // Strip session -> .../storage
+        return sessionURL
+            .deletingLastPathComponent()        // .../storage/session/<projectID>
+            .deletingLastPathComponent()        // .../storage/session
+            .deletingLastPathComponent()        // .../storage
+    }
+
+    private static func detectSchemaVersion(storageRoot: URL) -> StorageSchemaVersion {
+        let migrationURL = storageRoot.appendingPathComponent("migration", isDirectory: false)
+        guard let data = try? Data(contentsOf: migrationURL),
+              let str = String(data: data, encoding: .utf8) else {
+            return .legacy
+        }
+        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let v = Int(trimmed), let parsed = StorageSchemaVersion(rawValue: v) {
+            return parsed
+        }
+        return .legacy
+    }
+
+    private static func storageLayout(for storageRoot: URL) -> any OpenCodeStorageLayout {
+        switch detectSchemaVersion(storageRoot: storageRoot) {
+        case .v2: return V2Layout()
+        case .legacy: return LegacyLayout()
+        }
+    }
+
+    private static func messagesRoot(for sessionID: String, sessionURL: URL) -> URL {
+        // sessionURL: ~/.local/share/opencode/storage/session/<projectID>/ses_<ID>.json
+        let projectDir = sessionURL.deletingLastPathComponent()
+        let sessionRoot = projectDir.deletingLastPathComponent()
+        let storageRoot = sessionRoot.deletingLastPathComponent()
+        return storageRoot
+            .appendingPathComponent("message", isDirectory: true)
+            .appendingPathComponent(sessionID, isDirectory: true)
+    }
+
+    private static func lightweightMessageMetadata(
+        for sessionID: String,
+        sessionURL: URL,
+        includeFirstUserTitle: Bool
+    ) -> (count: Int, modelID: String?, commands: Int, firstUserTitle: String?) {
+        let root = messagesRoot(for: sessionID, sessionURL: sessionURL)
+        let storageRoot = storageRoot(for: sessionURL)
+        let layout = storageLayout(for: storageRoot)
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
+            return (0, nil, 0, nil)
+        }
+        guard let enumerator = fm.enumerator(at: root,
+                                             includingPropertiesForKeys: [.isRegularFileKey],
+                                             options: [.skipsHiddenFiles]) else {
+            return (0, nil, 0, nil)
+        }
+        var count = 0
+        var firstModelID: String?
+        var commands = 0
+        var legacyIndex: [String: [URL]]? = nil
+        var userMessages: [(created: Int64?, fileName: String, message: MessageJSON)] = []
+        for case let url as URL in enumerator {
+            if url.lastPathComponent.hasPrefix("msg_") && url.pathExtension.lowercased() == "json" {
+                count += 1
+                guard let data = try? Data(contentsOf: url),
+                      let msg = try? JSONDecoder().decode(MessageJSON.self, from: data) else {
+                    continue
+                }
+                if firstModelID == nil,
+                   let mid = (msg.model?.modelID ?? msg.modelID), !mid.isEmpty {
+                    firstModelID = mid
+                }
+                if includeFirstUserTitle, msg.role?.lowercased() == "user" {
+                    userMessages.append((msg.time?.created, url.lastPathComponent, msg))
+                }
+                if let tools = msg.tools,
+                   (tools.todowrite ?? false) || (tools.todoread ?? false) || (tools.task ?? false) {
+                    commands += 1
+                }
+                if containsToolPart(for: msg.id ?? "", storageRoot: storageRoot, layout: layout, legacyIndex: &legacyIndex) {
+                    commands += 1
+                }
+            }
+        }
+        var firstUserTitle: String?
+        if includeFirstUserTitle {
+            userMessages.sort { lhs, rhs in
+                ordersBefore(
+                    (value: lhs.created, fileName: lhs.fileName),
+                    (value: rhs.created, fileName: rhs.fileName)
+                )
+            }
+            if let first = userMessages.first {
+                let parts = loadPartEvents(
+                    for: first.message,
+                    storageRoot: storageRoot,
+                    layout: layout,
+                    legacyIndex: &legacyIndex,
+                    fallbackTimestamp: first.created.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+                )
+                firstUserTitle = parts.text.compactMap(\.text).first(where: {
+                    !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                })
+                if firstUserTitle == nil {
+                    firstUserTitle = preferredUserSummaryText(from: first.message)
+                }
+            }
+        }
+        return (count, firstModelID, commands, firstUserTitle)
+    }
+
+    private static func loadMessages(for sessionID: String, sessionURL: URL) -> ([SessionEvent], String?, Int) {
+        let root = messagesRoot(for: sessionID, sessionURL: sessionURL)
+        let storageRoot = storageRoot(for: sessionURL)
+        let layout = storageLayout(for: storageRoot)
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
+            return ([], nil, 0)
+        }
+        guard let enumerator = fm.enumerator(at: root,
+                                             includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                                             options: [.skipsHiddenFiles]) else {
+            return ([], nil, 0)
+        }
+
+        var events: [SessionEvent] = []
+        var modelID: String?
+        var commandCount = 0
+        var legacyIndex: [String: [URL]]? = nil
+
+        // Collect message files first so we can enforce stable ordering.
+        var messageFiles: [(url: URL, created: Date?, fileName: String)] = []
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent.hasPrefix("msg_"), url.pathExtension.lowercased() == "json" else { continue }
+            guard let data = try? Data(contentsOf: url),
+                  let msg = try? JSONDecoder().decode(MessageJSON.self, from: data) else {
+                continue
+            }
+            guard msg.sessionID == nil || msg.sessionID == sessionID else { continue }
+            let created = msg.time?.created.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+            messageFiles.append((url: url, created: created, fileName: url.lastPathComponent))
+        }
+
+        messageFiles.sort { lhs, rhs in
+            ordersBefore(
+                (value: lhs.created, fileName: lhs.fileName),
+                (value: rhs.created, fileName: rhs.fileName)
+            )
+        }
+
+        for item in messageFiles {
+            let url = item.url
+            guard let data = try? Data(contentsOf: url) else { continue }
+            guard let msg = try? JSONDecoder().decode(MessageJSON.self, from: data) else { continue }
+
+            // For JSON files, msg.id is always present. Use filename as safety fallback.
+            let effectiveMsgID = msg.id ?? url.deletingPathExtension().lastPathComponent
+
+            let ts = msg.time?.created.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+            if modelID == nil, let mid = (msg.model?.modelID ?? msg.modelID), !mid.isEmpty {
+                modelID = mid
+            }
+
+            let partEvents = loadPartEvents(for: msg, storageRoot: storageRoot, layout: layout, legacyIndex: &legacyIndex, fallbackTimestamp: ts)
+            let hasToolParts = !partEvents.tool.isEmpty
+            let hasTextParts = !partEvents.text.isEmpty
+
+            let rawJSON: String = {
+                // Re-serialize via JSONSerialization to guarantee valid JSON, then cap at 8 KB.
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    return cappedPartJSON(obj: obj, source: data)
+                }
+                guard let str = String(data: data, encoding: .utf8) else { return "" }
+                return str.count > 8192 ? String(str.prefix(8192)) : str
+            }()
+
+            // Treat messages with tools flags as command/tool-call events for terminal view + filters
+            let hasTools = (msg.tools?.todowrite ?? false) || (msg.tools?.todoread ?? false) || (msg.tools?.task ?? false)
+            if hasTools { commandCount += 1 }
+            commandCount += partEvents.tool.filter { $0.kind == .tool_call }.count
+
+            // Preserve the raw message record for JSON view/debugging, but do not let it
+            // drive transcript rendering (OpenCode stores actual text content in part files).
+            let messageMetaEvent = SessionEvent(
+                id: effectiveMsgID + "-meta",
+                timestamp: ts,
+                kind: .meta,
+                role: msg.role,
+                text: nil,
+                toolName: nil,
+                toolInput: nil,
+                toolOutput: nil,
+                messageID: effectiveMsgID,
+                parentID: nil,
+                isDelta: false,
+                rawJSON: rawJSON
+            )
+            events.append(messageMetaEvent)
+
+            if hasTextParts {
+                events.append(contentsOf: partEvents.text)
+            } else {
+                // Fallback: use message summary fields when text parts are unavailable.
+                // (Some older OpenCode versions or compact records only store summary text.)
+                let baseKind = SessionEventKind.from(role: msg.role, type: nil)
+                let normalizedRole = msg.role?.lowercased()
+
+                // Build event text with sensible fallbacks
+                var text: String?
+                if normalizedRole == "user" {
+                    // Prefer title for user (older OpenCode sometimes placed assistant-style content in body).
+                    text = msg.summary?.title
+                    if (text == nil || text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true) {
+                        text = msg.summary?.body
+                    }
+                } else {
+                    // For assistant/tool/other messages, use body with title fallback
+                    text = msg.summary?.body
+                    if (text == nil || text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true),
+                       let title = msg.summary?.title, !title.isEmpty {
+                        text = title
+                    }
+                }
+
+                let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let isUser = normalizedRole == "user"
+
+                // If this message is purely a tool-call wrapper (common for assistant turns),
+                // rely on tool-part events instead of rendering an empty assistant/tool line.
+                if trimmed.isEmpty && (hasTools || hasToolParts) && !isUser {
+                    // no-op
+                } else if trimmed.isEmpty && !isUser {
+                    // Drop completely empty non-user messages to avoid blank rows.
+                } else {
+                    let event = SessionEvent(
+                        id: effectiveMsgID,
+                        timestamp: ts,
+                        kind: baseKind,
+                        role: msg.role,
+                        text: text,
+                        toolName: nil,
+                        toolInput: nil,
+                        toolOutput: nil,
+                        messageID: effectiveMsgID,
+                        parentID: nil,
+                        isDelta: false,
+                        rawJSON: rawJSON
+                    )
+                    events.append(event)
+                }
+            }
+            // Include tool parts and any other non-text parts (reasoning/step/etc.) as meta so JSON view stays complete.
+            events.append(contentsOf: partEvents.tool)
+            events.append(contentsOf: partEvents.meta)
+        }
+
+        return (events, modelID, commandCount)
+    }
+
+    // MARK: - Tool part helpers
+
+    struct PartEvents {
+        var text: [SessionEvent] = []
+        var tool: [SessionEvent] = []
+        var meta: [SessionEvent] = []
+    }
+
+    private static func loadPartEvents(for msg: MessageJSON,
+                                       storageRoot: URL,
+                                       layout: any OpenCodeStorageLayout,
+                                       legacyIndex: inout [String: [URL]]?,
+                                       fallbackTimestamp: Date?) -> PartEvents {
+        let files = layout.partFiles(forMessageID: msg.id ?? "", storageRoot: storageRoot, legacyIndex: &legacyIndex)
+        if files.isEmpty { return PartEvents() }
+
+        let kind = SessionEventKind.from(role: msg.role, type: nil)
+
+        struct LoadedPart {
+            let url: URL
+            let raw: String
+            let dict: [String: Any]
+            let type: String
+            let start: Date?
+            let fileName: String
+        }
+
+        var loaded: [LoadedPart] = []
+        loaded.reserveCapacity(files.count)
+
+        for file in files {
+            guard let data = try? Data(contentsOf: file),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let typeAny = obj["type"] as? String else {
+                continue
+            }
+            let rawJSON = cappedPartJSON(obj: obj, source: data)
+            let type = typeAny.lowercased()
+            let start = dateFromMillis((obj["time"] as? [String: Any])?["start"])
+                ?? dateFromMillis(((obj["state"] as? [String: Any])?["time"] as? [String: Any])?["start"])
+            loaded.append(LoadedPart(url: file, raw: rawJSON, dict: obj, type: type, start: start, fileName: file.lastPathComponent))
+        }
+
+        loaded.sort { lhs, rhs in
+            ordersBefore(
+                (value: lhs.start, fileName: lhs.fileName),
+                (value: rhs.start, fileName: rhs.fileName)
+            )
+        }
+
+        var parts = PartEvents()
+
+        for part in loaded {
+            let obj = part.dict
+            let partID = (obj["id"] as? String) ?? part.fileName
+            let ts = fallbackTimestamp ?? part.start
+
+            switch part.type {
+            case "text":
+                let text = (obj["text"] as? String) ?? ""
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                parts.text.append(SessionEvent(
+                    id: partID,
+                    timestamp: ts,
+                    kind: kind,
+                    role: msg.role,
+                    text: text,
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: msg.id,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: part.raw
+                ))
+
+            case "tool":
+                let callID = obj["callID"] as? String
+                let toolName = obj["tool"] as? String
+                let state = obj["state"] as? [String: Any] ?? [:]
+                let status = (state["status"] as? String)?.lowercased()
+                let inputStr = stringifyJSON(state["input"])
+                var outputStr = stringifyJSON(state["output"]) ?? stringifyJSON(state["stdout"])
+                if toolName?.lowercased() == "task", let raw = outputStr {
+                    let metadata = state["metadata"] as? [String: Any]
+                    let childID = (metadata?["sessionId"] as? String) ?? (metadata?["sessionID"] as? String)
+                    outputStr = unwrapTaskOutput(raw, childSessionID: childID)
+                }
+                let errorStr = stringifyJSON(state["error"]) ?? stringifyJSON(state["stderr"])
+                let exitCode: Int? = {
+                    let metadata = state["metadata"] as? [String: Any]
+                    let any = metadata?["exit"] ?? state["exit"] ?? state["exitCode"] ?? state["exit_code"]
+                    if let i = any as? Int { return i }
+                    if let d = any as? Double { return Int(d) }
+                    if let s = any as? String { return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                    return nil
+                }()
+
+                func appendExitCode(_ text: String?, exitCode: Int?) -> String? {
+                    guard let exitCode else { return text }
+                    if let text, text.range(of: "Exit Code:", options: [.caseInsensitive]) != nil { return text }
+                    if let text, !text.isEmpty { return text + "\nExit Code: \(exitCode)" }
+                    return "Exit Code: \(exitCode)"
+                }
+
+                let outputWithExit = appendExitCode(outputStr, exitCode: exitCode)
+
+                let timeDict = state["time"] as? [String: Any]
+                let startDate = dateFromMillis(timeDict?["start"]) ?? fallbackTimestamp ?? part.start
+                let endDate = dateFromMillis(timeDict?["end"]) ?? dateFromMillis(timeDict?["start"]) ?? fallbackTimestamp ?? part.start
+
+                let callEvent = SessionEvent(
+                    id: partID + "-call",
+                    timestamp: startDate,
+                    kind: .tool_call,
+                    role: "assistant",
+                    text: nil,
+                    toolName: toolName,
+                    toolInput: inputStr,
+                    toolOutput: nil,
+                    toolCallID: ToolCallID.from(callID),
+                    toolSidecar: callSidecar(state: state),
+                    messageID: callID ?? msg.id,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: part.raw
+                )
+                parts.tool.append(callEvent)
+
+                let isError = status == "error"
+                    || status == "failed"
+                    || (exitCode != nil && exitCode != 0)
+                    || (errorStr?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                let resultKind: SessionEventKind = isError ? .error : .tool_result
+                let resultText: String? = {
+                    let base = (isError && (errorStr?.isEmpty == false)) ? errorStr : outputWithExit
+                    return appendExitCode(base, exitCode: exitCode)
+                }()
+
+                parts.tool.append(SessionEvent(
+                    id: partID + (isError ? "-error" : "-result"),
+                    timestamp: endDate,
+                    kind: resultKind,
+                    role: nil,
+                    text: resultText,
+                    toolName: toolName,
+                    toolInput: nil,
+                    toolOutput: outputWithExit,
+                    toolCallID: ToolCallID.from(callID),
+                    toolSidecar: resultSidecar(state: state, exitCode: exitCode),
+                    messageID: callID ?? msg.id,
+                    parentID: callEvent.id,
+                    isDelta: false,
+                    rawJSON: part.raw
+                ))
+
+            case "reasoning":
+                parts.meta.append(SessionEvent(
+                    id: partID + "-meta",
+                    timestamp: ts,
+                    kind: .meta,
+                    role: msg.role,
+                    text: "[OpenCode reasoning part]",
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: msg.id,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: part.raw
+                ))
+
+            default:
+                parts.meta.append(SessionEvent(
+                    id: partID + "-meta",
+                    timestamp: ts,
+                    kind: .meta,
+                    role: msg.role,
+                    text: "[OpenCode part: \(part.type)]",
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: msg.id,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: part.raw
+                ))
+            }
+        }
+
+        return parts
+    }
+
+    private static func containsToolPart(for messageID: String,
+                                         storageRoot: URL,
+                                         layout: any OpenCodeStorageLayout,
+                                         legacyIndex: inout [String: [URL]]?) -> Bool {
+        let files = layout.partFiles(forMessageID: messageID, storageRoot: storageRoot, legacyIndex: &legacyIndex)
+        if files.isEmpty { return false }
+        for file in files {
+            guard let data = try? Data(contentsOf: file),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = obj["type"] as? String,
+                  type.lowercased() == "tool" else {
+                continue
+            }
+            return true
+        }
+        return false
+    }
+
+    private static func storageDiagnosticsEvents(storageRoot: URL) -> [SessionEvent] {
+        let fm = FileManager.default
+        let diffDir = storageRoot.appendingPathComponent("session_diff", isDirectory: true)
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: diffDir.path, isDirectory: &isDir), isDir.boolValue else {
+            return []
+        }
+        // Only surface a warning when there is actually content.
+        let items = (try? fm.contentsOfDirectory(at: diffDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        if items.isEmpty { return [] }
+
+        let payload = """
+        {"type":"opencode_import_warning","warning":"OpenCode session_diff is present; diffs are not imported yet.","path":"\(diffDir.path)"}
+        """
+        return [
+            SessionEvent(
+                id: "opencode-session-diff-warning",
+                timestamp: nil,
+                kind: .meta,
+                role: nil,
+                text: "OpenCode: session_diff present (diffs not imported).",
+                toolName: nil,
+                toolInput: nil,
+                toolOutput: nil,
+                messageID: nil,
+                parentID: nil,
+                isDelta: false,
+                rawJSON: payload
+            )
+        ]
+    }
+
+    // MARK: - Shared part-event builder (used by both JSON and SQLite paths)
+
+    /// Builds PartEvents from an array of already-parsed part dictionaries.
+    /// Each entry is `(id: partID, dict: parsed JSON dict, rawJSON: original string)`.
+    static func buildPartEvents(
+        for msg: MessageJSON,
+        effectiveMsgID: String? = nil,
+        parts: [(id: String, dict: [String: Any], rawJSON: String)],
+        fallbackTimestamp: Date?
+    ) -> PartEvents {
+        let kind = SessionEventKind.from(role: msg.role, type: nil)
+        let resolvedMsgID = effectiveMsgID ?? msg.id ?? ""
+        var result = PartEvents()
+
+        for (partID, obj, rawJSON) in parts {
+            guard let typeAny = obj["type"] as? String else { continue }
+            let type = typeAny.lowercased()
+            let partStart = dateFromMillis((obj["time"] as? [String: Any])?["start"])
+                ?? dateFromMillis(((obj["state"] as? [String: Any])?["time"] as? [String: Any])?["start"])
+            let ts = fallbackTimestamp ?? partStart
+
+            switch type {
+            case "text":
+                let text = (obj["text"] as? String) ?? ""
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                result.text.append(SessionEvent(
+                    id: partID,
+                    timestamp: ts,
+                    kind: kind,
+                    role: msg.role,
+                    text: text,
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+
+            case "tool":
+                let callID = obj["callID"] as? String
+                let toolName = obj["tool"] as? String
+                let state = obj["state"] as? [String: Any] ?? [:]
+                let status = (state["status"] as? String)?.lowercased()
+                let inputStr = stringifyJSON(state["input"])
+                let outputStr = stringifyJSON(state["output"]) ?? stringifyJSON(state["stdout"])
+                let errorStr = stringifyJSON(state["error"]) ?? stringifyJSON(state["stderr"])
+                let exitCode: Int? = {
+                    let metadata = state["metadata"] as? [String: Any]
+                    let any = metadata?["exit"] ?? state["exit"] ?? state["exitCode"] ?? state["exit_code"]
+                    if let i = any as? Int { return i }
+                    if let d = any as? Double { return Int(d) }
+                    if let s = any as? String { return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                    return nil
+                }()
+
+                func appendExitCode(_ text: String?, exitCode: Int?) -> String? {
+                    guard let exitCode else { return text }
+                    if let text, text.range(of: "Exit Code:", options: [.caseInsensitive]) != nil { return text }
+                    if let text, !text.isEmpty { return text + "\nExit Code: \(exitCode)" }
+                    return "Exit Code: \(exitCode)"
+                }
+
+                let outputWithExit = appendExitCode(outputStr, exitCode: exitCode)
+
+                let timeDict = state["time"] as? [String: Any]
+                let startDate = dateFromMillis(timeDict?["start"]) ?? fallbackTimestamp ?? partStart
+                let endDate = dateFromMillis(timeDict?["end"]) ?? dateFromMillis(timeDict?["start"]) ?? fallbackTimestamp ?? partStart
+
+                let callEvent = SessionEvent(
+                    id: partID + "-call",
+                    timestamp: startDate,
+                    kind: .tool_call,
+                    role: "assistant",
+                    text: nil,
+                    toolName: toolName,
+                    toolInput: inputStr,
+                    toolOutput: nil,
+                    toolCallID: ToolCallID.from(callID),
+                    toolSidecar: callSidecar(state: state),
+                    messageID: callID ?? resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                )
+                result.tool.append(callEvent)
+
+                let isError = status == "error"
+                    || status == "failed"
+                    || (exitCode != nil && exitCode != 0)
+                    || (errorStr?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                let resultKind: SessionEventKind = isError ? .error : .tool_result
+                let resultText: String? = {
+                    let base = (isError && (errorStr?.isEmpty == false)) ? errorStr : outputWithExit
+                    return appendExitCode(base, exitCode: exitCode)
+                }()
+
+                result.tool.append(SessionEvent(
+                    id: partID + (isError ? "-error" : "-result"),
+                    timestamp: endDate,
+                    kind: resultKind,
+                    role: nil,
+                    text: resultText,
+                    toolName: toolName,
+                    toolInput: nil,
+                    toolOutput: outputWithExit,
+                    toolCallID: ToolCallID.from(callID),
+                    toolSidecar: resultSidecar(state: state, exitCode: exitCode),
+                    messageID: callID ?? resolvedMsgID,
+                    parentID: callEvent.id,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+
+            case "reasoning":
+                result.meta.append(SessionEvent(
+                    id: partID + "-meta",
+                    timestamp: ts,
+                    kind: .meta,
+                    role: msg.role,
+                    text: "[OpenCode reasoning part]",
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+
+            default:
+                result.meta.append(SessionEvent(
+                    id: partID + "-meta",
+                    timestamp: ts,
+                    kind: .meta,
+                    role: msg.role,
+                    text: "[OpenCode part: \(type)]",
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+            }
+        }
+
+        return result
+    }
+
+    /// Returns a rawJSON string for a parsed part object, capped at 8 KB.
+    /// Re-serializes from the already-parsed `obj` to guarantee valid JSON.
+    /// Falls back to the original `source` data (hard-truncated) only if re-serialization fails.
+    static func cappedPartJSON(obj: [String: Any], source: Data?, limit: Int = 8192) -> String {
+        if JSONSerialization.isValidJSONObject(obj),
+           let reencoded = try? JSONSerialization.data(withJSONObject: obj),
+           let str = String(data: reencoded, encoding: .utf8) {
+            return str.count > limit ? String(str.prefix(limit)) : str
+        }
+        // Fallback: use source bytes; hard truncation may yield invalid JSON but is safe.
+        guard let source, let str = String(data: source, encoding: .utf8) else { return "" }
+        return str.count > limit ? String(str.prefix(limit)) : str
+    }
+
+    /// The agent-written label (`state.title`) as a sidecar on the call event, or nil without one.
+    static func callSidecar(state: [String: Any]) -> ToolSidecar? {
+        ToolSidecar(agentLabel: ToolCallID.from(state["title"])).orNilIfEmpty
+    }
+
+    /// Exit code (`state.metadata.exit` and the other keys the parser already reads) plus the label.
+    static func resultSidecar(state: [String: Any], exitCode: Int?) -> ToolSidecar? {
+        ToolSidecar(exitCode: exitCode, agentLabel: ToolCallID.from(state["title"])).orNilIfEmpty
+    }
+
+    static func stringifyJSON(_ any: Any?) -> String? {
+        guard let any else { return nil }
+        if let str = any as? String { return str }
+        if let str = ToolJSON.string(from: any, pretty: true) {
+            return str
+        }
+        return String(describing: any)
+    }
+
+    static func dateFromMillis(_ value: Any?) -> Date? {
+        guard let num = value as? NSNumber else { return nil }
+        return Date(timeIntervalSince1970: num.doubleValue / 1000.0)
+    }
+}

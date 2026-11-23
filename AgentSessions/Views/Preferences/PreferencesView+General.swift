@@ -1,0 +1,746 @@
+import SwiftUI
+import CoreServices
+
+extension PreferencesView {
+
+    var generalTab: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("General")
+                .font(.title2)
+                .fontWeight(.semibold)
+
+            sectionHeader("Appearance")
+            VStack(alignment: .leading, spacing: 12) {
+                labeledRow("Theme") {
+                    Picker("", selection: Binding(
+                        get: { indexer.appAppearance },
+                        set: { indexer.setAppearance($0) }
+                    )) {
+                        ForEach(AppAppearance.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .help("Choose the overall app appearance")
+                }
+            }
+
+            sectionHeader("Resume")
+            VStack(alignment: .leading, spacing: 12) {
+                // Terminal app preference for both Codex and Claude resumes
+                labeledRow("Terminal App") {
+                    Picker("", selection: Binding(
+                        get: {
+                            let kind = ResumePreferenceHelpers.resolveTerminalKind()
+                            if detectedTerminals.contains(where: { $0.kind == kind }) {
+                                return kind
+                            }
+                            return detectedTerminals.first?.kind ?? .terminalApp
+                        },
+                        set: { kind in
+                            ResumePreferenceHelpers.setTerminalKind(kind)
+                            let preferITerm = (kind == .iterm2)
+                            let codexMode: CodexLaunchMode
+                            switch kind {
+                            case .iterm2:      codexMode = .iterm
+                            case .warp:        codexMode = .warp
+                            case .warpPreview: codexMode = .warpPreview
+                            case .ghostty:     codexMode = .ghostty
+                            case .macterm:     codexMode = .macterm
+                            default:           codexMode = .terminal
+                            }
+                            resumeSettings.setLaunchMode(codexMode)
+                            claudeSettings.setPreferITerm(preferITerm)
+                            opencodeSettings.setPreferITerm(preferITerm)
+                            copilotSettings.setPreferITerm(preferITerm)
+                            antigravitySettings.setPreferITerm(preferITerm)
+                            cursorSettings.setPreferITerm(preferITerm)
+                            piSettings.setPreferITerm(preferITerm)
+                        }
+                    )) {
+                        ForEach(detectedTerminals) { terminal in
+                            Text(terminal.displayName).tag(terminal.kind)
+                        }
+                    }
+                    .frame(maxWidth: 260)
+                    .help("Choose which terminal application handles Resume for all CLI agents")
+                }
+                Text("Affects Resume actions in the Sessions window for all CLI agents.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            sectionHeader("Active CLI agents")
+            VStack(alignment: .leading, spacing: 6) {
+                // One row per registry entry, in registry order — which is exactly the
+                // order these twelve were hand-listed in. The row label is the
+                // descriptor's `shortLabel` ("Codex", "Copilot", "Kimi Code", …), the
+                // same string the hand-written list carried, and the toggle binding comes
+                // from `agentEnablementBinding(for:)`'s exhaustive switch.
+                let enabledCount = SessionSource.allCases.filter { agentEnablementBinding(for: $0).wrappedValue }.count
+
+                ForEach(SessionSourceRegistry.ordered, id: \.descriptor.source) { adapter in
+                    agentEnableToggle(title: adapter.descriptor.shortLabel,
+                                      source: adapter.descriptor.source,
+                                      isOn: agentEnablementBinding(for: adapter.descriptor.source),
+                                      enabledCount: enabledCount)
+                }
+
+                Text("Disabled agents are hidden across the app and background work is paused.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+            }
+
+        }
+        .onAppear {
+            if detectedTerminals.isEmpty {
+                Task.detached {
+                    let terminals = detectInstalledTerminals()
+                    await MainActor.run {
+                        detectedTerminals = terminals
+                    }
+                }
+            }
+        }
+    }
+
+    var agentCockpitTab: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Quota Meter")
+                .font(.title2)
+                .fontWeight(.semibold)
+
+            sectionHeader("Appearance")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Reduce transparency", isOn: $cockpitReduceTransparency)
+                    .help("Uses a denser window background for better readability over dark or busy wallpapers.")
+                Text("Also respects macOS System Settings > Accessibility > Display > Reduce transparency.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            sectionHeader("Live Sessions BETA")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Enable live session detection (Beta)", isOn: $codexActiveSessionsEnabled)
+                    .help("Beta feature. Tracks live/open Codex and Claude sessions, feeds the Quota Meter's session rows, and powers live dots/focus actions in Sessions.")
+
+                HStack(spacing: 12) {
+                    TextField("Active registry directory (optional)", text: $codexActiveRegistryRootOverride)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 360)
+                        .onSubmit { validateCodexActiveRegistryRootOverride() }
+                        .onChange(of: codexActiveRegistryRootOverride) { _, _ in
+                            validateCodexActiveRegistryRootOverride()
+                            codexActiveRegistryRootDebounce?.cancel()
+                            let work = DispatchWorkItem { validateCodexActiveRegistryRootOverride() }
+                            codexActiveRegistryRootDebounce = work
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+                        }
+                        .help("Override the directory used for active-session presence files. Leave blank to use $CODEX_HOME/active or ~/.codex/active.")
+
+                    Button(action: pickCodexActiveRegistryFolder) {
+                        Label("Choose…", systemImage: "folder")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Browse for a directory containing active-session presence JSON files")
+                }
+
+                if !codexActiveRegistryRootValid {
+                    Label("Path must point to an existing folder", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Text("Status: Beta. Scope in this release: Codex + Claude live/open detection.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text("Default: $CODEX_HOME/active or ~/.codex/active")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            sectionHeader("Quota Meter")
+            VStack(alignment: .leading, spacing: 12) {
+                labeledRow("Show Quota Meter in") {
+                    Picker("", selection: Binding(
+                        get: { QuotaMeterPlacement.current(raw: quotaMeterPlacementRaw) },
+                        set: { quotaMeterPlacementRaw = $0.rawValue }
+                    )) {
+                        ForEach(QuotaMeterPlacement.allCases) { placement in
+                            Text(placement.title).tag(placement)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 320)
+                    .help("Show the Quota Meter in the notch or on the desktop.")
+                }
+
+                Text(QuotaMeterPlacement.current(raw: quotaMeterPlacementRaw).detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if QuotaMeterPlacement.current(raw: quotaMeterPlacementRaw) != .floating {
+                    labeledRow("Notch Style") {
+                        Picker("", selection: Binding(
+                            get: { QuotaMeterNotchStyle.current(raw: quotaMeterNotchStyleRaw) },
+                            set: { quotaMeterNotchStyleRaw = $0.rawValue }
+                        )) {
+                            ForEach(QuotaMeterNotchStyle.allCases) { style in
+                                Text(style.title).tag(style)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 240)
+                        .help("Choose how much of the menu bar the collapsed notch uses.")
+                    }
+
+                    Text(QuotaMeterNotchStyle.current(raw: quotaMeterNotchStyleRaw).detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                labeledRow("Projection") {
+                    Toggle("Show 5h run-out token", isOn: $usageLimitCockpitProjectionEnabled)
+                        .toggleStyle(.checkbox)
+                        .help("Show a compact token such as ▸2h in the Quota Meter when fresh 5h usage samples project exhaustion before reset.")
+                }
+
+                Text("Quota Meter run-out tokens use fresh 5h usage velocity and can show longer before-reset ETAs than notification alerts. This display setting is independent of notification delivery.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                labeledRow("Size") {
+                    Picker("", selection: $quotaMeterEnlarged) {
+                        Text("Standard").tag(false)
+                        Text("Enlarged").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 240)
+                    .help("Enlarged raises every Quota Meter font by one point (provider rows and Session Runway alike) for easier reading, keeping the same relative scale.")
+                }
+
+                labeledRow("Toolbar") {
+                    Picker("", selection: Binding(
+                        get: { QuotaMeterChrome.current(raw: quotaMeterChromeRaw) },
+                        set: { quotaMeterChromeRaw = $0.rawValue }
+                    )) {
+                        ForEach(QuotaMeterChrome.allCases) { chrome in
+                            Text(chrome.title).tag(chrome)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 240)
+                    .help("Controls when the Quota Meter toolbar and reset-credits line appear.")
+                }
+
+                Text(QuotaMeterChrome.current(raw: quotaMeterChromeRaw).detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    var advancedTab: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Advanced")
+                .font(.title2)
+                .fontWeight(.semibold)
+
+            sectionHeader("Saved Sessions")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Save also keeps locally", isOn: $starPinsSessions)
+                    .help("When enabled, saving a session also archives its source files into Agent Sessions storage so it cannot disappear when the upstream CLI prunes history.")
+                HStack(spacing: 12) {
+                    Text("Stop syncing after inactivity")
+                    Picker("", selection: $stopSyncAfterInactivityMinutes) {
+                        Text("10 min").tag(10)
+                        Text("30 min").tag(30)
+                        Text("60 min").tag(60)
+                    }
+                    .labelsHidden()
+                    .frame(width: 120)
+                }
+                .help("After a saved session stops changing upstream for this long, Agent Sessions stops syncing the local copy. If it changes later, syncing resumes.")
+                Toggle("Remove from Saved deletes local copy", isOn: $unstarRemovesArchive)
+                    .help("When enabled, removing a session from Saved also deletes the local archive copy. By default, removing from Saved is non-destructive.")
+            }
+
+            Toggle("Hide Dock icon", isOn: Binding(
+                get: { UserDefaults.standard.object(forKey: PreferencesKey.Advanced.hideDockIcon) as? Bool ?? false },
+                set: { DockIconPreferenceController.setDockIconHidden($0) }
+            ))
+            .help("Removes Agent Sessions from the Dock while the Quota Meter in the notch, or a pinned Quota Meter on the desktop, keeps the app reachable. Hiding the Dock icon without either moves the Quota Meter to the notch.")
+
+            sectionHeader("Claude Archived Sessions")
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Allow restoring archived Claude sessions", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.allowClaudeArchiveRestore) },
+                    set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Advanced.allowClaudeArchiveRestore) }
+                ))
+                .help("Agent Sessions is otherwise read-only. Enabling this lets it modify Claude Desktop's session metadata to un-archive a session. Best done while Claude Desktop is quit, since Claude may overwrite the change. Your transcripts are never altered.")
+                Text("Off by default. Agent Sessions only writes to Claude's files when this is enabled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            sectionHeader("Indexing")
+            VStack(alignment: .leading, spacing: 8) {
+                Button("Rebuild Core Index…") {
+                    showCoreIndexRebuildConfirm = true
+                }
+                .buttonStyle(.borderedProminent)
+                .help("Clear and rebuild the core sessions index. Use only when indexing appears corrupted.")
+
+                Text("This is an advanced repair action and can be CPU-intensive.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+            var unifiedTab: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Unified Window")
+                .font(.title2)
+                .fontWeight(.semibold)
+
+            // Sessions List header removed per guidance; keep content compact
+            VStack(alignment: .leading, spacing: 12) {
+                // Modified Date (moved from General)
+                labeledRow("Modified Date") {
+                    Picker("", selection: $modifiedDisplay) {
+                        ForEach(SessionIndexer.ModifiedDisplay.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: modifiedDisplay) { _, newValue in
+                        indexer.setModifiedDisplay(newValue)
+                    }
+                    .help("Switch between relative and absolute modified timestamps")
+                }
+
+                sectionHeader("Appearance")
+                labeledRow("Agent Accents") {
+                    Picker("", selection: Binding(
+                        get: { stripMonochromeGlobal ? 1 : 0 },
+                        set: { stripMonochromeGlobal = ($0 == 1) }
+                    )) {
+                        Text("Color").tag(0)
+                        Text("Monochrome").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    .help("Choose colored or monochrome styling for agent accents")
+                }
+                Text("Affects usage strips, source labels, and Agent column colors in Sessions.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                sectionHeader("Session View")
+                labeledRow("Auto-scroll in Session View") {
+                    let key = PreferencesKey.Unified.sessionViewAutoScrollTarget
+                    Picker("", selection: Binding(
+                        get: { UserDefaults.standard.string(forKey: key) ?? SessionViewAutoScrollTarget.lastUserPrompt.rawValue },
+                        set: { UserDefaults.standard.set($0, forKey: key) }
+                    )) {
+                        ForEach(SessionViewAutoScrollTarget.allCases) { option in
+                            Text(option.title).tag(option.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 320)
+                    .help("When opening a session without a search query, choose which prompt to jump to in Session view")
+                }
+
+                Toggle("Show Transcript Window", isOn: $unifiedShowTranscriptWindow)
+                    .help("Show or hide the Transcript window in the Unified Window")
+
+                Toggle("Show inline image thumbnails in Session view", isOn: $inlineSessionImageThumbnailsEnabled)
+                    .help("Show small image thumbnails inline in Session view. Thumbnails load after scrolling stops to reduce CPU and I/O during fast scroll.")
+
+                Toggle("Show harness context in Session view", isOn: $sessionShowContext)
+                    .help("Show text the agent’s harness added: instructions, environment, skill files")
+
+                // Columns section
+                sectionHeader("Columns")
+                // First row: three columns to reduce height
+                HStack(spacing: 16) {
+                    Toggle("Session titles", isOn: $columnVisibility.showTitleColumn)
+                        .help("Show or hide the Session title column in the Sessions list")
+                    Toggle("Project names", isOn: $columnVisibility.showProjectColumn)
+                        .help("Show or hide the Project column in the Sessions list")
+                    Toggle("Source column", isOn: Binding(
+                        get: { UserDefaults.standard.bool(forKey: PreferencesKey.Unified.showSourceColumn) },
+                        set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Unified.showSourceColumn) }
+                    ))
+                    .help("Show or hide the Agent source column in the Unified list")
+                }
+                // Second row: remaining columns
+                HStack(spacing: 16) {
+                    Toggle("Message counts", isOn: $columnVisibility.showMsgsColumn)
+                        .help("Show or hide message counts in the Sessions list")
+                    Toggle("Modified date", isOn: $columnVisibility.showModifiedColumn)
+                        .help("Show or hide the modified date column")
+                    Toggle("Size column", isOn: Binding(
+                        get: { UserDefaults.standard.object(forKey: PreferencesKey.Unified.showSizeColumn) as? Bool ?? true },
+                        set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Unified.showSizeColumn) }
+                    ))
+                    .help("Show or hide the file size column in the Unified list")
+                    Toggle("Save", isOn: Binding(
+                        get: { UserDefaults.standard.object(forKey: PreferencesKey.Unified.showStarColumn) as? Bool ?? true },
+                        set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Unified.showStarColumn) }
+                    ))
+                    .help("Show or hide the Save button. Saved sessions can be kept locally to prevent upstream pruning from removing them.")
+                }
+
+                // Filters section
+                sectionHeader("Filters")
+                    .padding(.top, 8)
+                HStack(spacing: 16) {
+                    Toggle("Hide 0-message sessions", isOn: $hideZeroMessageSessionsPref)
+                        .onChange(of: hideZeroMessageSessionsPref) { _, _ in indexer.recomputeNow() }
+                        .help("Exclude sessions that contain no user or assistant messages")
+                    Toggle("Hide 1–2 message sessions", isOn: $hideLowMessageSessionsPref)
+                        .onChange(of: hideLowMessageSessionsPref) { _, _ in indexer.recomputeNow() }
+                        .help("Exclude sessions with only one or two messages (but keep 0-message sessions unless also excluded above)")
+                    Toggle("Hide housekeeping-only sessions", isOn: Binding(
+                        get: { !showHousekeepingSessions },
+                        set: { showHousekeepingSessions = !$0 }
+                    ))
+                    .onChange(of: showHousekeepingSessions) { _, _ in indexer.recomputeNow() }
+                    .help("Exclude sessions that contain no assistant output and no meaningful prompt content (for example Codex rollouts that only captured preamble, or Claude local-command-only transcripts)")
+                    Toggle("Hide sessions without tool calls (strict)", isOn: Binding(
+                        get: { UserDefaults.standard.bool(forKey: PreferencesKey.Unified.hasCommandsOnly) },
+                        set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Unified.hasCommandsOnly) }
+                    ))
+                    .help("Exclude sessions that contain no recorded tool/command calls. Strict: Claude and Antigravity are excluded unless tool calls are present in the parsed transcript.")
+                }
+
+                Divider()
+                Toggle("Skip preambles when parsing (Codex + Claude)", isOn: Binding(
+                    get: {
+                        let d = UserDefaults.standard
+                        if d.object(forKey: PreferencesKey.Unified.skipAgentsPreamble) == nil { return true }
+                        return d.bool(forKey: PreferencesKey.Unified.skipAgentsPreamble)
+                    },
+                    set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Unified.skipAgentsPreamble); indexer.recomputeNow() }
+                ))
+                .help("Ignore Codex Agents.md instructions and Claude local-command caveats when deriving titles and jumping to the first prompt (content remains visible)")
+
+                sectionHeader("Rich Transcript")
+                Toggle("Enable review cards for Codex internal review JSON", isOn: $transcriptEnableReviewCards)
+                    .help("When enabled, recognized Codex internal review payloads render as summary cards instead of raw JSON.")
+                Toggle("Enable file-link click targets in transcript", isOn: $transcriptEnableLinkification)
+                    .help("Turn file path references like Foo.swift:56 into clickable links that open in your editor.")
+                Toggle("Show line numbers for code and diff blocks", isOn: $transcriptEnableCodeDiffLineNumbers)
+                    .help("Show per-block line numbers for semantic code and diff transcript blocks.")
+                labeledRow("Preferred Editor") {
+                    Picker("", selection: Binding(
+                        get: { IDEOpener.Target(rawValue: transcriptPreferredIDETargetRaw) ?? .systemDefault },
+                        set: { transcriptPreferredIDETargetRaw = $0.rawValue }
+                    )) {
+                        Text("System Default").tag(IDEOpener.Target.systemDefault)
+                        Text("Cursor").tag(IDEOpener.Target.cursor)
+                        Text("VS Code").tag(IDEOpener.Target.vscode)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 340)
+                    .help("Choose which app receives transcript file links.")
+                }
+                labeledRow("Editor CLI Override") {
+                    TextField("Optional binary path (for Cursor/VS Code)", text: $transcriptIDEBinaryOverridePath)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 420)
+                        .help("Optional override for the editor CLI binary used for line-targeted opens.")
+                }
+            }
+
+            // Usage Tracking moved to General pane
+        }
+    }
+
+}
+
+private extension PreferencesView {
+    /// THE one place this pane names the `…AgentEnabled` `@AppStorage` properties.
+    /// Exhaustive on purpose: a new source must say which preference its row reads
+    /// instead of falling through a `default:` onto somebody else's toggle.
+    func agentEnablementBinding(for source: SessionSource) -> Binding<Bool> {
+        switch source {
+        case .codex:       return $codexAgentEnabled
+        case .claude:      return $claudeAgentEnabled
+        case .antigravity: return $antigravityAgentEnabled
+        case .opencode:    return $openCodeAgentEnabled
+        case .hermes:      return $hermesAgentEnabled
+        case .copilot:     return $copilotAgentEnabled
+        case .droid:       return $droidAgentEnabled
+        case .openclaw:    return $openClawAgentEnabled
+        case .cursor:      return $cursorAgentEnabled
+        case .pi:          return $piAgentEnabled
+        case .kimi:        return $kimiAgentEnabled
+        case .grok:        return $grokAgentEnabled
+        case .qwen:        return $qwenAgentEnabled
+        case .devin:       return $devinAgentEnabled
+        case .fx:          return $fxAgentEnabled
+        case .cline:       return $clineAgentEnabled
+        case .deepseekHarness: return $deepSeekHarnessAgentEnabled
+        }
+    }
+
+    func agentEnableToggle(title: String, source: SessionSource, isOn: Binding<Bool>, enabledCount: Int) -> some View {
+        let availability = AgentEnablement.availabilityStatus(for: source)
+        let isCurrentlyOn = isOn.wrappedValue
+        let canDisable = !(enabledCount == 1 && isCurrentlyOn)
+        let canEnable = availability.isAvailable || isCurrentlyOn
+        let accent = Color.agentColor(for: source, monochrome: stripMonochromeGlobal)
+
+        return Toggle(isOn: Binding(
+            get: { isOn.wrappedValue },
+            set: { newValue in
+                _ = AgentEnablement.setEnabled(source, enabled: newValue)
+            }
+        )) {
+            HStack {
+                Text(title)
+                    .foregroundStyle(accent)
+                    .opacity(isCurrentlyOn ? 1.0 : 0.6)
+                Spacer()
+                Text(availability.statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .disabled(!(canDisable && canEnable))
+    }
+}
+
+// MARK: - Terminal detection helpers
+
+struct DetectedTerminal: Identifiable {
+    let kind: TerminalKind
+    var id: String { kind.rawValue }
+    var displayName: String { kind.displayName }
+}
+
+private func detectInstalledTerminals() -> [DetectedTerminal] {
+    let candidates: [TerminalKind] = [.terminalApp, .iterm2, .warp, .warpPreview, .ghostty, .macterm]
+    return candidates.filter { kind in
+        guard let bundle = kind.bundleIdentifier else { return false }
+        return isTerminalInstalled(bundleId: bundle)
+    }.map { DetectedTerminal(kind: $0) }
+}
+
+private func isTerminalInstalled(bundleId: String) -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+    process.arguments = ["kMDItemCFBundleIdentifier == '\(bundleId)'"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    try? process.run()
+    process.waitForExit()
+    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+}
+
+
+/// Settings → Search: which parts of the chats are searched and how much each counts,
+/// how results are shown, and the index behind them. Every default works with no setup.
+struct SearchPreferencesPane: View {
+    @AppStorage(SearchPreferences.Key.prefixWhileTyping) private var prefixWhileTyping = true
+    @AppStorage(SearchPreferences.Key.bestMatchFirst) private var bestMatchFirst = true
+    @AppStorage(SearchPreferences.Key.excerptLines) private var excerptLines = 2
+    @AppStorage(SearchPreferences.Key.subagents) private var subagents = SearchPreferences.Subagents.fold.rawValue
+    @AppStorage(SearchPreferences.Key.oneRowPerChat) private var oneRowPerChat = true
+    @AppStorage(SearchPreferences.Key.indexToolOutput) private var indexToolOutput = true
+    /// Field choices live in plain defaults keys; bumping this redraws their rows.
+    @State private var fieldsVersion = 0
+    @State private var coverage: (indexed: Int, total: Int, bytes: Int64)?
+    @State private var confirmRebuild = false
+    @State private var confirmToolOutputOff = false
+    @State private var offerRebuildForToolOutput = false
+
+    var body: some View {
+        let _ = fieldsVersion
+        VStack(alignment: .leading, spacing: LayoutTokens.md) {
+            Text("Search")
+                .font(.title2)
+                .fontWeight(.semibold)
+
+            header("Fields")
+            Grid(alignment: .leading, horizontalSpacing: LayoutTokens.lg, verticalSpacing: LayoutTokens.sm) {
+                GridRow {
+                    Text("Search in")
+                    Text("Counts")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                ForEach(TranscriptField.allCases) { field in
+                    let available = field != .toolOutput || indexToolOutput
+                    GridRow {
+                        Toggle(field.label, isOn: isOn(field))
+                            .disabled(!available)
+                            .help(available ? "" : String(localized: "Tool output is not indexed. Turn on Index tool output below.",
+                                                          comment: "Settings, Search: why the Tool output field cannot be searched."))
+                        Picker("", selection: weight(field)) {
+                            Text("Less").tag(-1)
+                            Text("Normal").tag(0)
+                            Text("More").tag(1)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .fixedSize()
+                        .accessibilityLabel(String(localized: "How much \(field.label) counts",
+                                                   comment: "Accessibility label for a field weight control in Settings, Search."))
+                        .disabled(!available || !isOn(field).wrappedValue)
+                    }
+                }
+            }
+            Text("Title counts most and tool output least. A rare phrase in a reply still beats a common word in a title.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Restore Defaults") {
+                SearchPreferences.resetFields()
+                fieldsVersion += 1
+            }
+
+            header("Matching")
+            Toggle("Match the start of the last word while typing", isOn: $prefixWhileTyping)
+            Text("“deplo” finds “deployment” before you finish the word.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            header("Results")
+            PreferenceKeyValueRow(label: "Order") {
+                Picker("", selection: $bestMatchFirst) {
+                    Text("Best match first").tag(true)
+                    Text("Newest first").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+            }
+            PreferenceKeyValueRow(label: "Passage under each title") {
+                Picker("", selection: $excerptLines) {
+                    Text("1 line").tag(1)
+                    Text("2 lines").tag(2)
+                    Text("3 lines").tag(3)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+            }
+            PreferenceKeyValueRow(label: "Sub-agent chats") {
+                Picker("", selection: $subagents) {
+                    Text("Fold into the parent chat").tag(SearchPreferences.Subagents.fold.rawValue)
+                    Text("Show as separate rows").tag(SearchPreferences.Subagents.separate.rawValue)
+                    Text("Leave out").tag(SearchPreferences.Subagents.hide.rawValue)
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+            Toggle("List a chat stored in several files as one row", isOn: $oneRowPerChat)
+            Text("Changes apply to the next search.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            header("Index")
+            Toggle("Index tool output", isOn: Binding(
+                get: { indexToolOutput },
+                set: { on in
+                    if on { indexToolOutput = true; offerRebuildForToolOutput = true } else { confirmToolOutputOff = true }
+                }))
+            Text(indexToolOutput
+                 ? "Tool output is most of the searchable text. Words found only in tool output stop matching when this is off."
+                 : "Tool output is not indexed. After turning this on, rebuild the index to search it again.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let coverage {
+                VStack(alignment: .leading, spacing: LayoutTokens.xs) {
+                    HStack {
+                        Text("\(coverage.indexed) of \(coverage.total) sessions indexed")
+                        Spacer()
+                        Text("\(ByteCountFormatter.string(fromByteCount: coverage.bytes, countStyle: .file)) on disk")
+                            .foregroundStyle(.secondary)
+                    }
+                    ProgressView(value: Double(min(coverage.indexed, coverage.total)), total: Double(max(coverage.total, 1)))
+                }
+                Text("Sessions not indexed yet are found only by their first part, after the ranked results.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Rebuild Search Index…") { confirmRebuild = true }
+            Text("Rebuilding reads every session again in the background. On a large history it can take an hour.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task { await loadCoverage() }
+        .alert("Rebuild the search index?", isPresented: $confirmRebuild) {
+            Button("Rebuild") { NotificationCenter.default.post(name: .requestSearchIndexRebuild, object: nil) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Every session is read again in the background. Search keeps working meanwhile.")
+        }
+        .alert("Stop indexing tool output?", isPresented: $confirmToolOutputOff) {
+            Button("Remove Tool Output", role: .destructive) {
+                indexToolOutput = false
+                Task {
+                    try? await IndexDB().clearField(.toolOutput)
+                    await loadCoverage()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Tool output is removed from the search index now. Getting it back means rebuilding the index.")
+        }
+        .alert("Rebuild to search tool output?", isPresented: $offerRebuildForToolOutput) {
+            Button("Rebuild") { NotificationCenter.default.post(name: .requestSearchIndexRebuild, object: nil) }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("Sessions indexed while it was off have no tool output in the index until it is rebuilt.")
+        }
+    }
+
+    private func header(_ title: LocalizedStringResource) -> some View {
+        VStack(alignment: .leading, spacing: LayoutTokens.sm) {
+            Text(title)
+                .font(.headline)
+                .fontWeight(.semibold)
+            Divider()
+        }
+        .padding(.top, LayoutTokens.sm)
+    }
+
+    private func isOn(_ field: TranscriptField) -> Binding<Bool> {
+        Binding(get: { UserDefaults.standard.object(forKey: SearchPreferences.Key.fieldOn(field)) as? Bool ?? true },
+                set: { UserDefaults.standard.set($0, forKey: SearchPreferences.Key.fieldOn(field)); fieldsVersion += 1 })
+    }
+
+    private func weight(_ field: TranscriptField) -> Binding<Int> {
+        Binding(get: { UserDefaults.standard.integer(forKey: SearchPreferences.Key.fieldWeight(field)) },
+                set: { UserDefaults.standard.set($0, forKey: SearchPreferences.Key.fieldWeight(field)); fieldsVersion += 1 })
+    }
+
+    private func loadCoverage() async {
+        guard let db = try? IndexDB(), let counts = try? await db.fieldCoverage() else { return }
+        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+        let bytes = ["index.db", "index.db-wal"].reduce(Int64(0)) { total, name in
+            guard let path = folder?.appendingPathComponent(name).path,
+                  let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber else { return total }
+            return total + size.int64Value
+        }
+        coverage = (counts.indexed, counts.total, bytes)
+    }
+}
+

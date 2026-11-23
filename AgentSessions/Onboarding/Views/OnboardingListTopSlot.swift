@@ -1,0 +1,1002 @@
+import SwiftUI
+import AppKit
+
+/// Lightweight container mounted at the top of the session list. It hosts exactly
+/// one card — What's New, then Quota Meter, then star, then feedback, then the
+/// translation invitation, steward invitation, then the contribute-an-agent
+/// invitation (the last two ask for the most work, targeted before generic) —
+/// and carries the sheets for the compact What's New panel, the Quota Meter
+/// explainer, and the standalone feedback prompt. Renders nothing when there
+/// is nothing to show.
+///
+/// Order is activation before extraction: the Quota Meter card asks the user to
+/// try something, the star and feedback cards ask them for something. Feedback
+/// waits for 10 sessions or 14 days regardless, so the two rarely compete.
+///
+/// The star card outranks feedback because it terminates — see
+/// `OnboardingCoordinator.shouldShowStarCard()`.
+struct OnboardingListTopSlot: View {
+    @ObservedObject var coordinator: OnboardingCoordinator
+    /// Which quota providers the user actually has sessions for. Kept per
+    /// provider rather than collapsed to one Bool: activation needs to enable
+    /// only what applies, and a single "has either" flag makes that impossible
+    /// by the time it reaches the activator.
+    let providers: QuotaMeterProviderAvailability
+    /// Session-derived targeting is not trustworthy until the initial index
+    /// snapshot has arrived. What's New may still be selected before this.
+    let audienceReady: Bool
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(PreferencesKey.codexUsageEnabled) private var codexUsageEnabled: Bool = false
+    @AppStorage(PreferencesKey.claudeUsageEnabled) private var claudeUsageEnabled: Bool = false
+    /// Measured pane width, handed to every card so its actions can move below
+    /// the copy in a narrow window. Zero
+    /// until the first layout pass; see `WrappingSlotCard.paneWidth`.
+    ///
+    /// Safe against a layout loop: it feeds a card's internal arrangement, which
+    /// changes the card's height, and the width being measured comes from the
+    /// pane above and never from the card.
+    @State private var paneWidth: CGFloat = 0
+    /// Lets the ✕ on a forced card actually dismiss it, so the override can be
+    /// clicked through like the real thing instead of being pinned on screen.
+    @State private var debugCardDismissed = false
+    /// Frozen after the first eligible selection. Resolving or exhausting one
+    /// card therefore leaves the slot empty until the next app launch.
+    @State private var selectedCard: TopSlotCardSelection?
+
+    private var palette: OnboardingPalette { OnboardingPalette(colorScheme: colorScheme) }
+
+    private var usageEnabled: Bool { codexUsageEnabled || claudeUsageEnabled }
+
+    /// Tracking alone is not "using it": the data flows but the window may never
+    /// have been opened. Both must be true to retire the card.
+    private var isQuotaMeterActive: Bool {
+        usageEnabled && coordinator.hasEverOpenedCockpit
+    }
+
+    var body: some View {
+        Group {
+            // Ahead of the whole chain on purpose: the point of the override is
+            // to see one card regardless of what would otherwise hold the slot.
+            if let override = TopSlotDebugOverride.current, !debugCardDismissed {
+                debugCard(override)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
+            } else if !coordinator.didConsumeTopSlotAskThisLaunch, let selectedCard {
+                selectedCardView(selectedCard)
+                    .onAppear { coordinator.noteTopSlotCardShown(selectedCard) }
+                    .padding(.horizontal, 10)
+                    .padding(.top, 8)
+            }
+        }
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: SlotWidthKey.self, value: proxy.size.width)
+            }
+        )
+        .onPreferenceChange(SlotWidthKey.self) { paneWidth = $0 }
+        // The intro is evaluated before the card on purpose: shown at audience-ready, it keeps
+        // the Quota Meter card out of this launch.
+        .onAppear {
+            evaluateNotchIntro()
+            chooseTopSlotCardIfNeeded()
+        }
+        .onChange(of: audienceReady) { _, _ in
+            evaluateNotchIntro()
+            chooseTopSlotCardIfNeeded()
+        }
+        // The setup window or the What's New panel closing lets a waiting intro appear.
+        .onChange(of: coordinator.presentation) { _, _ in evaluateNotchIntro() }
+        .onChange(of: coordinator.isWhatsNewPanelPresented) { _, _ in evaluateNotchIntro() }
+        // Codex or Claude sessions can land in an index update after the audience is ready.
+        .onChange(of: providers) { _, _ in evaluateNotchIntro() }
+    }
+
+    private func evaluateNotchIntro() {
+        guard coordinator.notchIntroVariant == nil, !coordinator.notchIntroSettledThisLaunch,
+              TopSlotDebugOverride.current == nil else { return }
+        let input = NotchIntroInput(
+            alreadyShown: UserDefaults.standard.bool(forKey: QuotaMeterNotchIntro.shownKey),
+            audienceReady: audienceReady,
+            hasCodex: providers.hasCodex,
+            hasClaude: providers.hasClaude,
+            codexTracking: codexUsageEnabled,
+            claudeTracking: claudeUsageEnabled,
+            resolvesToNotch: QuotaMeterPresentationCoordinator.shared.resolvesToStrip(),
+            notchHidden: UserDefaults.standard.bool(forKey: PreferencesKey.quotaMeterStripHidden),
+            blockingSurfaceOpen: coordinator.presentation != nil || coordinator.isWhatsNewPanelPresented,
+            quotaMeterCardOnScreen: selectedCard == .quotaMeter || coordinator.quotaMeterCardShownThisLaunch
+        )
+        if input.audienceReady, !input.blockingSurfaceOpen, coordinator.notchIntroAudienceReadyAt == nil {
+            coordinator.notchIntroAudienceReadyAt = Date()
+        }
+        let elapsed = coordinator.notchIntroAudienceReadyAt.map { Date().timeIntervalSince($0) }
+        switch QuotaMeterNotchIntro.decision(for: input, secondsSinceAudienceReady: elapsed) {
+        case .show(let variant):
+            coordinator.notchIntroSettledThisLaunch = true
+            coordinator.presentNotchIntro(variant)
+        case .settle:
+            coordinator.notchIntroSettledThisLaunch = true
+        case .wait:
+            break
+        }
+    }
+
+    private func chooseTopSlotCardIfNeeded() {
+        guard selectedCard == nil, !coordinator.didConsumeTopSlotAskThisLaunch else { return }
+        guard TopSlotDebugOverride.current == nil else { return }
+        if coordinator.whatsNewMajorMinor != nil {
+            selectedCard = coordinator.selectWhatsNewTopSlotCard()
+            return
+        }
+        guard audienceReady else { return }
+        selectedCard = coordinator.selectTopSlotCard(
+            hasCodexOrClaudeSessions: providers.hasAny,
+            isQuotaMeterActive: isQuotaMeterActive
+        )
+    }
+
+    @ViewBuilder
+    private func selectedCardView(_ card: TopSlotCardSelection) -> some View {
+        switch card {
+        case let .whatsNew(version):
+            WhatsNewCard(
+                palette: palette,
+                majorMinor: version,
+                teaser: WhatsNewCatalog.teaser(for: version),
+                onOpen: { coordinator.openWhatsNewFromCard(version: version) },
+                onDismiss: { coordinator.dismissWhatsNewCard() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteWhatsNewCardShown() }
+        case .quotaMeter:
+            QuotaMeterCard(
+                palette: palette,
+                needsUsageEnabled: !usageEnabled,
+                onOpen: { coordinator.isQuotaMeterPromoPresented = true },
+                onSnooze: { coordinator.suppressQuotaMeterCardThisLaunch() },
+                onDismiss: { coordinator.dismissQuotaMeterAskForever() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteQuotaMeterCardShown() }
+        case .star:
+            StarCard(
+                palette: palette,
+                onOpen: openRepository,
+                onSnooze: { coordinator.snoozeStarAsk() },
+                onDismiss: { coordinator.dismissStarAskForever() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteStarCardShown() }
+        case .feedback:
+            FeedbackCard(
+                palette: palette,
+                onOpen: { coordinator.isFeedbackPromptPresented = true },
+                onSnooze: { coordinator.suppressFeedbackCardThisLaunch() },
+                onDismiss: { coordinator.dismissFeedbackAskForever() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteFeedbackCardShown() }
+        case .language:
+            LanguageContributeCard(
+                palette: palette,
+                onOpen: openLanguageContribution,
+                onLearnMore: openLocalizationGuide,
+                onSnooze: { coordinator.snoozeLanguageAsk() },
+                onDismiss: { coordinator.dismissLanguageAskForever() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteLanguageCardShown() }
+        case let .steward(agent):
+            StewardCard(
+                palette: palette,
+                agent: agent,
+                onSignUp: { openStewardSignup(for: agent) },
+                onLearnMore: openStewardGuide,
+                onDismiss: { coordinator.dismissStewardAskForever() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteStewardCardShown() }
+        case .contribute:
+            ContributeCard(
+                palette: palette,
+                onOpen: openContributeForm,
+                onLearnMore: openContributeGuide,
+                onSnooze: { coordinator.snoozeContributeAsk() },
+                onDismiss: { coordinator.dismissContributeAskForever() },
+                paneWidth: paneWidth
+            )
+            .onAppear { coordinator.noteContributeCardShown() }
+        }
+    }
+
+    /// The star card's one side effect. Kept here rather than in the coordinator
+    /// so that stays a pure state machine, matching `QuotaMeterPromoActivator`.
+    /// Opening the page is the whole action — nothing is sent anywhere.
+    private func openRepository() {
+        // Only retire the ask if the page actually opened. If no browser is
+        // available the click did nothing, and recording it as answered would
+        // silently cost the user the ask they just tried to accept.
+        guard NSWorkspace.shared.open(OnboardingCoordinator.githubRepositoryURL) else { return }
+        coordinator.recordStarOpened()
+    }
+
+    /// Both contribute actions open a public page and nothing else — no session
+    /// data is read, and nothing is sent anywhere. Same success guard as the
+    /// star card: a click that opened no browser must not spend the ask.
+    private func openContributeForm() {
+        guard NSWorkspace.shared.open(OnboardingCoordinator.contributeAgentSourceURL) else { return }
+        coordinator.recordContributeOpened()
+    }
+
+    private func openContributeGuide() {
+        guard NSWorkspace.shared.open(OnboardingCoordinator.contributeGuideURL) else { return }
+        coordinator.recordContributeOpened()
+    }
+
+    /// Translation links carry no locale, session, or device data. As with the
+    /// other contribution card, only a successful browser open retires the ask.
+    private func openLanguageContribution() {
+        guard NSWorkspace.shared.open(OnboardingCoordinator.languageContributionURL) else { return }
+        coordinator.recordLanguageContributionOpened()
+    }
+
+    private func openLocalizationGuide() {
+        guard NSWorkspace.shared.open(OnboardingCoordinator.localizationGuideURL) else { return }
+        coordinator.recordLanguageContributionOpened()
+    }
+
+    /// Opens the signup form with the agent pre-filled. Same success guard as the
+    /// other cards: a click that opened no browser must not spend the ask. Only
+    /// the agent's name leaves the app — see `stewardSignupURL(for:)`.
+    private func openStewardSignup(for agent: StewardAgent) {
+        guard NSWorkspace.shared.open(OnboardingCoordinator.stewardSignupURL(for: agent)) else { return }
+        coordinator.recordStewardSignupOpened()
+    }
+
+    private func openStewardGuide() {
+        guard NSWorkspace.shared.open(OnboardingCoordinator.stewardGuideURL) else { return }
+        coordinator.recordStewardGuideOpened()
+    }
+
+    /// A forced card, wired to the real destinations but to none of the ask
+    /// lifecycles. The links open exactly what they open in production — worth
+    /// clicking, since that is the only way to see the prefilled signup form —
+    /// while nothing here records an impression, spends a round, or dismisses an
+    /// ask forever. Looking at a card must not cost the user the real one.
+    @ViewBuilder
+    private func debugCard(_ override: TopSlotDebugOverride) -> some View {
+        switch override {
+        case let .whatsNew(version):
+            WhatsNewCard(
+                palette: palette,
+                majorMinor: version,
+                teaser: WhatsNewCatalog.teaser(for: version),
+                // Opens the real panel — that side is worth looking at — but
+                // routes around `openWhatsNewFromCard` so viewing the card
+                // cannot retire the version for real.
+                onOpen: { coordinator.openWhatsNewPanel(version: version) },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        case .quotaMeter:
+            QuotaMeterCard(
+                palette: palette,
+                needsUsageEnabled: true,
+                onOpen: { debugCardDismissed = true },
+                onSnooze: { debugCardDismissed = true },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        case .feedback:
+            FeedbackCard(
+                palette: palette,
+                onOpen: { debugCardDismissed = true },
+                onSnooze: { debugCardDismissed = true },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        case .star:
+            StarCard(
+                palette: palette,
+                onOpen: { _ = NSWorkspace.shared.open(OnboardingCoordinator.githubRepositoryURL) },
+                onSnooze: { debugCardDismissed = true },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        case let .steward(agent):
+            StewardCard(
+                palette: palette,
+                agent: agent,
+                onSignUp: { _ = NSWorkspace.shared.open(OnboardingCoordinator.stewardSignupURL(for: agent)) },
+                onLearnMore: { _ = NSWorkspace.shared.open(OnboardingCoordinator.stewardGuideURL) },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        case .contribute:
+            ContributeCard(
+                palette: palette,
+                onOpen: { _ = NSWorkspace.shared.open(OnboardingCoordinator.contributeAgentSourceURL) },
+                onLearnMore: { _ = NSWorkspace.shared.open(OnboardingCoordinator.contributeGuideURL) },
+                onSnooze: { debugCardDismissed = true },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        case .language:
+            LanguageContributeCard(
+                palette: palette,
+                onOpen: { _ = NSWorkspace.shared.open(OnboardingCoordinator.languageContributionURL) },
+                onLearnMore: { _ = NSWorkspace.shared.open(OnboardingCoordinator.localizationGuideURL) },
+                onSnooze: { debugCardDismissed = true },
+                onDismiss: { debugCardDismissed = true },
+                paneWidth: paneWidth
+            )
+        }
+    }
+}
+
+/// Forces one top-slot card on screen so it can be looked at in a running app.
+///
+/// The asks this slot holds are all gated behind weeks of retention and a
+/// spent-once lifecycle, so there is no way to reach most of them by hand — the
+/// steward card additionally needs sessions of an unstewarded agent in the
+/// index. Rather than hand-editing `UserDefaults` into a state that then sticks,
+/// pass the card as a launch argument, which lands in the volatile argument
+/// domain and leaves nothing behind when the app quits:
+///
+/// ```
+/// open <built>.app --args -AgentSessionsDebugTopSlotCard qwen
+/// ```
+///
+/// Accepts `quota`, `feedback`, `star`, `whatsnew` (optionally
+/// `whatsnew:5.1` to pick the version), `language`, `contribute`, or any
+/// `SessionSource` raw value listed in
+/// `StewardAskEligibility.stewardlessAgents` (`qwen`, `grok`, `cursor`, …).
+/// Debug builds only: `current` is a compile-time nil elsewhere, so no release
+/// build can be argued into showing a card it has not earned.
+///
+/// This shows a card's *appearance* — copy, layout, wrapping, light and dark. It
+/// deliberately does not exercise the lifecycles: every action below hides the
+/// override instead of calling the coordinator, so looking at a card here cannot
+/// spend the real ask. State transitions are covered by the unit tests, not by
+/// this.
+enum TopSlotDebugOverride {
+    case whatsNew(String)
+    case quotaMeter
+    case star
+    case feedback
+    case steward(StewardAgent)
+    case contribute
+    case language
+
+    static let defaultsKey = "AgentSessionsDebugTopSlotCard"
+
+    static var current: TopSlotDebugOverride? {
+        #if DEBUG
+        guard let raw = UserDefaults.standard.string(forKey: defaultsKey) else { return nil }
+        return parse(raw, buildMajorMinor: buildMajorMinor)
+        #else
+        nil
+        #endif
+    }
+
+    #if DEBUG
+    /// This build's own major.minor, which a bare `whatsnew` renders so the card
+    /// shows the copy about to ship rather than an archived entry.
+    ///
+    /// A `let` rather than a computed property: the Info dictionary cannot change
+    /// while the process runs, and `current` is read on every render of the slot.
+    private static let buildMajorMinor = OnboardingContent.currentMajorMinor()
+
+    /// The raw-value grammar, split out from `current` so it can be tested
+    /// without writing to `UserDefaults.standard`. `buildMajorMinor` is passed in
+    /// for the same reason: the bare `whatsnew` case stays deterministic.
+    static func parse(_ raw: String, buildMajorMinor: String?) -> TopSlotDebugOverride? {
+        // Literals first: none of them is a `SessionSource` raw value, and
+        // matching them here keeps the agent lookup from having to know about
+        // the cards that are not agents.
+        if raw == "contribute" { return .contribute }
+        if raw == "feedback" { return .feedback }
+        if raw == "language" { return .language }
+        if raw == "quota" { return .quotaMeter }
+        if raw == "star" { return .star }
+        if raw == "whatsnew" || raw.hasPrefix("whatsnew:") {
+            let requested = String(raw.dropFirst("whatsnew".count).drop(while: { $0 == ":" }))
+            if !requested.isEmpty { return .whatsNew(requested) }
+            // No version asked for and none to fall back on: decline rather than
+            // invent one, which would render a card for a version that is not
+            // this build's and may have no catalog entry.
+            guard let buildMajorMinor else { return nil }
+            return .whatsNew(buildMajorMinor)
+        }
+        guard let source = SessionSource(rawValue: raw),
+              let agent = StewardAskEligibility.stewardlessAgents.first(where: { $0.source == source })
+        else { return nil }
+        return .steward(agent)
+    }
+    #endif
+}
+
+/// Carries the slot's measured width up from a background reader.
+private struct SlotWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// One link-style action in a slot card's action row.
+struct SlotCardAction: Identifiable {
+    let id: String
+    let title: LocalizedStringResource
+    /// The card's primary action, drawn semibold. At most one per card.
+    let isProminent: Bool
+    let perform: () -> Void
+
+}
+
+/// Shared, adaptive chrome for every top-slot card. At narrow pane widths the
+/// actions move below the copy instead of squeezing or truncating it.
+///
+/// In one row, the actions are laid beside the text and take a fixed width, so
+/// every pixel the pane loses comes out of the text column. Below
+/// `minimumWideWidth` there is not enough left for a sentence — at the session
+/// list's 320pt minimum the contribute card's column fell under the width of the
+/// word "contributions", and SwiftUI broke it mid-word into "contributio / ns".
+/// Under that threshold the actions move below the text and wrap among
+/// themselves, so the text always gets the full width.
+struct WrappingSlotCard: View {
+    let palette: OnboardingPalette
+    let iconName: String
+    let iconTint: Color
+    let title: LocalizedStringResource
+    let message: LocalizedStringResource?
+    let actions: [SlotCardAction]
+    let dismissHelp: LocalizedStringResource
+    var usesTipStyle: Bool = false
+    var onDismiss: () -> Void
+    /// Width of the slot, measured by `OnboardingListTopSlot`. Zero before the
+    /// first layout pass, which is read as wide: most windows are, and starting
+    /// wide avoids a visible flip on the common path.
+    var paneWidth: CGFloat = 0
+
+    /// Pane width below which the actions wrap under the text.
+    ///
+    /// Derived from the widest action row here — the contribute card's three
+    /// links need roughly 320pt — plus the icon, the card's own padding, and
+    /// about 200pt of text column, under which an 11pt sentence stops reading as
+    /// a sentence. Shared by every card rather than computed per card: some
+    /// could stay wide slightly longer, but gain nothing from switching at a
+    /// different width than their neighbours.
+    static let minimumWideWidth: CGFloat = 560
+
+    /// Indent that lines the wrapped action row up with the text column above it.
+    private static let textColumnIndent: CGFloat = 24
+
+    /// Whether the actions wrap under the text. Internal rather than private so
+    /// the threshold's behaviour at the list's minimum width can be tested
+    /// without rendering.
+    var prefersCompactLayout: Bool { paneWidth > 0 && paneWidth < Self.minimumWideWidth }
+
+    var body: some View {
+        Group {
+            if prefersCompactLayout {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top, spacing: 10) {
+                        icon
+                        textColumn
+                        Spacer(minLength: 8)
+                        dismissButton
+                    }
+                    Flow(spacing: 12) {
+                        ForEach(actions) { actionButton($0) }
+                    }
+                    .padding(.leading, Self.textColumnIndent)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    icon
+                    textColumn
+                    Spacer(minLength: 8)
+                    ForEach(actions) { actionButton($0) }
+                    dismissButton
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(usesTipStyle ? palette.tipFill : palette.rowFill))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(usesTipStyle ? palette.tipStroke : palette.rowStroke, lineWidth: 1))
+    }
+
+    private var icon: some View {
+        Image(systemName: iconName)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(iconTint)
+    }
+
+    private var textColumn: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.primary)
+                // Titles here carry agent names and run longer than the
+                // single-line cards' do. Wrapping beats truncating to "Help ad…".
+                .fixedSize(horizontal: false, vertical: true)
+            if let message {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func actionButton(_ action: SlotCardAction) -> some View {
+        Button(action.title, action: action.perform)
+            .buttonStyle(.link)
+            .font(.system(size: 12, weight: action.isProminent ? .semibold : .regular))
+    }
+
+    private var dismissButton: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help(Text(dismissHelp))
+        .accessibilityLabel(Text(dismissHelp))
+        .frame(minWidth: 28, minHeight: 28)
+        .contentShape(Rectangle())
+    }
+}
+
+/// Invitation to steward one specific agent — the one the user's own sessions
+/// show they run.
+///
+/// Three exits, one fewer than the contribute card: sign up, read what the job
+/// is, or never. There is no "Maybe later" because the ask already re-arms on a
+/// release bump, and a snooze button on top of that would only add a second way
+/// to say the thing silence already says.
+struct StewardCard: View {
+    let palette: OnboardingPalette
+    let agent: StewardAgent
+    var onSignUp: () -> Void
+    var onLearnMore: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    /// A question, not a statement of the project's problem. The card is asking
+    /// the reader to volunteer, so it opens by qualifying them — someone who does
+    /// not use this agent can stop reading at the first two words. Held as static
+    /// functions so tests can pin the claims without rendering the view.
+    static func titleText(for agent: StewardAgent) -> LocalizedStringResource {
+        "Use \(agent.stewardName)?"
+    }
+
+    /// Opens with the ask, then the reason, then what it costs. Qwen keeps its own
+    /// reason because its situation is genuinely different: every other agent here
+    /// can at least be spot-checked by the maintainer, and Qwen cannot be checked
+    /// at all. No version or month is quoted — `STEWARDS.md`, one click away
+    /// behind "What's involved", carries the precise footnote and can be kept
+    /// current without shipping a build.
+    static func bodyText(for agent: StewardAgent) -> LocalizedStringResource {
+        if agent.source == .qwen {
+            return """
+                Looking for a steward. Qwen's free tier ended, so newer builds go unverified here. \
+                One command, a few times a year. No code, nothing shared.
+                """
+        }
+        return """
+            Looking for a steward to help keep Agent Sessions reading it correctly when the format \
+            moves. One command, a few times a year. No code, nothing shared.
+            """
+    }
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "checkmark.seal",
+            iconTint: Color(nsColor: SessionSourceRegistry.resolvedBrandAccent(for: agent.source)),
+            title: Self.titleText(for: agent),
+            message: Self.bodyText(for: agent),
+            actions: [
+                SlotCardAction(id: "become-steward", title: "Become the steward", isProminent: true, perform: onSignUp),
+                SlotCardAction(id: "whats-involved", title: "What's involved", isProminent: false, perform: onLearnMore)
+            ],
+            dismissHelp: "Don't ask again",
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+/// Dismissible invitation to translate Agent Sessions into another language.
+///
+/// This uses the wrapping card chrome because translated actions and body copy
+/// must remain readable at the session list's minimum width.
+struct LanguageContributeCard: View {
+    let palette: OnboardingPalette
+    var onOpen: () -> Void
+    var onLearnMore: () -> Void
+    var onSnooze: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    static let titleText: LocalizedStringResource = "Speak another language?"
+    static let bodyText: LocalizedStringResource = """
+        Agent Sessions is now available in English and Simplified Chinese. Help bring it to your \
+        language—no Swift required.
+        """
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "character.book.closed",
+            iconTint: palette.accentBlue,
+            title: Self.titleText,
+            message: Self.bodyText,
+            actions: [
+                SlotCardAction(id: "help-translate", title: "Help translate", isProminent: true, perform: onOpen),
+                SlotCardAction(id: "translation-guide", title: "Translation guide", isProminent: false, perform: onLearnMore),
+                SlotCardAction(id: "maybe-later", title: "Maybe later", isProminent: false, perform: onSnooze)
+            ],
+            dismissHelp: "Don't ask again",
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+/// Dismissible one-time invitation to add support for another coding agent.
+///
+/// Four exits, because the ask has four honest answers: contribute, read what it
+/// involves first, ask me later, or never. Both open actions are terminal — a
+/// user who went to look has been asked.
+struct ContributeCard: View {
+    let palette: OnboardingPalette
+    var onOpen: () -> Void
+    var onLearnMore: () -> Void
+    var onSnooze: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    /// The card's own copy, held as a constant only so the frozen privacy
+    /// sentence can be pinned by a test. Deliberately not a strings file — every
+    /// other card in this slot keeps its copy inline too. No source count is
+    /// stated here: that number changes every release.
+    static let titleText: LocalizedStringResource = "Help add another agent"
+    static let bodyText: LocalizedStringResource = """
+        Agent Sessions adds new agents from user contributions — a pull request, your coding agent \
+        working from our brief, or a sanitized sample. Never share real transcripts, keys, or \
+        private paths.
+        """
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "puzzlepiece.extension",
+            iconTint: palette.accentBlue,
+            title: Self.titleText,
+            message: Self.bodyText,
+            actions: [
+                SlotCardAction(id: "contribute-agent", title: "Contribute an agent", isProminent: true, perform: onOpen),
+                SlotCardAction(id: "how-it-works", title: "How it works", isProminent: false, perform: onLearnMore),
+                SlotCardAction(id: "maybe-later", title: "Maybe later", isProminent: false, perform: onSnooze)
+            ],
+            dismissHelp: "Don't ask again",
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+/// Dismissible "Track your Codex and Claude quota" banner.
+struct QuotaMeterCard: View {
+    let palette: OnboardingPalette
+    let needsUsageEnabled: Bool
+    var onOpen: () -> Void
+    var onSnooze: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "gauge.with.dots.needle.50percent",
+            iconTint: palette.accentBlue,
+            title: "Know your quota before it runs out",
+            message: "A pinned window with Codex and Claude limits, and how fast each session burns them.",
+            actions: [
+                SlotCardAction(
+                    id: "quota-meter-setup",
+                    title: needsUsageEnabled ? "Set up" : "Preview",
+                    isProminent: true,
+                    perform: onOpen
+                ),
+                SlotCardAction(id: "not-now", title: "Not now", isProminent: false, perform: onSnooze)
+            ],
+            dismissHelp: "Don't ask again",
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+extension View {
+    /// Attaches the What's New panel and feedback-prompt sheets to a stable,
+    /// always-present anchor. The cards themselves live in `OnboardingListTopSlot`,
+    /// but that slot renders empty once the card is dismissed — and a `.sheet` on an
+    /// empty view can fail to present — so the sheets must hang off the list pane,
+    /// which is always on screen (Help → What's New relies on this).
+    /// `providers` scopes what the Quota Meter promo's activation may switch on.
+    func onboardingSheets(
+        coordinator: OnboardingCoordinator,
+        quotaMeterProviders: QuotaMeterProviderAvailability = QuotaMeterProviderAvailability()
+    ) -> some View {
+        self
+            .sheet(isPresented: Binding(
+                get: { coordinator.isWhatsNewPanelPresented },
+                set: { coordinator.isWhatsNewPanelPresented = $0 }
+            )) {
+                WhatsNewPanelView(
+                    coordinator: coordinator,
+                    majorMinor: coordinator.whatsNewPanelVersion ?? coordinator.whatsNewMajorMinor ?? "",
+                    onClose: { coordinator.isWhatsNewPanelPresented = false }
+                )
+            }
+            .sheet(isPresented: Binding(
+                get: { coordinator.isFeedbackPromptPresented },
+                set: { coordinator.isFeedbackPromptPresented = $0 }
+            )) {
+                FeedbackPromptView(
+                    coordinator: coordinator,
+                    onFinished: { coordinator.isFeedbackPromptPresented = false }
+                )
+            }
+            .sheet(isPresented: Binding(
+                get: { coordinator.isQuotaMeterPromoPresented },
+                set: { coordinator.isQuotaMeterPromoPresented = $0 }
+            )) {
+                QuotaMeterPromoActivator(coordinator: coordinator, providers: quotaMeterProviders)
+            }
+            .sheet(isPresented: Binding(
+                get: { coordinator.notchIntroVariant != nil },
+                set: { if !$0 { coordinator.completeNotchIntro(activated: false) } }
+            )) {
+                NotchIntroActivator(coordinator: coordinator, providers: quotaMeterProviders)
+            }
+    }
+}
+
+/// Which quota providers a user actually has sessions for. The Quota Meter
+/// reports Codex and Claude quota only, so this both gates the card and decides
+/// what activation is allowed to switch on.
+struct QuotaMeterProviderAvailability: Equatable {
+    var hasCodex: Bool = false
+    var hasClaude: Bool = false
+
+    var hasAny: Bool { hasCodex || hasClaude }
+}
+
+/// Owns the one side-effectful step the promo has: turning usage tracking on and
+/// putting the Quota Meter on screen. Kept out of `QuotaMeterPromoView` so that
+/// view stays presentation-only, and kept here because the sheet's host is the
+/// list pane, which is always mounted.
+private struct QuotaMeterPromoActivator: View {
+    @ObservedObject var coordinator: OnboardingCoordinator
+    let providers: QuotaMeterProviderAvailability
+    @AppStorage(PreferencesKey.codexUsageEnabled) private var codexUsageEnabled: Bool = false
+    @AppStorage(PreferencesKey.claudeUsageEnabled) private var claudeUsageEnabled: Bool = false
+
+    /// Only counts providers the user actually has: a Codex-only user whose
+    /// Claude tracking happens to be off does not need "Enable", and switching
+    /// Claude on for them would just start a probe against a CLI they may not
+    /// have.
+    private var needsUsageEnabled: Bool {
+        (providers.hasCodex && !codexUsageEnabled) || (providers.hasClaude && !claudeUsageEnabled)
+    }
+
+    var body: some View {
+        QuotaMeterPromoView(
+            coordinator: coordinator,
+            needsUsageEnabled: needsUsageEnabled,
+            onActivate: activate,
+            onClose: { coordinator.isQuotaMeterPromoPresented = false }
+        )
+    }
+
+    private func activate() {
+        // Enable before opening: the Quota Meter renders "Usage tracking is off"
+        // otherwise, which would make the promo deliver an empty box.
+        QuotaMeterActivation.enableTracking(for: providers)
+        coordinator.recordQuotaMeterActivated()
+        QuotaMeterPresentationCoordinator.shared.showQuotaMeter()
+    }
+}
+
+/// The one consented step both Quota Meter invitations share (the list card's promo and
+/// the notch intro's Turn On).
+enum QuotaMeterActivation {
+    /// Only the providers the user has sessions for, and only ever switching on — never
+    /// off, so an existing preference for the other provider survives untouched.
+    @MainActor
+    static func enableTracking(for providers: QuotaMeterProviderAvailability,
+                               defaults: UserDefaults = .standard) {
+        if providers.hasCodex {
+            defaults.set(true, forKey: PreferencesKey.codexUsageEnabled)
+        }
+        if providers.hasClaude {
+            defaults.set(true, forKey: PreferencesKey.claudeUsageEnabled)
+        }
+    }
+}
+
+/// Hosts the notch intro dialog and carries out its buttons. Kept beside
+/// `QuotaMeterPromoActivator` for the same reason: the list pane's sheet host is always
+/// mounted, and the dialog view stays presentation-only.
+private struct NotchIntroActivator: View {
+    @ObservedObject var coordinator: OnboardingCoordinator
+    let providers: QuotaMeterProviderAvailability
+    /// The variant stays drawn while the sheet animates away; `notchIntroVariant` turns nil
+    /// as soon as a button is pressed, and an empty sheet would shrink mid-dismissal.
+    @State private var shownVariant: NotchIntroVariant?
+
+    var body: some View {
+        if let variant = coordinator.notchIntroVariant ?? shownVariant {
+            NotchIntroView(variant: variant,
+                           onPrimary: { primary(variant) },
+                           onSecondary: { coordinator.completeNotchIntro(activated: false) })
+                .onAppear { shownVariant = variant }
+        }
+    }
+
+    private func primary(_ variant: NotchIntroVariant) {
+        switch variant {
+        case .alreadyInNotch:
+            coordinator.completeNotchIntro(activated: false)
+        case .moveToNotch, .unhideNotch, .turnOnTracking:
+            if variant == .turnOnTracking {
+                QuotaMeterActivation.enableTracking(for: providers)
+            }
+            QuotaMeterPresentationCoordinator.shared.moveToNotch()
+            coordinator.completeNotchIntro(activated: true)
+            // Show where it went, with the user's own data.
+            QuotaMeterPresentationCoordinator.shared.peekStrip()
+        }
+    }
+}
+
+/// Dismissible "✨ What's New in X.Y" banner.
+struct WhatsNewCard: View {
+    let palette: OnboardingPalette
+    let majorMinor: String
+    let teaser: LocalizedStringResource?
+    var onOpen: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "sparkles",
+            iconTint: palette.accentBlue,
+            title: "What's New in \(majorMinor)",
+            message: teaser,
+            actions: [
+                SlotCardAction(id: "see-whats-new", title: "See what's new", isProminent: true, perform: onOpen)
+            ],
+            dismissHelp: "Dismiss this update",
+            usesTipStyle: true,
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+/// Dismissible "star the repo" card, shown once the retention bar is met.
+///
+/// Three exits, because the ask has three honest answers: star it, ask me later,
+/// or never. `star.circle` rather than a bare `star` — the session list already
+/// spends that glyph on per-session favourites one row below.
+struct StarCard: View {
+    let palette: OnboardingPalette
+    var onOpen: () -> Void
+    var onSnooze: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "star.circle",
+            iconTint: palette.accentBlue,
+            title: "Leave a star if this helps",
+            message: "A star helps others find this project. Opens GitHub; nothing is sent.",
+            actions: [
+                SlotCardAction(id: "open-github", title: "Open GitHub", isProminent: true, perform: onOpen),
+                SlotCardAction(id: "maybe-later", title: "Maybe later", isProminent: false, perform: onSnooze)
+            ],
+            dismissHelp: "Don't ask again",
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+/// Dismissible feedback card (shown only when What's New is absent and the
+/// feedback ask is due).
+struct FeedbackCard: View {
+    let palette: OnboardingPalette
+    var onOpen: () -> Void
+    var onSnooze: () -> Void
+    var onDismiss: () -> Void
+    var paneWidth: CGFloat = 0
+
+    var body: some View {
+        WrappingSlotCard(
+            palette: palette,
+            iconName: "text.bubble",
+            iconTint: palette.accentBlue,
+            title: "Help make Agent Sessions better",
+            message: "What's the one thing you wish Agent Sessions did better?",
+            actions: [
+                SlotCardAction(id: "share-feedback", title: "Share feedback", isProminent: true, perform: onOpen),
+                SlotCardAction(id: "not-now", title: "Not now", isProminent: false, perform: onSnooze)
+            ],
+            dismissHelp: "Don't ask again",
+            onDismiss: onDismiss,
+            paneWidth: paneWidth
+        )
+    }
+}
+
+#if DEBUG
+/// The steward card at the pane widths that actually occur: the session list's
+/// 320pt minimum, a typical split, and a wide window. The contribute card sits
+/// and translation cards sit underneath as references — all three use the same
+/// wrapping chrome and must behave at the same real pane widths.
+private struct StewardCardPreviewMatrix: View {
+    let colorScheme: ColorScheme
+
+    private static let qwen = StewardAgent(source: .qwen, stewardName: "Qwen Code")
+    /// The longest name in the list — the worst case for the title.
+    private static let copilot = StewardAgent(source: .copilot, stewardName: "GitHub Copilot CLI")
+
+    var body: some View {
+        let palette = OnboardingPalette(colorScheme: colorScheme)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                ForEach([CGFloat(340), 520, 900], id: \.self) { width in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("— \(Int(width))pt pane —")
+                            .font(.system(size: 11, weight: .heavy))
+                            .foregroundStyle(.secondary)
+                        VStack(spacing: 8) {
+                            StewardCard(palette: palette, agent: Self.qwen,
+                                        onSignUp: {}, onLearnMore: {}, onDismiss: {},
+                                        paneWidth: width)
+                            StewardCard(palette: palette, agent: Self.copilot,
+                                        onSignUp: {}, onLearnMore: {}, onDismiss: {},
+                                        paneWidth: width)
+                            ContributeCard(palette: palette, onOpen: {}, onLearnMore: {},
+                                           onSnooze: {}, onDismiss: {}, paneWidth: width)
+                            LanguageContributeCard(palette: palette, onOpen: {}, onLearnMore: {},
+                                                   onSnooze: {}, onDismiss: {}, paneWidth: width)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(width: width)
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .environment(\.colorScheme, colorScheme)
+    }
+}
+
+#Preview("StewardCard • Light") { StewardCardPreviewMatrix(colorScheme: .light) }
+#Preview("StewardCard • Dark") { StewardCardPreviewMatrix(colorScheme: .dark) }
+#endif

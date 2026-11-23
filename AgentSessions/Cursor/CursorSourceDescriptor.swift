@@ -1,0 +1,191 @@
+import Foundation
+import Combine
+import SwiftUI
+import AppKit
+
+extension SessionSourceDescriptor {
+    static let cursor: SessionSourceDescriptor = {
+        let isBinaryInstalled: (AvailabilityContext) -> Bool = { ctx in
+            ctx.detectBinary("agent") || ctx.detectBinary("cursor") || ctx.detectBinary("cursor-agent")
+        }
+        return SessionSourceDescriptor(
+            source: .cursor,
+            telemetry: TelemetryCapabilities(
+                configuration: .partial(
+                    "current model comes from loaded Session metadata; Cursor transcripts do not record first-observed model or model-change history"),
+                tokens: .unavailable(
+                    "Cursor Agent transcript JSONL and chat metadata do not record attributable token components"),
+                cost: .unavailable(
+                    "Cursor Agent does not expose audited local pricing or billable token components"),
+                weeklyQuota: .unavailable("Cursor Agent does not expose a compatible account quota feed")
+            ),
+            scanTelemetry: { session in
+                CursorTelemetryReader.loadTelemetry(for: session)
+            },
+            telemetryRevision: { session in
+                CursorTelemetryReader.telemetryRevision(for: session)
+            },
+            telemetryBackendAvailable: { session in
+                CursorTelemetryReader.isSupportedSession(session)
+            },
+            shortLabel: "Cursor",
+            badgeInitials: "CR",
+            // Teal-ish (Cursor brand).
+            brandHue: .calibrated(red: 0.20, green: 0.60, blue: 0.70),
+            monochromeWhite: 0.9,
+            onboardingAccent: { _ in Color(red: 0.20, green: 0.60, blue: 0.70) },
+            enablementKey: PreferencesKey.Agents.cursorEnabled,
+            cliAvailableKey: PreferencesKey.cursorCLIAvailable,
+            rootOverrideKeys: [PreferencesKey.Paths.cursorSessionsRootOverride],
+            includeKey: PreferencesKey.Include.cursor,
+            binaryNames: ["agent", "cursor", "cursor-agent"],
+            isBinaryInstalled: isBinaryInstalled,
+            isAvailable: { ctx in
+                let custom = ctx.customRoot(PreferencesKey.Paths.cursorSessionsRootOverride)
+                let disc = CursorSessionDiscovery(customRoot: custom)
+                // Also check the chats root (DB-only sessions live there). The live switch
+                // does this before the shared sessions-root check, so the order is kept.
+                if ctx.directoryExists(disc.chatsRoot()) { return true }
+                if ctx.directoryExists(disc.acpSessionsRoot()) { return true }
+                if ctx.directoryExists(disc.sessionsRoot()) { return true }
+                return isBinaryInstalled(ctx)
+            },
+            defaultEnabled: .whenAvailable,
+            parseFullByPath: { url in
+                CursorACPStoreReader.isACPStore(url)
+                    ? CursorACPStoreReader.parse(at: url)
+                    : CursorSessionParser.parseFileFull(at: url)
+            },
+            parseFullByIdentity: nil,
+            searchUsesIdentityAtURL: nil,
+            logicalFileStat: { CursorACPStoreReader.logicalFileStat(at: $0) },
+            archive: ArchiveCapability(
+                backfillURLs: { defaults in
+                    var map: [String: URL] = [:]
+                    let custom = defaults.string(forKey: PreferencesKey.Paths.cursorSessionsRootOverride)
+                    let discovery = CursorSessionDiscovery(customRoot: custom?.isEmpty == false ? custom : nil)
+                    for url in discovery.discoverSessionFiles() {
+                        if let s = CursorSessionParser.parseFile(at: url), !s.id.isEmpty {
+                            map[s.id] = url
+                        }
+                    }
+                    for url in discovery.discoverACPSessionDBs() ?? [] {
+                        // Discovery already proved the canonical UUID directory,
+                        // store, and sidecar boundary. Keep the URL even when the
+                        // SQLite graph is temporarily unreadable so the backfill
+                        // arm can publish a provenance-preserving minimal row.
+                        let folder = url.deletingLastPathComponent().lastPathComponent
+                        guard let uuid = UUID(uuidString: folder) else { continue }
+                        map["cursor-acp:" + uuid.uuidString.lowercased()] = url
+                    }
+                    return map
+                },
+                sessionForBackfill: { sessionID, upstreamURL in
+                    if CursorACPStoreReader.isACPStore(upstreamURL) {
+                        return CursorACPStoreReader.parse(at: upstreamURL)
+                            ?? SessionArchiveBackfill.minimalSession(
+                                source: .cursor,
+                                id: sessionID,
+                                url: upstreamURL,
+                                originator: "cursor-agent",
+                                originSource: "acp-persisted",
+                                surface: .acp
+                            )
+                    }
+                    return CursorSessionParser.parseFile(at: upstreamURL)
+                        ?? SessionArchiveBackfill.minimalSession(source: .cursor, id: sessionID, url: upstreamURL)
+                },
+                archiveUnit: { url in
+                    guard CursorACPStoreReader.isACPStore(url),
+                          url.deletingLastPathComponent().lastPathComponent != "data" else { return nil }
+                    return ArchiveUnit(root: url.deletingLastPathComponent(),
+                                       isDirectory: true,
+                                       primaryRelativePath: "store.db")
+                },
+                manifestEntries: { upstream, primary in
+                    guard primary == "store.db",
+                          upstream.lastPathComponent != "store.db",
+                          CursorACPStoreReader.isACPStore(
+                              upstream.appendingPathComponent("store.db", isDirectory: false)
+                          ),
+                          let files = try? FileManager.default.contentsOfDirectory(at: upstream,
+                                                                                   includingPropertiesForKeys: [],
+                                                                                   options: [.skipsHiddenFiles]) else { return nil }
+                    // SQLite's -shm file is a rebuildable WAL index, not durable
+                    // session content. Keep it out of the archive manifest so
+                    // normal read-only opens cannot invalidate a saved session.
+                    let allowed = Set(["store.db", "meta.json", "store.db-wal"])
+                    var entries: [String] = []
+                    for file in files where allowed.contains(file.lastPathComponent) {
+                        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+                              let type = attrs[.type] as? FileAttributeType,
+                              type == .typeRegular else { return nil }
+                        entries.append(file.lastPathComponent)
+                    }
+                    guard entries.contains("store.db"), entries.contains("meta.json") else { return nil }
+                    return entries.sorted()
+                },
+                // A live SQLite store can commit into a WAL while the archive is
+                // being copied. Never replace a healthy archive with an unchecked
+                // best-effort snapshot after the bounded retry loop.
+                requiresStableSnapshot: true
+            ),
+            supportsResume: true,
+            resumeAgentLabel: "Cursor CLI",
+            otherAgentPill: PillSpec(color: Color.agentCursor, shortcut: "8")
+        )
+    }()
+}
+
+// MARK: - Adapter
+
+extension SessionSourceAdapter {
+    /// Descriptor + runtime factory for cursor (SPEC §3.2). `makeRuntime` runs once,
+    /// from `SessionProviderCatalog.init`; every closure below captures only the local
+    /// `indexer`, never `self` or the catalog (SPEC §3.4 retain-cycle rule).
+    static let cursor = SessionSourceAdapter(
+        descriptor: .cursor,
+        makeRuntime: {
+            let indexer = CursorSessionIndexer()
+            return SourceRuntime(
+                source: .cursor,
+                indexerObject: indexer,
+                handle: UnifiedSessionIndexer.ProviderHandle(
+                    allSessions: indexer.$allSessions.eraseToAnyPublisher(),
+                    isIndexing: indexer.$isIndexing.eraseToAnyPublisher(),
+                    isProcessingTranscripts: indexer.$isProcessingTranscripts.eraseToAnyPublisher(),
+                    filesProcessed: indexer.$filesProcessed.eraseToAnyPublisher(),
+                    totalFiles: indexer.$totalFiles.eraseToAnyPublisher(),
+                    indexingError: indexer.$indexingError.eraseToAnyPublisher(),
+                    launchPhase: indexer.$launchPhase.eraseToAnyPublisher(),
+                    currentSessions: { indexer.allSessions },
+                    currentIsIndexing: { indexer.isIndexing },
+                    currentLaunchPhase: { indexer.launchPhase },
+                    searchIdentitySnapshots: .notApplicable,
+                    refresh: { mode, trigger, profile in
+                        indexer.refresh(mode: mode, trigger: trigger, executionProfile: profile)
+                    },
+                    reloadFocusedSession: { id, force, trigger in
+                        let reason: CursorSessionIndexer.ReloadReason
+                        switch trigger {
+                        case .selection: reason = .selection
+                        case .monitor: reason = .focusedSessionMonitor
+                        case .manual: reason = .manualRefresh
+                        }
+                        indexer.reloadSession(id: id, force: force, reason: reason)
+                    }
+                ),
+                // Transcribed verbatim from UnifiedSessionsView.init's adapter dictionary.
+                searchAdapter: .init(
+                    transcriptCache: indexer.searchTranscriptCache,
+                    update: { indexer.updateSession($0) },
+                    parseFull: { url, forcedID in
+                        CursorACPStoreReader.isACPStore(url)
+                            ? CursorACPStoreReader.parse(at: url)
+                            : CursorSessionParser.parseFileFull(at: url, forcedID: forcedID)
+                    }
+                )
+            )
+        }
+    )
+}

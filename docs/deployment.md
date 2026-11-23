@@ -1,0 +1,852 @@
+# Agent Sessions Deployment Runbook
+
+This document is the canonical deployment runbook for all agents (Claude, Codex, OpenCode, Xcode, manual shell). Always treat this file as the single source of truth for how releases are built, signed, notarized, and published.
+
+
+This runbook provides a **fully automated deployment process** with comprehensive validation, retry logic, automated testing, and verification.
+
+## One-screen cheat sheet
+
+**Recommended first step**:
+- Run the pre-release QA checklist: `docs/release/pre-release-qa.md`
+
+**Workspace rule (mandatory)**:
+- Deploy only from the user’s current local repository checkout.
+- Do not use temporary clones or alternate worktrees to bypass a dirty tree.
+- If `git status --short` is not clean, stop and ask the user to clean/stash/commit before any deploy command.
+
+**Version format rule**:
+- Major and minor releases use `X.Y` (for example `3.1`).
+- Patch releases use `X.Y.Z` (for example `3.1.1`).
+- Never publish `X.Y.0`.
+
+**Core commands** (run from repo root):
+- `tools/release/deploy changelog [FROM_TAG]`
+- `tools/release/deploy qa --version <VERSION>`
+- `tools/release/deploy bump [patch|minor|major]`
+- `git push origin main`
+- `tools/release/deploy qa --version <VERSION>` — optional: `release` auto-runs QA when no valid stamp exists and the tree is fully clean; run it explicitly only to front-load the wait or inspect QA output separately
+- `tools/release/deploy release <VERSION>`
+- `tools/release/deploy status` — anytime during a release: shows whether the pipeline is running, its current phase (build/notarize), the checkpoint, and recent log lines. Use this before assuming a long build is stalled (Release builds take ~8-12 min).
+- `tools/release/deploy verify <VERSION>`
+
+## Sparkle Update Integrity (Appcast + Signatures)
+
+- **Appcast file**: `docs/appcast.xml` (committed to `main`)
+- **Served from**: GitHub Pages over HTTPS at `https://jazzyalex.github.io/agent-sessions/appcast.xml`
+- **Update payloads**: DMGs are hosted on GitHub Releases over HTTPS (the appcast `enclosure url` should point to `https://github.com/jazzyalex/agent-sessions/releases/...`)
+- **Signing (recommended by Sparkle)**: Appcast generation uses Sparkle’s `generate_appcast`, which produces EdDSA signatures for update enclosures.
+
+**Key environment flags**:
+- `SKIP_CONFIRM=1` — make bump and release flows unattended (suppresses confirmation prompts where supported).
+- `RELEASE_NOTES_REVIEWED=1` — required with `SKIP_CONFIRM=1` before publishing Sparkle appcast notes; set it only after inspecting the printed Sparkle notes preview.
+- In unattended mode, manual smoke checks are reported as post-deploy reminders rather than blocking prompts, but Sparkle release notes still require explicit review.
+- `NOTARIZE_SYNC=1` — use legacy blocking notarization instead of background polling.
+- `UPDATE_CASK=1` — update the Homebrew tap via GitHub API.
+- Notary auth is resolved in this order:
+  - App Store Connect API key: `NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, and optional `NOTARY_ISSUER` (aliases: `ASC_PRIVATE_KEY`/`ASC_PRIVATE_KEY_PATH`, `ASC_KEY_ID`, `ASC_ISSUER_ID`).
+  - Apple ID app-specific password: `NOTARY_APPLE_ID`, `NOTARY_PASSWORD`, and `NOTARY_TEAM_ID` or `TEAM_ID`.
+  - Keychain profile: `NOTARY_PROFILE`, default `AgentSessionsNotary`.
+
+**Log locations** (see troubleshooting for details):
+- Unified deploy log: `tools/release/deploy` prints the path (in `/tmp`) when running `release`.
+- Verification log: `/tmp/deploy-<VERSION>.log`.
+- Notarization log: `/tmp/notarization-<VERSION>-<timestamp>.log`.
+
+## Quick Start (Unified Tool)
+
+The entire deployment workflow is now handled by a single unified tool: `tools/release/deploy`
+
+### Typical Release Workflow
+
+```bash
+# 0. Run recommended pre-release QA checklist first
+# docs/release/pre-release-qa.md
+
+# 1. Review what changed since last release
+tools/release/deploy changelog
+
+# 2. Run release-candidate QA before mutating release metadata
+tools/release/deploy qa --version 2.8
+
+# 3. Bump version (patch/minor/major)
+tools/release/deploy bump minor
+
+# 4. Push version bump to GitHub
+git push origin main
+
+# 5. Re-run QA on the exact pushed version-bump commit that will be released
+tools/release/deploy qa --version 2.8
+
+# 6. Deploy the release
+tools/release/deploy release 2.8
+
+# 7. Verify deployment (runs automatically, but can re-run)
+tools/release/deploy verify 2.8
+
+# 8. After the release is published: record the released price manifest.
+#    Set sequence and fingerprint in docs/prices-v2.released.json to the values
+#    the released build bundles (RunwayPriceTable.makeForTesting().sequence and
+#    .manifestFingerprint), in a commit of its own.
+```
+
+### Quick Patch Release
+
+```bash
+# QA is required before bump; bump enforces it automatically.
+tools/release/deploy qa --version 2.7.2
+tools/release/deploy bump patch
+git push origin main
+tools/release/deploy qa --version 2.7.2
+tools/release/deploy release 2.7.2
+```
+
+## Unified Tool Subcommands
+
+### `deploy bump [major|minor|patch]`
+Automatically increments version and updates CHANGELOG:
+- Auto-increments build number (critical for Sparkle)
+- Updates MARKETING_VERSION in project.pbxproj (2 occurrences)
+- Moves [Unreleased] to [VERSION] in CHANGELOG.md
+- Creates git commit with version bump
+- Shows diff for review before committing
+- Respects `SKIP_CONFIRM=1` to skip interactive confirmations when running unattended
+
+### `deploy release VERSION`
+Full deployment pipeline with enhanced safety:
+- ✅ **Fresh QA stamp required** (from `tools/release/deploy qa --version VERSION`, unless explicitly skipped)
+- ✅ **Comprehensive dependency validation** (all required tools)
+- ✅ **Enhanced pre-flight checks** (git state, version validation, build numbers)
+- ✅ **Build, sign, and notarize** (Apple Developer ID)
+- ✅ **DMG smoke testing** (mount, verify signature, check version)
+- ✅ **Sparkle appcast generation** (Sparkle `generate_appcast`, EdDSA signatures)
+- ✅ **GitHub release creation** (idempotent, can re-run)
+- ✅ **Homebrew cask update** (via GitHub API)
+- ✅ **Network retry logic** (3 attempts, 5s backoff)
+- ✅ **Cache propagation waits** (GitHub Pages, Homebrew)
+- ✅ **Automated verification** (8+ critical checks)
+- ✅ **Auto-rollback prompt** (if verification fails)
+- ✅ **Structured logging** (saved to /tmp/release-VERSION-timestamp.log)
+
+### `deploy verify VERSION`
+Post-deployment verification (runs automatically after release):
+- GitHub Release assets uploaded and downloadable
+- Appcast has correct version, EdDSA signature, release URLs
+- Documentation links updated (README.md, docs/index.html)
+- Homebrew cask updated to correct version
+- DMG downloadable and correct size
+- SHA256 checksums match
+- Git tags exist locally and remotely
+- GitHub/API checks retry transient network failures before reporting an error. If verification still fails with a classified timeout or temporary API/network failure, rerun verification before rollback.
+
+### `deploy changelog [FROM_TAG]`
+Generate CHANGELOG from conventional commits:
+- Auto-detects last tag if not specified
+- Extracts feat/fix/perf/refactor/docs commits
+- Groups into CHANGELOG sections (Added, Fixed, Performance, etc.)
+- Shows commit breakdown by category
+- Offers to save snippet file for easy copying when run interactively; in unattended/non-interactive runs it prints the preview and exits successfully without modifying files.
+
+### `deploy qa [--version VERSION]`
+Release-candidate QA gate:
+- Shows scope since the last release tag
+- Requires a clean `main` checkout synced with `origin/main`
+- Runs the CI docs-drift and docs-publication guards
+- Requires the pinned Xcode toolchain from `tools/release/ci-xcode-version.txt`
+- Validates the committed localization catalogs before building
+- Runs the no-signing Debug `xcodebuild` with `-destination 'platform=macOS'` and `.deriveddata-localization`
+- Runs the localization extraction-drift validator against the build's `Objects-normal` output
+- Runs the stable XCTest wrapper
+- Runs Python release/script tests
+- Prints a warning sweep from the build log
+- Writes a QA stamp tied to the current git `HEAD` and target version only after every gate passes; `deploy release VERSION` and `deploy resume` require this stamp unless `--skip-qa` or `SKIP_QA=1` is explicit
+
+The localization build and extraction check intentionally mirror `.github/workflows/ci.yml`. This catches newly added user-facing SwiftUI strings, stale catalog entries, and accidental raw/verbatim strings before a release push can create a failing CI run.
+
+### Emergency Rollback
+
+If deployment fails or has issues, use the separate rollback tool:
+
+```bash
+tools/release/rollback-release.sh VERSION
+
+# What it does:
+# - Deletes GitHub Release and git tags (local + remote)
+# - Reverts version-related commits
+# - Provides guidance for Homebrew cask cleanup
+# - Interactive confirmations for safety
+```
+
+## Legacy Commands
+
+The unified `tools/release/deploy` entrypoint is the supported path. Legacy
+wrappers delegate to it so QA-stamp enforcement, resume validation, and release
+sequencing remain centralized:
+
+```bash
+tools/release/deploy bump patch
+tools/release/deploy qa --version 2.7.2
+tools/release/deploy release 2.7.2
+tools/release/deploy verify 2.7.2
+```
+
+`tools/release/deploy-agent-sessions.sh` is an internal implementation detail.
+Direct emergency use must set `SKIP_QA=1` explicitly; normal releases should not
+call it directly.
+
+Outputs:
+- DMG: `dist/AgentSessions-2.5.1.dmg`
+- SHA: `dist/AgentSessions-2.5.1.dmg.sha256`
+- GitHub Release: `v2.5.1` with assets and notes from `docs/CHANGELOG.md`
+- README and docs download links updated to 2.5.1
+- Homebrew cask updated in `jazzyalex/homebrew-agent-sessions`
+
+If any step fails, see “Troubleshooting” below.
+
+## Deployment Features
+
+### 1. Comprehensive Dependency Validation
+All required tools are checked upfront:
+- ✅ xcodebuild, git, gh, python3, curl, shasum, codesign, hdiutil, security
+- ✅ Python packaging module for semver comparison
+- ✅ GitHub CLI authentication status
+- ✅ Apple notary profile configuration
+
+**Benefit**: Fails fast with clear error messages instead of mysterious mid-deployment failures
+
+### 2. Enhanced Pre-Flight Validation
+Before building, the system validates:
+- ✅ **Git state**: Clean working directory, on main branch, synced with origin
+- ✅ **Version validation**: Tag doesn't exist, semver comparison with previous version
+- ✅ **Build number**: Must increment for Sparkle (critical!)
+- ✅ **CHANGELOG**: Section exists for version with correct date format
+
+**Benefit**: Catches errors before the 10-minute build/notarize cycle
+
+Agent behavior requirement:
+- If git state is dirty, do not workaround with a separate clone/worktree.
+- Stop and request local cleanup in the same repository, then continue deployment there.
+
+### 3. Pre-Deployment Smoke Testing (NEW!)
+After DMG creation, before upload:
+- ✅ **DMG verification**: Validates structure with `hdiutil verify`
+- ✅ **Mount test**: Mounts DMG to verify it's bootable
+- ✅ **App bundle check**: Ensures .app exists in DMG
+- ✅ **Code signature**: Validates with `codesign --verify --deep --strict`
+- ✅ **Version check**: Confirms app version matches expected
+
+**Benefit**: Prevents uploading corrupted or incorrectly signed DMGs
+
+### 4. Network Retry Logic
+All network operations retry automatically (3 attempts, 5s backoff):
+- GitHub Release creation/upload
+- Homebrew cask updates via GitHub API
+- Git push operations (appcast, docs)
+
+**Benefit**: Resilient to transient network failures
+
+### 5. Improved Cache Propagation Waits
+Smart timeout-based waiting instead of hardcoded loops:
+- **GitHub Pages**: Waits up to 120s for the exact target appcast item and DMG URL to be live, not just any matching version text
+- **Homebrew cask**: Waits up to 40s for cask version to propagate
+- Shows elapsed time when cache propagates
+- Non-blocking warnings if timeout exceeded
+
+**Benefit**: Prevents race conditions, provides better feedback
+
+### 6. Idempotent Operations
+Safe to re-run if deployment partially fails:
+- GitHub release checks if release exists before creating
+- Asset uploads use `--clobber` flag to replace existing
+- All operations logged with structured timestamps
+
+**Benefit**: Can recover from partial failures by re-running
+
+### 7. Automated Verification
+After deployment, comprehensive checks run automatically:
+- GitHub Release assets exist and are downloadable
+- Appcast has correct version, EdDSA signature, and URLs
+- Validates README/docs download links
+- Checks Homebrew cask version matches
+- Verifies SHA256 checksums
+- Exits with error if any check fails
+
+**Benefit**: Catches deployment issues immediately
+
+### 8. Auto-Rollback on Failure (NEW!)
+If verification fails, the system prompts for automatic rollback:
+- ✅ Offers to run rollback script automatically (default: Yes)
+- ✅ Deletes GitHub Release and git tags
+- ✅ Reverts version-related commits
+- ✅ Provides clear error logging
+- ✅ Respects `SKIP_CONFIRM=1` flag (shows manual command instead)
+
+**Benefit**: Fast recovery from failed deployments
+
+### 9. Structured Logging
+All operations log to timestamped files:
+- Format: `/tmp/<subcommand>-<VERSION>-<timestamp>.log`
+- Includes ISO timestamps and severity levels
+- Captures all output for debugging
+- Example: `/tmp/release-2.8-1732652300.log`
+
+**Benefit**: Easy to debug failed deployments, share logs with team
+
+### 10. CHANGELOG Automation (NEW!)
+Generate CHANGELOG entries from conventional commits:
+- ✅ Extracts commits by type: feat/fix/perf/refactor/docs
+- ✅ Groups into CHANGELOG sections (Added, Fixed, Performance, etc.)
+- ✅ Shows commit breakdown by category
+- ✅ Offers to save snippet file for easy copying
+- ✅ Auto-detects last tag if not specified
+
+**Benefit**: No more manual CHANGELOG writing, consistent formatting
+
+## Rollback Capability
+`rollback-release.sh` provides fast recovery:
+- Deletes GitHub Release and git tags (local + remote)
+- Reverts appcast/README/docs commits
+- Checks Homebrew cask status
+- Interactive confirmations for destructive operations
+
+**Benefit**: MTTR (mean time to recover) reduced from hours to minutes
+
+### Agent Execution (Codex CLI)
+- The Agent can and will run xcodebuild, codesign, notarytool, hdiutil, and gh with escalated permissions when you request a release.
+- Certificates and notary profile are assumed to be installed on the system Keychain (per this project's setup). The Agent won't prompt for them each time.
+- To avoid repeated questions, prefer SKIP_CONFIRM=1 and provide VERSION/TEAM_ID/DEV_ID_APP/NOTARY_PROFILE explicitly.
+- The Agent will request elevation when necessary (build/sign/notarize/upload/cask writes) and proceed non‑interactively.
+
+## Pre-flight Checklist (Mostly Automated Now)
+
+Complete this checklist **before** running the deployment script. Answer all questions and verify all conditions.
+
+### 0. Recommended QA Gate
+- [ ] Run `docs/release/pre-release-qa.md` for the release candidate.
+- [ ] Record outcome (`GO` / `NO-GO`) and unresolved known risks (if any).
+
+### 1. Version Planning
+- [ ] What version are you releasing? (e.g., 2.5.1)
+- [ ] Current MARKETING_VERSION in project.pbxproj: 2.5.1 (run grep to confirm)
+- [ ] **CRITICAL: Increment CURRENT_PROJECT_VERSION (build number) for Sparkle updates:**
+  ```bash
+  grep "CURRENT_PROJECT_VERSION" AgentSessions.xcodeproj/project.pbxproj
+  # Must be higher than previous release (e.g., 1 → 2, 2 → 3)
+  # Sparkle compares build numbers, not marketing versions!
+  ```
+- [ ] Confirm version bump is correct (major/minor/patch)
+
+### 2. Asset Preparation
+- [ ] Screenshots updated (if UI changed):
+  - `docs/assets/screenshot-V.png`
+  - `docs/assets/screenshot-H.png`
+  - `docs/assets/screenshot-menubar.png`
+- [ ] `docs/CHANGELOG.md` has a section for the new version
+- [ ] README.md and docs/index.html reviewed and updated:
+  - Download button/link points to `{VERSION}` and visible label reads `Download Agent Sessions {VERSION}`
+  - File name references use `AgentSessions-{VERSION}.dmg`
+  - No release notes added to README or website (keep feature overview current; detailed notes live in `docs/CHANGELOG.md`)
+  - Gemini remains noted as read-only; Favorites listed if present
+  - Product Hunt badge aligns with the social buttons row and matches button height
+- [ ] All code changes committed and pushed to main
+
+### 3. Environment Validation
+- [ ] macOS with Xcode CLT installed
+- [ ] Developer ID Application certificate in Keychain
+- [ ] Notary auth configured, preferably via an App Store Connect API key in ignored `tools/release/.env`; fallback is a valid `AgentSessionsNotary` keychain profile or explicit Apple ID app-password environment variables.
+- [ ] Sparkle EdDSA private key exists in Keychain:
+  ```bash
+  security find-generic-password -s "Sparkle"
+  # Should show: keychain: "/Users/.../Library/Keychains/login.keychain-db"
+  ```
+- [ ] GitHub CLI authenticated: `gh auth status`
+- [ ] Clean working directory: `git status`
+- [ ] On main branch: `git branch --show-current`
+
+### 4. Deployment Parameters
+
+Gather these values before running the script:
+
+```bash
+# Required
+VERSION=2.5.1                                         # Target version
+
+# Optional (auto-detected if not set)
+TEAM_ID=24NDRU35WD                                    # Apple Team ID
+NOTARY_PROFILE=AgentSessionsNotary                    # Keychain profile name
+NOTARY_KEY_PATH=/absolute/path/AuthKey_ABC123DEFG.p8  # Durable App Store Connect API key
+NOTARY_KEY_ID=ABC123DEFG                              # App Store Connect API key ID
+NOTARY_ISSUER=00000000-0000-0000-0000-000000000000    # App Store Connect issuer; omit only for individual API keys
+DEV_ID_APP="Developer ID Application: Alex M (24NDRU35WD)"  # Code signing identity
+
+# Optional fallback if the keychain profile cannot be read by notarytool
+NOTARY_APPLE_ID=your-apple-id@example.com
+NOTARY_TEAM_ID=24NDRU35WD
+NOTARY_PASSWORD=your-app-specific-password
+
+# Optional (defaults shown)
+UPDATE_CASK=1                                         # Update Homebrew cask (1=yes, 0=no)
+SKIP_CONFIRM=1                                        # Skip interactive prompts (1=yes, 0=no)
+```
+
+## Automated Deployment
+
+Once pre-flight is complete, run the deployment script with all parameters:
+
+```bash
+tools/release/deploy release 2.5.1
+```
+
+### What the script does automatically:
+
+1. **Pre-checks**
+   - Validates xcodebuild, gh, notarytool are available
+   - Auto-detects Developer ID certificate
+   - Verifies CHANGELOG.md has version section
+
+2. **Build & Sign** (2-10 minutes)
+   - Builds Release configuration
+   - Release builds may spend several minutes in `swift-frontend` during whole-module optimization; the helper prints periodic heartbeats so this does not look stuck.
+   - Code signs with Developer ID Application certificate + hardened runtime
+   - **Verifies signature uses Developer ID (not ad-hoc)**
+   - Creates DMG
+
+3. **DMG Verification** (Critical!)
+   - **Verifies DMG integrity with `hdiutil verify`**
+   - **Validates DMG is a proper disk image format**
+   - Catches corrupted DMGs before notarization (prevents wasted time)
+
+4. **Notarize & Staple** (5-15 minutes)
+   - Submits verified DMG to Apple notary service
+   - Waits for approval
+   - Staples notarization ticket to DMG
+
+5. **Generate Sparkle Appcast** (for auto-updates)
+   - Copies DMG to `dist/updates/` directory
+   - Finds Sparkle `generate_appcast` tool from SPM artifacts
+   - Generates `appcast.xml` with EdDSA signature (reads private key from Keychain)
+   - **Verifies EdDSA private key exists in Keychain (service: "https://sparkle-project.org")**
+   - Fixes DMG URL to point to GitHub Releases (not GitHub Pages)
+   - Inserts **structured Sparkle release notes** into `<description><![CDATA[...]]></description>`
+     - Starts with the headline user-facing change for the current release, then a short “Other Changes” summary
+     - Must omit internal implementation cleanup and pre-release stabilization that users never experienced as released bugs
+     - Fails if generated notes contain internal/process wording or put Bug Fixes ahead of a headline section
+     - For patch releases `A.B.C`, includes a short reminder from the baseline release `A.B` (TL;DR if available)
+     - If the current release section has no structured bullets, adds a fallback highlight: `Small bug fixes and stability improvements.`
+     - Fails hard with a clear error if no notes are found (prevents Sparkle UI hang)
+   - Copies appcast.xml to docs/ for GitHub Pages
+   - Prints a Sparkle release notes preview and asks for approval before publishing (unless `SKIP_CONFIRM=1`)
+   - `SKIP_CONFIRM=1` is not enough to publish appcast notes; unattended release runs must also set `RELEASE_NOTES_REVIEWED=1` after the preview has been inspected
+   - After approval, publishes the GitHub Release DMG/SHA assets and curated notes before committing the appcast, so Sparkle never advertises a DMG that is not uploaded yet
+   - Fails hard before any Homebrew or GitHub Release publication if Sparkle appcast generation is unavailable or invalid
+   - Commits and pushes appcast to main branch
+
+6. **Update Documentation**
+   - Updates download links in README.md and docs/index.html
+   - Normalizes visible version strings in download button labels and file names
+   - Validates that both files contain the expected `{VERSION}` URL and label; fails hard if mismatched
+   - Does not inject release notes; README/site remain feature-focused
+   - Commits and pushes changes
+
+7. **Update Homebrew Cask**
+   - Generates cask file with correct version and SHA256
+   - Updates via GitHub API to jazzyalex/homebrew-agent-sessions
+   - Commits directly to main branch
+
+8. **Create GitHub Release**
+   - Uses the same curated/linted notes generated for Sparkle instead of raw commit history or raw changelog extraction
+   - Creates or updates GitHub Release
+   - Uploads DMG and SHA256 checksum
+
+### Script output location:
+- DMG: `dist/AgentSessions-{VERSION}.dmg`
+- SHA: `dist/AgentSessions-{VERSION}.dmg.sha256`
+- Build logs: Terminal output
+
+## Post-Deployment Verification
+
+After script completes successfully, run automated and manual checks.
+
+### Automated Checks (Run by Agent - 1-2 minutes)
+
+These checks should be performed automatically by the deployment agent:
+
+```bash
+# 1. Verify GitHub release exists with correct assets
+gh release view v{VERSION} --json name,assets | jq '.assets[] | .name'
+# Expected: AgentSessions-{VERSION}.dmg and AgentSessions-{VERSION}.dmg.sha256
+
+# 2. Verify Sparkle appcast.xml published on GitHub Pages
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | \
+  awk 'BEGIN { RS="</item>"; ORS="</item>\n" } index($0, "<sparkle:shortVersionString>{VERSION}</sparkle:shortVersionString>")'
+# Expected: the item for {VERSION} is present and includes:
+#   <sparkle:version>{BUILD}</sparkle:version>
+#   <sparkle:shortVersionString>{VERSION}</sparkle:shortVersionString>
+#   <enclosure url="https://github.com/jazzyalex/agent-sessions/releases/download/v{VERSION}/AgentSessions-{VERSION}.dmg" ... sparkle:edSignature="..."/>
+
+# 3. Verify `<description>` (release notes) is present for the target item
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | \
+  awk 'BEGIN { RS="</item>"; ORS="</item>\n" } index($0, "<sparkle:shortVersionString>{VERSION}</sparkle:shortVersionString>")' | \
+  grep -n "<description"
+# Expected: a `<description><![CDATA[` block inside the {VERSION} item
+
+# 4. Verify EdDSA signature is present in appcast
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep "sparkle:edSignature" | wc -l
+# Expected: 1 (or more if multiple versions in appcast)
+
+# 5. Verify appcast DMG URL points to GitHub Releases (not GitHub Pages)
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep "enclosure url" | grep -v "github.com/jazzyalex/agent-sessions/releases"
+# Expected: no output (all URLs should be GitHub Releases)
+
+# 6. Verify README.md download links and labels point to new version
+grep -E "releases/download/v{VERSION}/AgentSessions-{VERSION}\.dmg|Download Agent Sessions {VERSION}" README.md
+# Should find: AgentSessions-{VERSION}.dmg URL and a visible "Download Agent Sessions {VERSION}" label
+
+# 7. Verify docs/index.html download links and labels point to new version
+grep -E "releases/download/v{VERSION}/AgentSessions-{VERSION}\.dmg|Download Agent Sessions {VERSION}" docs/index.html
+# Should find: AgentSessions-{VERSION}.dmg URL and a visible "Download Agent Sessions {VERSION}" label
+
+# 8. Verify Homebrew cask updated (API avoids raw cache)
+gh api -H "Accept: application/vnd.github+json" \
+  "/repos/jazzyalex/homebrew-agent-sessions/contents/Casks/agent-sessions.rb" \
+  --jq '.content' | tr -d '\n' | base64 --decode | \
+  grep -E "(version \"{VERSION}\"|sha256 )"
+# Expected: version "{VERSION}" and matching sha256
+
+# 9. Verify release notes match CHANGELOG.md
+gh release view v{VERSION} --json body -q '.body' > /tmp/release_notes.txt
+awk '/^## \[{VERSION}\]/,/^## \[/' docs/CHANGELOG.md > /tmp/changelog_section.txt
+diff -u /tmp/changelog_section.txt /tmp/release_notes.txt
+# Expected: no significant differences
+
+# 9. Verify git is clean
+git status --porcelain
+# Expected: empty output or only .claude/settings.local.json
+```
+
+**Agent should automatically fix any issues found:**
+- Incorrect version numbers in download button text or filenames → Edit and commit
+- Missing Homebrew cask update → Update cask, commit, and push
+- Uncommitted documentation changes → Commit and push
+
+## Website/README Content Guidelines (Mandatory)
+- Do not add release notes to README or the website. Keep detailed changes in `docs/CHANGELOG.md`.
+- Keep features current. `README.md` may include a versioned "What's New" summary, but `docs/index.html` should not include a versioned "What's New" section.
+- Always update:
+  - The download URL to `v{VERSION}/AgentSessions-{VERSION}.dmg`
+  - The visible label to `Download Agent Sessions {VERSION}`
+  - Any text references to `AgentSessions-{VERSION}.dmg`
+- Product Hunt badge should be in the same row as GitHub/X buttons and visually aligned (matching height).
+- Follow Docs Style Policy: no emojis, clear headings, accessible text.
+
+### Human-Required Checks (30-60 minutes)
+- [ ] Download DMG from GitHub Release
+- [ ] Verify SHA256 checksum matches
+- [ ] Test installation on clean macOS system
+- [ ] Verify Gatekeeper accepts app (right-click → Open)
+- [ ] Test app launches without errors
+- [ ] Test basic functionality (session list, search, resume)
+- [ ] Test Homebrew cask installation locally:
+  ```bash
+  # Uninstall current version if present
+  brew uninstall agent-sessions
+
+  # Update tap and verify new version is available
+  brew update
+  brew info agent-sessions  # Should show version {VERSION}
+
+  # Install and verify
+  brew install agent-sessions
+  open -a "Agent Sessions"
+
+  # Verify version matches
+  plutil -p "/Applications/Agent Sessions.app/Contents/Info.plist" | grep CFBundleShortVersionString
+  # Expected: "CFBundleShortVersionString" => "{VERSION}"
+  ```
+
+### Communication
+- [ ] Update website if needed (jazzyalex.github.io/agent-sessions)
+- [ ] Announce release (if applicable)
+- [ ] Monitor GitHub issues for installation problems
+
+### Monitoring (24-48 hours)
+- [ ] Check GitHub Release download count
+- [ ] Monitor for new issues or bug reports
+- [ ] Verify no Gatekeeper or notarization complaints
+
+## Troubleshooting
+
+### "The DMG is corrupted" when it is not (mounted-image false failure)
+
+**Symptom**: right after `hdiutil create`, verification fails with
+
+```
+hdiutil: verify: unable to recognize "…AgentSessions-X.Y.Z.dmg" as a disk image.
+         (Resource temporarily unavailable)
+ERROR: DMG verification failed! The DMG is corrupted.
+```
+
+**This is almost never corruption.** `hdiutil verify` needs an exclusive handle, and
+`hdiutil create` can leave the image it just made attached. Any volume backed by that file
+makes verify return `EAGAIN`. Hit during the 5.1.1 release: the image was mounted at
+`/dev/disk10` and checksummed clean the moment it was detached.
+
+**Diagnose before rebuilding anything** — the old error text blamed the app bundle and sent
+the operator after a build problem that did not exist:
+
+```bash
+hdiutil info | grep -A3 "$(pwd)/dist"
+```
+
+If your DMG is listed, detach it and re-verify:
+
+```bash
+hdiutil detach /dev/diskN -force && hdiutil verify dist/AgentSessions-X.Y.Z.dmg
+```
+
+`build_sign_notarize_release.sh` now does this automatically (detach, then verify, retrying
+twice for a slow DiskArbitration unmount), so this should not resurface.
+
+The guard was tested directly rather than inferred from a clean release: under
+`set -euo pipefail`, with the DMG deliberately attached it detached all four listed devices
+and verify passed on the first attempt, and with nothing mounted the empty-match pipeline
+returned cleanly instead of tripping `set -e`. Both are the paths that matter.
+
+The underlying race is **intermittent** — 5.1 never tripped it, 5.1.1 tripped it on one run
+and not the next — so if it ever does resurface, expect a `==> Detaching stale mount` line in
+the release log rather than a failure. A release that never logs one simply did not race.
+
+### Corrupted DMG (notarytool hangs or fails)
+
+**Symptom**: `xcrun notarytool submit` hangs at "initiating connection" or fails immediately
+
+**Diagnosis**:
+```bash
+# Check if DMG is corrupted
+hdiutil verify dist/AgentSessions-{VERSION}.dmg
+
+# Check file type
+file dist/AgentSessions-{VERSION}.dmg
+# Expected: "...Apple partition map..." or "...Macintosh HFS..."
+# Bad: "zlib compressed data" (corrupted)
+```
+
+**Root Causes**:
+1. App bundle was incomplete when DMG was created
+2. App was signed with ad-hoc certificate instead of Developer ID
+3. Xcode build failed but didn't exit with error code
+
+**Solution**:
+```bash
+# 1. Delete corrupted DMG
+rm dist/AgentSessions-{VERSION}.dmg
+
+# 2. Verify app signature uses Developer ID
+codesign -dv --verbose=4 dist/AgentSessions.app 2>&1 | grep "Authority=Developer ID Application"
+# Must show: Authority=Developer ID Application: Your Name (TEAM_ID)
+
+# 3. If app has wrong signature, re-sign
+codesign --deep --force --verify --verbose --timestamp --options runtime \
+  --sign "Developer ID Application: Alex M (24NDRU35WD)" dist/AgentSessions.app
+
+# 4. Create fresh DMG
+hdiutil create -volname "Agent Sessions" -srcfolder dist/AgentSessions.app \
+  -ov -format UDZO dist/AgentSessions-{VERSION}.dmg
+
+# 5. Verify DMG is valid
+hdiutil verify dist/AgentSessions-{VERSION}.dmg
+
+# 6. Retry notarization
+xcrun notarytool submit dist/AgentSessions-{VERSION}.dmg --keychain-profile AgentSessionsNotary --wait
+```
+
+**Prevention**: The updated build script now includes DMG verification before notarization.
+
+## Docs sanity check (for agents)
+
+Before changing deployment scripts, do a quick paper dry run using a fake version (for example, 2.9):
+- Walk through the cheat sheet commands and confirm each one is documented with required flags and environment variables.
+- Verify that `docs/deployment.md` and `.claude/skills/deploy.md` reference the same entrypoints (`tools/release/deploy`).
+- Treat this as a documentation validation step only; do not actually tag or publish 2.9.
+
+### Sparkle EdDSA signature errors
+
+**Symptom**: Users see "The update is improperly signed and could not be validated"
+
+**Diagnosis**:
+```bash
+# 1. Check if EdDSA private key exists
+security find-generic-password -s "https://sparkle-project.org" -a "ed25519"
+# Should show: keychain: "/Users/.../Library/Keychains/login.keychain-db"
+
+# 2. Verify public key in Info.plist matches
+~/Library/Developer/Xcode/DerivedData/AgentSessions-*/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_keys
+# Shows: "A pre-existing signing key was found. This is how it should appear in your Info.plist:"
+
+# 3. Compare with AgentSessions/Info.plist
+grep -A1 "SUPublicEDKey" AgentSessions/Info.plist
+```
+
+**Root Causes**:
+1. Public key in Info.plist doesn't match private key in Keychain
+2. Appcast was signed with different key than what's in Info.plist
+3. Private key was lost/regenerated but Info.plist wasn't updated
+
+**Solution**:
+1. If keys don't match: Update Info.plist with correct public key from `generate_keys`
+2. Regenerate appcast.xml with matching key
+3. Test signature: Download DMG and verify with Sparkle's `sign_update --verify`
+
+### Sparkle auto-update not detecting new version
+
+**Symptom**: App says "You're up to date" when a newer version exists in the appcast
+
+**Diagnosis**:
+```bash
+# 1. Check build numbers (NOT marketing versions!)
+# Old version:
+plutil -p "/Applications/Agent Sessions.app/Contents/Info.plist" | grep CFBundleVersion
+# New version in release:
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep "sparkle:version"
+
+# 2. Sparkle compares build numbers, not marketing versions!
+# If both have CFBundleVersion=1, Sparkle thinks they're the same
+```
+
+**Root Cause**:
+Sparkle uses `CFBundleVersion` (build number), not `CFBundleShortVersionString` (marketing version) for version comparison. If you release 2.5 with build number "1" and the previous 2.4 also had build number "1", Sparkle won't detect an update.
+
+**Solution**:
+```bash
+# Do not hand-edit release metadata or invoke a legacy build/publish script.
+# The canonical bump command increments the build number and requires target-version QA.
+tools/release/deploy bump patch
+
+# Push the bump commit, then QA the exact pushed HEAD before publishing.
+git push origin main
+tools/release/deploy qa --version <VERSION>
+tools/release/deploy release <VERSION>
+tools/release/deploy verify <VERSION>
+```
+
+**Prevention**: Always use `tools/release/deploy bump`, which increments `CURRENT_PROJECT_VERSION`, requires the target-version QA stamp before mutation, and keeps release publication behind exact-commit QA.
+
+### Sparkle update window shows spinning wheel forever
+
+**Symptom**: Update is detected, window opens, but shows indefinite spinning wheel during download
+
+**Diagnosis**:
+```bash
+# Check if release notes are present in appcast
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep -A5 "description"
+# If empty or missing, Sparkle may hang when SUShowReleaseNotes=1
+```
+
+**Root Cause**:
+When `SUShowReleaseNotes` is enabled in Info.plist but the appcast has no `<description>` element, Sparkle may hang waiting for release notes content.
+
+**Solution**:
+```bash
+# Add release notes to appcast.xml item:
+<description><![CDATA[
+    <h2>What's New in {VERSION}</h2>
+    <ul>
+        <li><strong>Feature:</strong> Description</li>
+        <li><strong>Fixed:</strong> Bug description</li>
+    </ul>
+]]></description>
+
+# Commit and push appcast
+git add docs/appcast.xml
+git commit -m "Add release notes to appcast for {VERSION}"
+git push
+```
+
+**Prevention**: The deployment script automatically adds release notes from CHANGELOG.md to the appcast using Python (robust with CDATA) and fails hard if missing. This prevents the Sparkle UI from hanging due to an empty `<description>`.
+
+### Notary profile errors
+```bash
+xcrun notarytool store-credentials AgentSessionsNotary \
+  --apple-id "your-apple-id@example.com" \
+  --team-id "24NDRU35WD" \
+  --password "app-specific-password"
+```
+
+If `store-credentials` succeeds but profile-based commands still return `401
+Unauthenticated`, run the deploy with explicit credentials instead of bypassing
+notary checks:
+
+```bash
+NOTARY_APPLE_ID="your-apple-id@example.com" \
+NOTARY_TEAM_ID="24NDRU35WD" \
+NOTARY_PASSWORD="app-specific-password" \
+SKIP_CONFIRM=1 tools/release/deploy release 3.6.2
+```
+
+Do not commit `.env` files or shell history containing `NOTARY_PASSWORD`.
+
+### GitHub CLI authentication
+```bash
+gh auth login
+gh auth status
+```
+
+### Developer ID certificate not found
+```bash
+security find-identity -v -p codesigning
+```
+
+### Build failures
+- Check Xcode version: `xcodebuild -version`
+- Clean build folder: `rm -rf build/ dist/`
+- Verify project.pbxproj MARKETING_VERSION is correct
+
+### QA test host killed by Gatekeeper (transient)
+- **Symptom** (6.1.2 QA): the test run aborts with the host killed by
+  `OS_REASON_EXEC | Gatekeeper policy blocked execution`. It happened twice in a row; the
+  third run passed with no change.
+- **Diagnose:** `xcrun xcresulttool export diagnostics --path <bundle>.xcresult --output-path <dir>`,
+  then `/usr/bin/log show <dir>/…/*.logarchive --predicate 'process == "syspolicyd"'`
+  (use `/usr/bin/log`; the zsh `log` builtin shadows it). The 6.1.2 logs showed
+  `sandbox_register_app_bundle_exception failed … signing-id=(null)` and `scan failed`.
+- **Fix:** none needed in the project. Re-run QA. If it fails three times, check
+  `syspolicyd` health and free memory before suspecting the build.
+
+### Notarization rejected
+- Review notary log: `xcrun notarytool log --keychain-profile AgentSessionsNotary {submission-id}`
+- Common issues: unsigned binaries, incorrect entitlements, missing hardened runtime
+
+### Homebrew cask not updated
+- Script now uses GitHub API to update cask directly
+- Check: `curl -s https://raw.githubusercontent.com/jazzyalex/homebrew-agent-sessions/main/Casks/agent-sessions.rb | grep version`
+- If wrong: Re-run deploy script with UPDATE_CASK=1
+
+## Manual Deployment (Alternative)
+
+Use manual publication only for failures after release QA has passed on the exact clean, synced HEAD. Run `tools/release/deploy qa --version <VERSION>` first. Never use this fallback to bypass a failed or omitted localization/extraction gate; an explicit emergency `SKIP_QA=1` decision is required to bypass release QA.
+
+If automation fails after that QA gate, use manual steps:
+
+1. Build: `xcodebuild -scheme AgentSessions -configuration Release SYMROOT=build`
+2. Sign: `codesign --deep --force --verify --verbose --timestamp --options runtime --sign "Developer ID Application: Alex M (24NDRU35WD)" build/Release/AgentSessions.app`
+3. Create DMG: `hdiutil create -volname "Agent Sessions" -srcfolder build/Release/AgentSessions.app -ov -format UDZO dist/AgentSessions-{VERSION}.dmg`
+4. Notarize: `xcrun notarytool submit dist/AgentSessions-{VERSION}.dmg --keychain-profile AgentSessionsNotary --wait`
+5. Staple: `xcrun stapler staple dist/AgentSessions-{VERSION}.dmg`
+6. Compute SHA: `shasum -a 256 dist/AgentSessions-{VERSION}.dmg > dist/AgentSessions-{VERSION}.dmg.sha256`
+7. Create release: `gh release create v{VERSION} dist/AgentSessions-{VERSION}.dmg dist/AgentSessions-{VERSION}.dmg.sha256 --title "Agent Sessions {VERSION}" --notes-file notes.txt`
+8. Update README/docs download links manually
+9. Update Homebrew cask manually
+
+## Environment Configuration
+
+Optional: Create `tools/release/.env` (not committed) with default values:
+
+```bash
+TEAM_ID=24NDRU35WD
+NOTARY_PROFILE=AgentSessionsNotary
+DEV_ID_APP="Developer ID Application: Alex M (24NDRU35WD)"
+UPDATE_CASK=1
+SKIP_CONFIRM=1
+```
+
+This file is sourced automatically by the script.

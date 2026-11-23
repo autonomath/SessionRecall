@@ -1,0 +1,1349 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# deploy - Unified deployment tool for Agent Sessions
+# Consolidates bump, release, verify, and changelog workflows
+#
+# Canonical runbook: docs/deployment.md
+
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$REPO_ROOT"
+
+# ============================================================================
+# SHARED UTILITIES
+# ============================================================================
+
+green(){ printf "\033[32m%s\033[0m\n" "$*"; }
+yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
+red(){ printf "\033[31m%s\033[0m\n" "$*"; }
+
+# Structured logging
+LOG_FILE=""
+STATE_FILE="/tmp/deploy-state.json"
+QA_STAMP_FILE="${TMPDIR:-/tmp}/agent-sessions-release-qa.json"
+
+init_logging() {
+  local context="${1:-deploy}"
+  LOG_FILE="/tmp/${context}-$(date +%s).log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+# State management for resume capability
+save_state() {
+  local version="$1"
+  local step="$2"
+  local timestamp=$(date -Iseconds)
+  local head
+  head=$(git rev-parse HEAD)
+  cat > "$STATE_FILE" <<EOF
+{
+  "version": "$version",
+  "last_step": "$step",
+  "head": "$head",
+  "timestamp": "$timestamp",
+  "log_file": "$LOG_FILE"
+}
+EOF
+  log INFO "Saved state: $step"
+}
+
+load_state() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo ""
+    return 1
+  fi
+  cat "$STATE_FILE"
+}
+
+clear_state() {
+  rm -f "$STATE_FILE"
+  log INFO "Cleared deployment state"
+}
+
+log() {
+  local level="$1"; shift
+  echo "[$(date -Iseconds)] [$level] $*"
+}
+
+current_project_version() {
+  grep -m1 "MARKETING_VERSION = " AgentSessions.xcodeproj/project.pbxproj | sed 's/.*= \([^;]*\);/\1/' | tr -d ' '
+}
+
+write_qa_stamp() {
+  local version="$1"
+  local head="$2"
+  local started_at="$3"
+  local completed_at
+  completed_at=$(date -Iseconds)
+  VERSION_VALUE="$version" \
+  HEAD_VALUE="$head" \
+  STARTED_AT_VALUE="$started_at" \
+  COMPLETED_AT_VALUE="$completed_at" \
+  STAMP_PATH_VALUE="$QA_STAMP_FILE" \
+    python3 <<'PYEOF'
+import json
+import os
+from pathlib import Path
+
+stamp = {
+    "version": os.environ["VERSION_VALUE"],
+    "head": os.environ["HEAD_VALUE"],
+    "started_at": os.environ["STARTED_AT_VALUE"],
+    "completed_at": os.environ["COMPLETED_AT_VALUE"],
+    "checks": [
+        "git scope review",
+        "CI docs guards",
+        "Xcode toolchain parity",
+        "localization catalog validation",
+        "CI-parity Debug xcodebuild",
+        "CI-parity localization extraction drift",
+        "stable XCTest wrapper",
+        "Python release tests",
+        "warning sweep",
+    ],
+}
+path = Path(os.environ["STAMP_PATH_VALUE"])
+path.write_text(json.dumps(stamp, indent=2) + "\n")
+PYEOF
+}
+
+invalidate_qa_stamp() {
+  if [[ -f "$QA_STAMP_FILE" ]]; then
+    rm -f "$QA_STAMP_FILE"
+    yellow "Invalidated the previous release QA stamp before rerunning QA"
+  fi
+}
+
+qa_stamp_head() {
+  if [[ "${SKIP_QA:-0}" == "1" ]]; then
+    git rev-parse HEAD
+    return 0
+  fi
+
+  if [[ ! -f "$QA_STAMP_FILE" ]]; then
+    return 1
+  fi
+
+  STAMP_PATH_VALUE="$QA_STAMP_FILE" \
+    python3 <<'PYEOF'
+import json
+import os
+
+with open(os.environ["STAMP_PATH_VALUE"], "r", encoding="utf-8") as fh:
+    stamp = json.load(fh)
+print(stamp.get("head", ""))
+PYEOF
+}
+
+require_qa_stamp() {
+  local version="$1"
+  local expected_head="${2:-}"
+  local dirty_mode="${3:-strict}"
+
+  if [[ "${SKIP_QA:-0}" == "1" ]]; then
+    yellow "SKIP_QA=1: proceeding without a fresh QA stamp"
+    return 0
+  fi
+
+  local tracked_dirty
+  local untracked_dirty
+  tracked_dirty=$({ git diff --name-only; git diff --cached --name-only; } | sort -u)
+  untracked_dirty=$(git ls-files --others --exclude-standard)
+  if [[ -n "$tracked_dirty" ]] || [[ -n "$untracked_dirty" ]]; then
+    if [[ "$dirty_mode" == "allow-appcast" && "$tracked_dirty" == "docs/appcast.xml" && -z "$untracked_dirty" ]]; then
+      yellow "Resume checkpoint has expected pending docs/appcast.xml changes."
+    else
+      red "ERROR: Release requires the same clean working tree that was QA-stamped."
+      git status --short
+      exit 2
+    fi
+  fi
+
+  local current_head
+  current_head=$(git rev-parse HEAD)
+  if [[ -z "$expected_head" ]]; then
+    expected_head="$current_head"
+  fi
+
+  # Auto-run QA when the stamp is missing or invalid on a fully clean tree,
+  # instead of bouncing the operator to a manual `deploy qa` round-trip.
+  if ! qa_stamp_matches "$version" "$expected_head"; then
+    if [[ -n "$tracked_dirty" || -n "$untracked_dirty" ]]; then
+      red "ERROR: No valid release QA stamp and the tree is not fully clean; cannot auto-run QA."
+      red "Run: tools/release/deploy qa --version $version"
+      exit 2
+    fi
+    yellow "No valid QA stamp for $version at $expected_head — running release QA now (auto)"
+    run_release_qa_core "$version"
+    if ! qa_stamp_matches "$version" "$expected_head"; then
+      red "ERROR: Release QA stamp is still not valid after auto-run."
+      exit 2
+    fi
+  fi
+
+  green "✓ Release QA stamp valid for $version at $expected_head"
+}
+
+# Returns 0 when the stamp exists and matches version/head and is < 24h old.
+qa_stamp_matches() {
+  local version="$1"
+  local expected_head="$2"
+
+  [[ -f "$QA_STAMP_FILE" ]] || return 1
+
+  STAMP_PATH_VALUE="$QA_STAMP_FILE" \
+  EXPECTED_VERSION="$version" \
+  EXPECTED_HEAD="$expected_head" \
+    python3 <<'PYEOF'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path = os.environ["STAMP_PATH_VALUE"]
+expected_version = os.environ["EXPECTED_VERSION"]
+expected_head = os.environ["EXPECTED_HEAD"]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        stamp = json.load(fh)
+except Exception as exc:
+    print(f"ERROR: Could not read QA stamp {path}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+errors = []
+if stamp.get("version") != expected_version:
+    errors.append(f"stamp version {stamp.get('version')!r} != {expected_version!r}")
+if stamp.get("head") != expected_head:
+    errors.append(f"stamp head {stamp.get('head')!r} != expected release HEAD {expected_head!r}")
+
+completed = stamp.get("completed_at", "")
+try:
+    completed_dt = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+    if completed_dt.tzinfo is None:
+        completed_dt = completed_dt.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - completed_dt.astimezone(timezone.utc)).total_seconds()
+    if age_seconds > 24 * 60 * 60:
+        errors.append("stamp is older than 24 hours")
+except Exception:
+    errors.append(f"stamp completed_at is invalid: {completed!r}")
+
+if errors:
+    print("ERROR: Release QA stamp is not valid:", file=sys.stderr)
+    for error in errors:
+        print(f"  - {error}", file=sys.stderr)
+    sys.exit(2)
+PYEOF
+}
+
+count_lines() {
+  local value="$1"
+  if [[ -z "$value" ]]; then
+    echo "0"
+  else
+    printf '%s\n' "$value" | grep -c '^'
+  fi
+}
+
+# Comprehensive dependency validation
+check_dependencies() {
+  local required_cmds=("$@")
+  local missing=()
+
+  for cmd in "${required_cmds[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    red "ERROR: Missing required dependencies:"
+    for dep in "${missing[@]}"; do
+      red "  - $dep"
+    done
+    exit 2
+  fi
+}
+
+# Retry function for network operations
+retry() {
+  local max_attempts=3
+  local timeout=5
+  local attempt=1
+  local exitCode=0
+
+  while [[ $attempt -le $max_attempts ]]; do
+    if "$@"; then
+      return 0
+    else
+      exitCode=$?
+    fi
+
+    if [[ $attempt -lt $max_attempts ]]; then
+      yellow "Attempt $attempt failed (exit $exitCode). Retrying in $timeout seconds..."
+      sleep $timeout
+    fi
+    ((attempt++))
+  done
+
+  red "Command failed after $max_attempts attempts"
+  return $exitCode
+}
+
+# Improved cache wait with timeout
+wait_for_cache() {
+  local url="$1"
+  local expected="$2"
+  local max_wait="${3:-120}"
+  local interval=3
+
+  log INFO "Waiting for cache propagation: $url"
+
+  for ((i=0; i<max_wait; i+=interval)); do
+    if curl -sf "$url" 2>/dev/null | grep -q "$expected"; then
+      green "✓ Cache propagated after ${i}s"
+      return 0
+    fi
+    sleep $interval
+  done
+
+  red "ERROR: Cache did not propagate after ${max_wait}s"
+  return 1
+}
+
+# Safe, verified version bump with locking and rollback
+safe_version_bump() {
+  local pbxproj="$1"
+  local curr_build="$2"
+  local new_build="$3"
+  local curr_marketing="$4"
+  local new_marketing="$5"
+
+  local lock_file="/tmp/$(echo "$pbxproj" | tr '/.' '__').lock"
+  local backup_file="/tmp/$(basename "$pbxproj").backup.$(date +%s)"
+
+  PBXPROJ="$pbxproj" \
+  LOCK_FILE="$lock_file" \
+  BACKUP_FILE="$backup_file" \
+  CURR_BUILD="$curr_build" \
+  NEW_BUILD="$new_build" \
+  CURR_MARKETING="$curr_marketing" \
+  NEW_MARKETING="$new_marketing" \
+  python3 <<'PYEOF'
+import fcntl, os, shutil, sys, time
+
+pbx = os.environ["PBXPROJ"]
+lock_path = os.environ["LOCK_FILE"]
+backup = os.environ["BACKUP_FILE"]
+curr_build = os.environ["CURR_BUILD"]
+new_build = os.environ["NEW_BUILD"]
+curr_marketing = os.environ["CURR_MARKETING"]
+new_marketing = os.environ["NEW_MARKETING"]
+
+curr_build_token = f"CURRENT_PROJECT_VERSION = {curr_build};"
+new_build_token = f"CURRENT_PROJECT_VERSION = {new_build};"
+curr_marketing_token = f"MARKETING_VERSION = {curr_marketing};"
+new_marketing_token = f"MARKETING_VERSION = {new_marketing};"
+
+start = time.time()
+timeout = 10
+
+with open(lock_path, "w") as lock:
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.time() - start > timeout:
+                print(f"ERROR: Could not acquire lock {lock_path} after {timeout}s", file=sys.stderr)
+                sys.exit(1)
+            time.sleep(0.2)
+
+    if not os.path.exists(pbx):
+        print(f"ERROR: {pbx} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(pbx, "r", encoding="utf-8") as f:
+        data = f.read()
+
+    if curr_build_token not in data or curr_marketing_token not in data:
+        print("ERROR: Expected version tokens not found in project file", file=sys.stderr)
+        sys.exit(1)
+
+    shutil.copyfile(pbx, backup)
+
+    updated = data.replace(curr_build_token, new_build_token)
+    updated = updated.replace(curr_marketing_token, new_marketing_token)
+
+    if curr_build_token in updated or curr_marketing_token in updated:
+        print("ERROR: Old version tokens still present after update", file=sys.stderr)
+        shutil.copyfile(backup, pbx)
+        sys.exit(1)
+
+    if updated.count(new_build_token) < 1 or updated.count(new_marketing_token) < 1:
+        print("ERROR: New version tokens missing after update", file=sys.stderr)
+        shutil.copyfile(backup, pbx)
+        sys.exit(1)
+
+    tmp = pbx + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(updated)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp, pbx)
+
+    dir_path = os.path.dirname(pbx) or "."
+    dir_fd = os.open(dir_path, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+print(f"Backup saved to {backup}")
+PYEOF
+}
+
+# ============================================================================
+# SUBCOMMAND: bump
+# ============================================================================
+
+cmd_bump() {
+  shift # remove 'bump' from args
+  local BUMP_TYPE="${1:-patch}"
+
+  [[ "$BUMP_TYPE" =~ ^(major|minor|patch)$ ]] || {
+    red "ERROR: Invalid bump type. Use: major, minor, or patch"
+    echo "Usage: tools/release/deploy bump [major|minor|patch]"
+    exit 1
+  }
+
+  check_dependencies git grep sed awk python3
+  init_logging "bump-${BUMP_TYPE}"
+
+  log INFO "Starting version bump: $BUMP_TYPE"
+  echo "==> Version Bump: $BUMP_TYPE"
+
+  # Detect current version
+  local CURR_MARKETING=$(grep -m1 "MARKETING_VERSION = " AgentSessions.xcodeproj/project.pbxproj | sed 's/.*= \([^;]*\);/\1/' | tr -d ' ')
+  local CURR_BUILD=$(grep -m1 "CURRENT_PROJECT_VERSION = " AgentSessions.xcodeproj/project.pbxproj | sed 's/.*= \([^;]*\);/\1/' | tr -d ' ')
+
+  echo "Current version: $CURR_MARKETING (build $CURR_BUILD)"
+
+  # Calculate new version using Python (minor/major default to two-part; patch uses three-part)
+  local NEW_VERSION=$(python3 << PYEOF
+import sys
+version = "$CURR_MARKETING".split('.')
+major, minor = int(version[0]), int(version[1])
+patch = int(version[2]) if len(version) > 2 else 0
+
+if "$BUMP_TYPE" == "major":
+    major += 1
+    minor = 0
+    patch = 0
+elif "$BUMP_TYPE" == "minor":
+    minor += 1
+    patch = 0
+elif "$BUMP_TYPE" == "patch":
+    patch += 1
+
+if "$BUMP_TYPE" == "patch":
+    print(f"{major}.{minor}.{patch}")
+else:
+    print(f"{major}.{minor}")
+PYEOF
+)
+
+  echo ""
+  echo "==> Required pre-bump QA"
+  require_qa_stamp "$NEW_VERSION"
+
+  # Auto-increment build number
+  local NEW_BUILD=$((CURR_BUILD + 1))
+
+  echo "New version: $NEW_VERSION (build $NEW_BUILD)"
+
+  # Update project.pbxproj
+  echo "==> Updating AgentSessions.xcodeproj/project.pbxproj (locked, verified)"
+  safe_version_bump "AgentSessions.xcodeproj/project.pbxproj" "$CURR_BUILD" "$NEW_BUILD" "$CURR_MARKETING" "$NEW_VERSION"
+
+  # Verify replacements (read-back)
+  local COUNT_BUILD=$(grep -c "CURRENT_PROJECT_VERSION = $NEW_BUILD;" AgentSessions.xcodeproj/project.pbxproj || true)
+  local COUNT_VERSION=$(grep -c "MARKETING_VERSION = $NEW_VERSION;" AgentSessions.xcodeproj/project.pbxproj || true)
+  local OLD_BUILD_REMAIN=$(grep -c "CURRENT_PROJECT_VERSION = $CURR_BUILD;" AgentSessions.xcodeproj/project.pbxproj || true)
+  local OLD_MARKETING_REMAIN=$(grep -c "MARKETING_VERSION = $CURR_MARKETING;" AgentSessions.xcodeproj/project.pbxproj || true)
+
+  if [[ $COUNT_BUILD -lt 1 || $COUNT_VERSION -lt 1 || $OLD_BUILD_REMAIN -gt 0 || $OLD_MARKETING_REMAIN -gt 0 ]]; then
+    red "ERROR: Version replacement failed (new build=$COUNT_BUILD new version=$COUNT_VERSION old build still present=$OLD_BUILD_REMAIN old version still present=$OLD_MARKETING_REMAIN)"
+    exit 1
+  fi
+  green "✓ Updated CURRENT_PROJECT_VERSION → $NEW_BUILD and MARKETING_VERSION → $NEW_VERSION"
+
+  # Update CHANGELOG.md
+  echo "==> Updating docs/CHANGELOG.md"
+  local TODAY=$(date +%Y-%m-%d)
+
+  # Check if version already exists
+  if grep -q "^## \[$NEW_VERSION\]" docs/CHANGELOG.md; then
+    yellow "WARNING: Version $NEW_VERSION already exists in CHANGELOG.md"
+    if [[ "${SKIP_CONFIRM:-0}" != "1" ]]; then
+      read -p "Continue anyway? [y/N] " -n 1 -r
+      echo
+      [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    else
+      yellow "SKIP_CONFIRM=1 set, continuing despite existing version in CHANGELOG.md"
+    fi
+  fi
+
+  # Insert new version section directly under [Unreleased] so Unreleased becomes empty
+  awk -v ver="$NEW_VERSION" -v date="$TODAY" '
+/^## \[Unreleased\]/ {
+    print
+    print ""
+    print "## [" ver "] - " date
+    next
+}
+{ print }
+' docs/CHANGELOG.md > docs/CHANGELOG.md.tmp && mv docs/CHANGELOG.md.tmp docs/CHANGELOG.md
+
+  # Verify CHANGELOG has new section
+  if ! grep -q "^## \[$NEW_VERSION\] - $TODAY" docs/CHANGELOG.md; then
+    red "ERROR: Failed to update CHANGELOG.md"
+    exit 1
+  fi
+  green "✓ Added [$NEW_VERSION] section to CHANGELOG.md"
+
+  # Show diff for review
+  echo ""
+  echo "==> Changes to be committed:"
+  git diff AgentSessions.xcodeproj/project.pbxproj docs/CHANGELOG.md | head -50
+
+  # Confirm before committing
+  echo ""
+  if [[ "${SKIP_CONFIRM:-0}" != "1" ]]; then
+    read -p "Commit these changes? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      yellow "Aborted. Run 'git checkout AgentSessions.xcodeproj/project.pbxproj docs/CHANGELOG.md' to revert."
+      exit 1
+    fi
+  else
+    green "Proceeding automatically (SKIP_CONFIRM=1): committing version bump without interactive prompt"
+  fi
+
+  # Git commit
+  echo "==> Creating git commit"
+  git add AgentSessions.xcodeproj/project.pbxproj docs/CHANGELOG.md
+
+  # Read actual changes from CHANGELOG for commit message
+  local CHANGELOG_EXCERPT=$(sed -n "/^## \[$NEW_VERSION\]/,/^## \[/{/^## \[/d; p;}" docs/CHANGELOG.md | head -15)
+
+  git commit -m "chore: bump version to $NEW_VERSION (build $NEW_BUILD)
+
+Build number: $CURR_BUILD → $NEW_BUILD
+Marketing version: $CURR_MARKETING → $NEW_VERSION
+
+Release highlights:
+$CHANGELOG_EXCERPT
+
+Tool: deploy bump
+Model: Sonnet 4.5
+Why: Version bump for $NEW_VERSION release"
+
+  green "✓ Version bump committed"
+  log INFO "Version bump completed: $CURR_MARKETING → $NEW_VERSION"
+
+  echo ""
+  echo "Next steps:"
+  echo "  1. Review commit: git show HEAD"
+  echo "  2. Push to GitHub: git push origin main"
+  echo "  3. Re-run exact-commit QA: tools/release/deploy qa --version $NEW_VERSION"
+  echo "  4. Deploy: tools/release/deploy release $NEW_VERSION"
+}
+
+# ============================================================================
+# SUBCOMMAND: qa
+# ============================================================================
+
+cmd_qa() {
+  shift # remove 'qa' from args
+  local VERSION=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version)
+        VERSION="${2:-}"
+        shift 2
+        ;;
+      -*)
+        red "ERROR: Unknown option: $1"
+        echo "Usage: tools/release/deploy qa [--version VERSION]"
+        exit 1
+        ;;
+      *)
+        VERSION="$1"
+        shift
+        ;;
+    esac
+  done
+
+  check_dependencies git xcodebuild python3
+  init_logging "release-qa"
+
+  if [[ -z "$VERSION" ]]; then
+    VERSION=$(current_project_version)
+  fi
+
+  run_release_qa_core "$VERSION"
+}
+
+# Core QA work (build + suites + stamp). Callable from cmd_qa and from
+# require_qa_stamp's auto-run path; must NOT call init_logging (the caller
+# owns logging; re-exec'ing tee here would hijack the release log).
+run_release_qa_core() {
+  local VERSION="$1"
+
+  echo "==> Release QA preflight"
+  if [[ -n $(git status --porcelain) ]]; then
+    red "ERROR: Release QA requires a clean working tree."
+    git status --short
+    exit 2
+  fi
+
+  if [[ $(git branch --show-current) != "main" ]]; then
+    red "ERROR: Release QA must run on main (currently on $(git branch --show-current))"
+    exit 2
+  fi
+
+  git fetch origin main --quiet
+  if [[ $(git rev-parse HEAD) != $(git rev-parse origin/main) ]]; then
+    red "ERROR: Release QA must run on the same commit as origin/main."
+    red "Push or pull before running QA."
+    exit 2
+  fi
+  green "✓ Clean main synced with origin/main"
+  invalidate_qa_stamp
+
+  local started_at
+  started_at=$(date -Iseconds)
+  local head
+  head=$(git rev-parse HEAD)
+  local last_tag
+  last_tag=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | head -n1 || true)
+
+  echo "==> Release QA"
+  echo "Version: $VERSION"
+  echo "HEAD:    $head"
+  echo "Last tag: ${last_tag:-<none>}"
+  echo ""
+
+  echo "==> Scope"
+  git log --oneline --decorate -n 30
+  if [[ -n "$last_tag" ]]; then
+    echo ""
+    echo "==> Files changed since $last_tag"
+    git diff --name-only "$last_tag..HEAD"
+  fi
+
+  echo ""
+  echo "==> Xcode toolchain parity"
+  python3 scripts/check_xcode_version.py
+
+  echo ""
+  echo "==> CI docs guards"
+  scripts/check_deploy_drift.sh
+  python3 scripts/check_docs_publish.py
+
+  echo ""
+  echo "==> Localization catalog validation"
+  python3 -m unittest scripts.tests.test_validate_localization_catalogs
+  python3 scripts/validate_localization_catalogs.py
+
+  echo ""
+  echo "==> Debug build (CI parity)"
+  local localization_derived_data=".deriveddata-localization"
+  local localization_extraction_root="$localization_derived_data/Build/Intermediates.noindex/AgentSessions.build/Debug/AgentSessions.build/Objects-normal"
+  local build_log="/tmp/agent-sessions-qa-build-$(date +%s).log"
+  xcodebuild \
+    -project AgentSessions.xcodeproj \
+    -scheme AgentSessions \
+    -configuration Debug \
+    -destination 'platform=macOS' \
+    -derivedDataPath "$localization_derived_data" \
+    CODE_SIGNING_ALLOWED=NO \
+    clean build 2>&1 | tee "$build_log"
+
+  echo ""
+  echo "==> Localization extraction drift (CI parity)"
+  python3 scripts/validate_localization_catalogs.py \
+    --extraction-root "$localization_extraction_root"
+
+  echo ""
+  echo "==> Stable XCTest"
+  ./scripts/xcode_test_stable.sh
+
+  # The "Executed N tests" lines in the log are PER TEST BUNDLE and this scheme has
+  # two, so reading the last one silently drops the smaller bundle -- during the 5.1.1
+  # release stdout said 2396 where the real total was 2448. agents.md makes the count an
+  # invariant; print the authoritative one here so a release operator compares against
+  # the same number the handover records.
+  # Read the derived-data directory out of the test script rather than repeating the
+  # literal here: two independent copies drift, and this one drifting is invisible --
+  # it falls to the "no .xcresult found" branch, which looks exactly like a machine
+  # that has not run tests yet.
+  local dd_dir=""
+  dd_dir=$(sed -n 's|^DERIVED_DATA_PATH="\${PWD}/\(.*\)"$|\1|p' scripts/xcode_test_stable.sh | head -1) || dd_dir=""
+  if [[ -z "$dd_dir" ]]; then
+    yellow "  (could not read DERIVED_DATA_PATH from scripts/xcode_test_stable.sh — falling back)"
+    dd_dir=".deriveddata-tests"
+  fi
+
+  # `|| xcresult=""` is required, not defensive: on a clean checkout the glob matches
+  # nothing, ls exits non-zero, pipefail propagates it out of the command substitution,
+  # and set -e would abort QA over a missing readout.
+  local xcresult=""
+  xcresult=$(ls -td "$dd_dir"/Logs/Test/Run-*.xcresult 2>/dev/null | head -1) || xcresult=""
+  if [[ -z "$xcresult" ]]; then
+    red "ERROR: no .xcresult under $dd_dir — cannot verify the test count."
+    red "The suite must run before release QA can vouch for it."
+    return 1
+  fi
+
+  echo "==> Test totals (from the result bundle, not stdout)"
+  local passed=""
+  passed=$(xcrun xcresulttool get test-results summary --path "$xcresult" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    s = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print("%d %d %d" % (s.get("passedTests") or 0, s.get("failedTests") or 0, s.get("skippedTests") or 0))') || passed=""
+  if [[ -z "$passed" ]]; then
+    red "ERROR: could not read test totals from $xcresult"
+    return 1
+  fi
+  local n_pass n_fail n_skip
+  read -r n_pass n_fail n_skip <<<"$passed"
+  echo "  passed: $n_pass · failed: $n_fail · skipped: $n_skip"
+
+  # agents.md treats the test count as an invariant, so compare it rather than just
+  # printing it: a silently deleted suite still exits 0 from xcodebuild, and a number
+  # with nothing to compare against relies on a human noticing four digits changed.
+  local baseline_file="tools/release/test-count-baseline.txt" baseline=""
+  baseline=$(cat "$baseline_file" 2>/dev/null | tr -dc '0-9') || baseline=""
+  if [[ -z "$baseline" ]]; then
+    yellow "  (no baseline in $baseline_file — skipping the count check)"
+  elif (( n_pass < baseline )); then
+    # Warns rather than blocks, deliberately. Blocking would stop a release until
+    # someone edited the baseline, which is a surprising failure for anyone who has
+    # not seen it before. The trade is real: this line has to actually be read.
+    red "WARNING: test count dropped: $n_pass passed, baseline is $baseline ($(( baseline - n_pass )) fewer)."
+    red "Tests were removed or stopped running. If that was intended, update"
+    red "$baseline_file. If not, stop and investigate before releasing."
+  elif (( n_pass > baseline )); then
+    yellow "  test count rose ($baseline → $n_pass) — bump $baseline_file in this release."
+  fi
+
+  if [[ -d scripts/tests ]]; then
+    echo ""
+    echo "==> Python release/script tests"
+    PYTHONPATH=scripts python3 -m pytest scripts/tests
+  fi
+
+  echo ""
+  echo "==> Warning sweep"
+  if grep -n "warning:" "$build_log" >/tmp/agent-sessions-qa-warnings.txt 2>/dev/null; then
+    yellow "Build warnings found in $build_log:"
+    sed -n '1,40p' /tmp/agent-sessions-qa-warnings.txt
+    yellow "Review whether these warnings are pre-existing or actionable before release."
+  else
+    green "✓ No build warnings found"
+  fi
+
+  write_qa_stamp "$VERSION" "$head" "$started_at"
+  green "✓ Release QA stamp written: $QA_STAMP_FILE"
+}
+
+# ============================================================================
+# SUBCOMMAND: release
+# ============================================================================
+
+cmd_release() {
+  shift # remove 'release' from args
+
+  # Parse release arguments
+  local VERSION=""
+  local DRY_RUN=0
+  local SKIP_VALIDATION=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --skip-validation)
+        SKIP_VALIDATION=1
+        shift
+        ;;
+      --skip-qa)
+        export SKIP_QA=1
+        shift
+        ;;
+      -*)
+        red "ERROR: Unknown option: $1"
+        echo "Usage: tools/release/deploy release VERSION [--dry-run] [--skip-validation] [--skip-qa]"
+        exit 1
+        ;;
+      *)
+        VERSION="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$VERSION" ]]; then
+    red "ERROR: VERSION not provided"
+    echo "Usage: tools/release/deploy release VERSION [--dry-run] [--skip-validation] [--skip-qa]"
+    exit 1
+  fi
+
+  check_dependencies xcodebuild git gh python3 curl shasum codesign hdiutil security
+  init_logging "release-${VERSION}"
+
+  log INFO "Starting release deployment for version $VERSION"
+
+  # ============================================================================
+  # DRY-RUN MODE
+  # ============================================================================
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    yellow "  DRY-RUN MODE - No changes will be made"
+    echo "═══════════════════════════════════════════════════════════"
+    echo ""
+
+    echo "==> Version: $VERSION"
+    echo ""
+
+    echo "==> Pre-deployment validation would run..."
+    if [[ -x "$REPO_ROOT/tools/release/validate-release.sh" ]]; then
+      "$REPO_ROOT/tools/release/validate-release.sh" "$VERSION"
+    else
+      yellow "    validate-release.sh not found"
+    fi
+
+    echo ""
+    echo "==> Steps that would be performed:"
+    echo "    1. Build Release configuration (xcodebuild)"
+    echo "    2. Sign app and create DMG"
+    echo "    3. Submit to Apple Notary and staple ticket"
+    echo "    4. Generate SHA256 checksum"
+    echo "    5. Generate and lint Sparkle release notes/appcast"
+    echo "    6. Pause for release-notes approval when interactive"
+    echo "    7. Publish GitHub Release assets and curated notes"
+    echo "    8. Commit/push appcast to GitHub Pages"
+    echo "    9. Normalize README/docs download links"
+    echo "    10. Update Homebrew cask via GitHub API"
+    echo "    11. Run post-deployment verification"
+    echo ""
+
+    echo "==> Files that would be modified:"
+    echo "    - dist/AgentSessions-$VERSION.dmg (created)"
+    echo "    - dist/AgentSessions-$VERSION.dmg.sha256 (created)"
+    echo "    - docs/appcast.xml (updated)"
+    echo "    - README.md and docs/index.html download links (if stale)"
+    echo "    - jazzyalex/homebrew-agent-sessions cask via GitHub API"
+    echo ""
+
+    echo "═══════════════════════════════════════════════════════════"
+    green "  DRY-RUN complete. Run without --dry-run to deploy."
+    echo "═══════════════════════════════════════════════════════════"
+    return 0
+  fi
+
+  require_qa_stamp "$VERSION"
+  local RELEASE_QA_HEAD
+  RELEASE_QA_HEAD=$(qa_stamp_head)
+  if [[ -z "$RELEASE_QA_HEAD" ]]; then
+    red "ERROR: Could not read release QA stamp head."
+    exit 2
+  fi
+
+  # ============================================================================
+  # PRE-DEPLOYMENT VALIDATION
+  # ============================================================================
+  if [[ "$SKIP_VALIDATION" -eq 1 ]]; then
+    echo ""
+    yellow "⚠️  SKIP_VALIDATION=1: Skipping pre-deployment validation"
+    yellow "   This is not recommended for production releases!"
+    echo ""
+  else
+    echo ""
+    echo "==> Running pre-deployment validation..."
+
+    if [[ -x "$REPO_ROOT/tools/release/validate-release.sh" ]]; then
+      local VALIDATION_EXIT=0
+      "$REPO_ROOT/tools/release/validate-release.sh" "$VERSION" || VALIDATION_EXIT=$?
+
+      if [[ "$VALIDATION_EXIT" -eq 2 ]]; then
+        red ""
+        red "═══════════════════════════════════════════════════════════"
+        red "  VALIDATION FAILED: Cannot proceed with deployment"
+        red "  Fix the errors above and retry."
+        red "═══════════════════════════════════════════════════════════"
+        exit 2
+      elif [[ "$VALIDATION_EXIT" -eq 1 ]]; then
+        yellow ""
+        yellow "═══════════════════════════════════════════════════════════"
+        yellow "  VALIDATION PASSED WITH WARNINGS"
+        yellow "═══════════════════════════════════════════════════════════"
+        echo ""
+        if [[ "${SKIP_CONFIRM:-0}" != "1" ]]; then
+          read -p "Continue with deployment despite warnings? [y/N] " -n 1 -r
+          echo
+          if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            yellow "Deployment aborted. Fix warnings and retry."
+            exit 1
+          fi
+        else
+          yellow "SKIP_CONFIRM=1: Proceeding despite warnings"
+        fi
+      else
+        green ""
+        green "═══════════════════════════════════════════════════════════"
+        green "  VALIDATION PASSED: All checks OK"
+        green "═══════════════════════════════════════════════════════════"
+      fi
+    else
+      yellow "WARNING: validate-release.sh not found, skipping validation"
+    fi
+    echo ""
+  fi
+
+  # Source the existing deploy-agent-sessions.sh script with VERSION set
+  export VERSION="$VERSION"
+  export SKIP_CONFIRM="${SKIP_CONFIRM:-0}"
+  export RELEASE_QA_HEAD
+
+  # Call the existing deployment script
+  "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+}
+
+# ============================================================================
+# SUBCOMMAND: verify
+# ============================================================================
+
+cmd_verify() {
+  shift # remove 'verify' from args
+  local VERSION="${1:-}"
+
+  if [[ -z "$VERSION" ]]; then
+    red "ERROR: VERSION not provided"
+    echo "Usage: tools/release/deploy verify VERSION"
+    exit 1
+  fi
+
+  check_dependencies git gh curl grep base64
+
+  log INFO "Starting deployment verification for version $VERSION"
+
+  # Call the existing verify-deployment.sh script
+  "$REPO_ROOT/tools/release/verify-deployment.sh" "$VERSION"
+}
+
+# ============================================================================
+# SUBCOMMAND: changelog
+# ============================================================================
+
+cmd_changelog() {
+  shift # remove 'changelog' from args
+  local FROM_TAG="${1:-}"
+
+  check_dependencies git grep sed
+
+  # Auto-detect last tag if not provided
+  if [[ -z "$FROM_TAG" ]]; then
+    FROM_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | head -n1)
+    if [[ -z "$FROM_TAG" ]]; then
+      red "ERROR: No previous tags found and no FROM_TAG specified"
+      exit 1
+    fi
+    yellow "Using last tag: $FROM_TAG"
+  fi
+
+  echo "==> Generating CHANGELOG from $FROM_TAG..HEAD"
+  echo ""
+
+  # Extract conventional commits
+  local FEAT_COMMITS=$(git log --pretty=format:"%s" "$FROM_TAG..HEAD" | grep "^feat:" || true)
+  local FIX_COMMITS=$(git log --pretty=format:"%s" "$FROM_TAG..HEAD" | grep "^fix:" || true)
+  local PERF_COMMITS=$(git log --pretty=format:"%s" "$FROM_TAG..HEAD" | grep "^perf:" || true)
+  local REFACTOR_COMMITS=$(git log --pretty=format:"%s" "$FROM_TAG..HEAD" | grep "^refactor:" || true)
+  local DOCS_COMMITS=$(git log --pretty=format:"%s" "$FROM_TAG..HEAD" | grep "^docs:" || true)
+
+  # Count commits by category
+  local FEAT_COUNT=$(count_lines "$FEAT_COMMITS")
+  local FIX_COUNT=$(count_lines "$FIX_COMMITS")
+  local PERF_COUNT=$(count_lines "$PERF_COMMITS")
+  local REFACTOR_COUNT=$(count_lines "$REFACTOR_COMMITS")
+  local DOCS_COUNT=$(count_lines "$DOCS_COMMITS")
+
+  echo "Commit breakdown:"
+  echo "  Features:     $FEAT_COUNT"
+  echo "  Fixes:        $FIX_COUNT"
+  echo "  Performance:  $PERF_COUNT"
+  echo "  Refactoring:  $REFACTOR_COUNT"
+  echo "  Docs:         $DOCS_COUNT"
+  echo ""
+
+  # Generate CHANGELOG content
+  local OUTPUT=""
+
+  if [[ -n "$FEAT_COMMITS" ]]; then
+    OUTPUT+="### Added\n"
+    while IFS= read -r commit; do
+      local MSG=$(echo "$commit" | sed -E 's/^feat(\([^)]+\))?:[[:space:]]*//')
+      OUTPUT+="- $MSG\n"
+    done <<< "$FEAT_COMMITS"
+    OUTPUT+="\n"
+  fi
+
+  if [[ -n "$FIX_COMMITS" ]]; then
+    OUTPUT+="### Fixed\n"
+    while IFS= read -r commit; do
+      local MSG=$(echo "$commit" | sed -E 's/^fix(\([^)]+\))?:[[:space:]]*//')
+      OUTPUT+="- $MSG\n"
+    done <<< "$FIX_COMMITS"
+    OUTPUT+="\n"
+  fi
+
+  if [[ -n "$PERF_COMMITS" ]]; then
+    OUTPUT+="### Performance\n"
+    while IFS= read -r commit; do
+      local MSG=$(echo "$commit" | sed -E 's/^perf(\([^)]+\))?:[[:space:]]*//')
+      OUTPUT+="- $MSG\n"
+    done <<< "$PERF_COMMITS"
+    OUTPUT+="\n"
+  fi
+
+  if [[ -n "$REFACTOR_COMMITS" ]]; then
+    OUTPUT+="### Refactoring\n"
+    while IFS= read -r commit; do
+      local MSG=$(echo "$commit" | sed -E 's/^refactor(\([^)]+\))?:[[:space:]]*//')
+      OUTPUT+="- $MSG\n"
+    done <<< "$REFACTOR_COMMITS"
+    OUTPUT+="\n"
+  fi
+
+  if [[ -n "$DOCS_COMMITS" ]]; then
+    OUTPUT+="### Documentation\n"
+    while IFS= read -r commit; do
+      local MSG=$(echo "$commit" | sed -E 's/^docs(\([^)]+\))?:[[:space:]]*//')
+      OUTPUT+="- $MSG\n"
+    done <<< "$DOCS_COMMITS"
+    OUTPUT+="\n"
+  fi
+
+  if [[ -z "$OUTPUT" ]]; then
+    yellow "No conventional commits found. Showing all commits instead:"
+    echo ""
+    git log --pretty='- %s' "$FROM_TAG..HEAD"
+    exit 0
+  fi
+
+  green "==> Generated CHANGELOG:"
+  echo ""
+  echo -e "$OUTPUT"
+
+  echo ""
+  if [[ -t 0 && "${SKIP_CONFIRM:-0}" != "1" ]]; then
+    read -p "Save to CHANGELOG snippet file? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      local SNIPPET_FILE="/tmp/changelog-snippet-$(date +%s).md"
+      echo -e "$OUTPUT" > "$SNIPPET_FILE"
+      green "✓ Saved to $SNIPPET_FILE"
+      echo ""
+      echo "You can now copy this content into docs/CHANGELOG.md under the [Unreleased] section"
+    fi
+  else
+    yellow "Preview only: CHANGELOG snippet was printed and no files were modified."
+  fi
+}
+
+# ============================================================================
+# SUBCOMMAND: resume
+# ============================================================================
+
+cmd_resume() {
+  shift # remove 'resume' from args
+
+  check_dependencies git gh python3
+
+  # Load saved state
+  if ! state_json=$(load_state); then
+    red "ERROR: No deployment state found"
+    echo "Nothing to resume. Use 'tools/release/deploy release VERSION' to start a new deployment."
+    exit 1
+  fi
+
+  local version=$(echo "$state_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))')
+  local last_step=$(echo "$state_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("last_step",""))')
+  local saved_head=$(echo "$state_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("head",""))')
+  local saved_release_head=$(echo "$state_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("release_head") or data.get("head",""))')
+  local saved_log=$(echo "$state_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("log_file",""))')
+
+  if [[ -z "$version" ]] || [[ -z "$last_step" ]]; then
+    red "ERROR: Invalid state file"
+    exit 1
+  fi
+
+  if [[ -z "$saved_head" ]]; then
+    red "ERROR: Deployment state is missing git HEAD. Restart with tools/release/deploy release $version."
+    exit 2
+  fi
+
+  local current_head
+  current_head=$(git rev-parse HEAD)
+  if [[ "$current_head" != "$saved_head" ]]; then
+    red "ERROR: Cannot resume from a different git HEAD."
+    red "  State HEAD:   $saved_head"
+    red "  Current HEAD: $current_head"
+    red "Return to the saved commit or restart the release."
+    exit 2
+  fi
+
+  local dirty_mode="strict"
+  if [[ "$last_step" == "github_release_published" ]]; then
+    dirty_mode="allow-appcast"
+  fi
+  require_qa_stamp "$version" "$saved_release_head" "$dirty_mode"
+
+  echo "═══════════════════════════════════════════════════════════"
+  echo "  Resuming deployment for version $version"
+  echo "  Last completed step: $last_step"
+  echo "  Checkpoint HEAD: $saved_head"
+  echo "  QA release HEAD: $saved_release_head"
+  if [[ -f "$saved_log" ]]; then
+    echo "  Previous log: $saved_log"
+  fi
+  echo "═══════════════════════════════════════════════════════════"
+  echo ""
+
+  # Determine next steps based on last completed step
+  case "$last_step" in
+    "notarization_submitted")
+      green "==> Checking notarization status..."
+      # Continue with deployment script - it will handle waiting/stapling
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      export RESUME_FROM="notarization"
+      "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+      ;;
+
+    "build_complete")
+      green "==> Continuing with appcast generation..."
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      export RESUME_FROM="appcast"
+      "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+      ;;
+
+    "appcast_generated")
+      green "==> Continuing after appcast publication..."
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      export GITHUB_RELEASE_PUBLISHED=1
+      export RESUME_FROM="post_appcast"
+      "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+      ;;
+
+    "github_release_published")
+      green "==> Continuing after GitHub release asset publication..."
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_NOTES_REVIEWED="${RELEASE_NOTES_REVIEWED:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      export GITHUB_RELEASE_PUBLISHED=1
+      export RESUME_FROM="appcast"
+      "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+      ;;
+
+    "appcast_committed")
+      green "==> Continuing appcast publication..."
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      export GITHUB_RELEASE_PUBLISHED=1
+      export RESUME_FROM="appcast_committed"
+      "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+      ;;
+
+    "github_release_created")
+      green "==> GitHub release already created, running verification..."
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      export GITHUB_RELEASE_PUBLISHED=1
+      if [[ -x "$REPO_ROOT/tools/release/verify-deployment.sh" ]]; then
+        "$REPO_ROOT/tools/release/verify-deployment.sh" "$version"
+      else
+        yellow "WARNING: verify-deployment.sh not found"
+      fi
+      ;;
+
+    *)
+      yellow "Unknown step: $last_step"
+      echo "Attempting to continue full deployment..."
+      export VERSION="$version"
+      export SKIP_CONFIRM="${SKIP_CONFIRM:-1}"
+      export RELEASE_QA_HEAD="$saved_release_head"
+      "$REPO_ROOT/tools/release/deploy-agent-sessions.sh"
+      ;;
+  esac
+
+  clear_state
+  green "Resume complete!"
+}
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+cmd_help() {
+  cat << 'EOF'
+deploy - Unified deployment tool for Agent Sessions
+
+USAGE:
+    tools/release/deploy <subcommand> [options]
+
+SUBCOMMANDS:
+    bump [major|minor|patch]    Bump version and update CHANGELOG
+                                Default: patch
+
+    release VERSION [OPTIONS]   Build, sign, notarize, and publish release
+                                Runs full deployment pipeline
+
+                                Options:
+                                  --dry-run         Show what would happen without executing
+                                  --skip-validation Skip pre-deployment validation (not recommended)
+                                  --skip-qa         Skip required QA stamp (not recommended)
+
+    qa [--version VERSION]      Run release QA and write the QA stamp required
+                                by the release command
+
+    verify VERSION              Verify deployment completed successfully
+                                Checks GitHub release, appcast, Homebrew cask
+
+    changelog [FROM_TAG]        Generate CHANGELOG from conventional commits
+                                Auto-detects last tag if not specified
+
+    resume                      Resume failed deployment from last checkpoint
+                                Automatically continues from where it left off
+
+    status                      Show whether a deployment is running, its
+                                current phase, checkpoint, and recent log lines
+
+DOCUMENTATION:
+    See docs/deployment.md for prerequisites, environment variables, logs, and troubleshooting.
+
+EOF
+}
+
+# ============================================================================
+# SUBCOMMAND: status
+# ============================================================================
+
+cmd_status() {
+  echo "==> Deploy status"
+
+  # 1. Live processes
+  local live
+  live=$(pgrep -fl "deploy-agent-sessions.sh|build_sign_notarize_release.sh" 2>/dev/null || true)
+  local building
+  building=$(pgrep -fl "xcodebuild.*AgentSessions" 2>/dev/null || true)
+  local notarizing
+  notarizing=$(pgrep -fl "notarytool" 2>/dev/null || true)
+
+  if [[ -n "$live" ]]; then
+    green "Pipeline: RUNNING"
+    [[ -n "$building" ]]   && echo "  Phase: Release build in progress (typ. ~8-12 min)"
+    [[ -n "$notarizing" ]] && echo "  Phase: notarization in progress (typ. 2-10 min)"
+  else
+    echo "Pipeline: not running"
+  fi
+
+  # 2. Checkpoint state
+  if [[ -f "$STATE_FILE" ]]; then
+    echo ""
+    echo "Checkpoint ($STATE_FILE):"
+    python3 -c "
+import json,sys
+from datetime import datetime,timezone
+s=json.load(open('$STATE_FILE'))
+ts=s.get('timestamp','')
+age=''
+try:
+    dt=datetime.fromisoformat(ts)
+    if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+    age=f\" ({int((datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()//60)} min ago)\"
+except Exception: pass
+print(f\"  version: {s.get('version')}  last_step: {s.get('last_step')}{age}\")
+" 2>/dev/null || cat "$STATE_FILE"
+  else
+    echo "Checkpoint: none (no deployment in progress or last one completed cleanly)"
+  fi
+
+  # 3. Latest log tail
+  local latest_log
+  latest_log=$(ls -t /tmp/deploy-*.log /tmp/release-*.log 2>/dev/null | head -n1 || true)
+  if [[ -n "$latest_log" ]]; then
+    echo ""
+    echo "Latest log: $latest_log"
+    echo "Recent progress:"
+    grep -E "^==>|^\[20|ERROR|WARN|✓" "$latest_log" 2>/dev/null | tail -8 | sed 's/^/  /'
+  fi
+}
+
+# ============================================================================
+# MAIN DISPATCHER
+# ============================================================================
+
+SUBCOMMAND="${1:-help}"
+
+case "$SUBCOMMAND" in
+  bump)
+    cmd_bump "$@"
+    ;;
+  qa)
+    cmd_qa "$@"
+    ;;
+  release)
+    cmd_release "$@"
+    ;;
+  verify)
+    cmd_verify "$@"
+    ;;
+  changelog)
+    cmd_changelog "$@"
+    ;;
+  status)
+    cmd_status
+    ;;
+  resume)
+    cmd_resume "$@"
+    ;;
+  help|--help|-h)
+    cmd_help
+    ;;
+  *)
+    red "ERROR: Unknown subcommand: $SUBCOMMAND"
+    echo ""
+    cmd_help
+    exit 1
+    ;;
+esac

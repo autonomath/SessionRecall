@@ -1,0 +1,146 @@
+import Foundation
+
+/// Per-turn duration ("how long did the assistant take to answer"), attached
+/// to the turn's anchor block (see `TranscriptTurnTiming`).
+struct TurnTiming: Equatable {
+    var durationSeconds: Double?
+    var toolCallCount: Int
+}
+
+/// Per-tool-call duration ("how long did this tool take"), keyed by each
+/// output block's `globalBlockIndex` (see `TranscriptTurnTiming`).
+struct ToolTiming: Equatable {
+    var durationSeconds: Double?
+}
+
+/// Pure per-turn and per-tool duration computation from coalesced
+/// `LogicalBlock` timestamps (Phase 3 Task 18). No UI, no state — safe to
+/// call from a controller's `apply`/derived-state path on every rebuild, same
+/// discipline as `TranscriptToolSummary`.
+///
+/// Timing definitions:
+/// - A turn starts only at a typed user message. Its chip anchors on the first
+///   visible agent message, with no user-anchor fallback. The turn ends before
+///   the next typed user message or at an explicit interruption/abort notice.
+/// - `durationSeconds` measures from the typed prompt to the last visible agent
+///   reply, tool block, error, or explicit interruption/abort notice in that turn.
+///   Bare harness tails do not extend the endpoint. The duration is nil if either
+///   timestamp is missing or the delta is negative (clock skew).
+/// - Turns without a visible agent message have no chip.
+/// - `toolCallCount` = number of `.toolCall` blocks in the turn.
+/// - Tool duration comes from the call ↔ output pairing in
+///   `ToolInvocationIndex` (spec §6.2): by call id, then FIFO inside the turn,
+///   then a stack fallback for an output with no open call in its own turn.
+///   Pairing is session-wide. Each output of an invocation with a call gets
+///   `timestamp(output) − timestamp(call)`, keyed by the output's
+///   `globalBlockIndex`. nil duration if either timestamp is missing or the
+///   delta is negative. An output with no call (orphan) gets no entry.
+///   Id-less parallel calls (`call1, call2, out, out`) pair in arrival order:
+///   parallel calls are far more common than nested ones, and nested calls
+///   from agents that record ids pair by id.
+enum TranscriptTurnTiming {
+
+    /// Builds the pairing itself for the session's agent. Callers that hold a
+    /// snapshot's `ToolInvocationIndex` use `compute(blocks:index:)`.
+    static func compute(
+        blocks: [SessionTranscriptBuilder.LogicalBlock],
+        source: SessionSource
+    ) -> (turns: [Int: TurnTiming], tools: [Int: ToolTiming]) {
+        compute(blocks: blocks, index: ToolInvocationIndex.build(blocks: blocks, source: source), source: source)
+    }
+
+    /// - Parameters:
+    ///   - blocks: the full session stream (`globalBlockIndex` == position).
+    ///   - index: the pairing built from the same `blocks`.
+    ///   - turnIndex: the turn segmentation of the same `blocks`; built here when nil.
+    static func compute(
+        blocks: [SessionTranscriptBuilder.LogicalBlock],
+        index: ToolInvocationIndex,
+        source: SessionSource = .claude,
+        turnIndex: TranscriptTurnIndex? = nil
+    ) -> (turns: [Int: TurnTiming], tools: [Int: ToolTiming]) {
+        var turns: [Int: TurnTiming] = [:]
+        var tools: [Int: ToolTiming] = [:]
+
+        // MARK: Tool durations — from the session-wide pairing.
+        func timestamp(_ globalBlockIndex: Int) -> Date? {
+            guard blocks.indices.contains(globalBlockIndex),
+                  blocks[globalBlockIndex].globalBlockIndex == globalBlockIndex else { return nil }
+            return blocks[globalBlockIndex].timestamp
+        }
+        for invocation in index.invocations {
+            guard let callIndex = invocation.callBlockIndex else { continue }
+            let callTimestamp = timestamp(callIndex)
+            for outputIndex in invocation.outputBlockIndices {
+                tools[outputIndex] = ToolTiming(
+                    durationSeconds: duration(from: callTimestamp, to: timestamp(outputIndex)))
+            }
+        }
+
+        // MARK: Turn segmentation — shared with `TranscriptTurns`.
+        let turnIndex = turnIndex ?? TranscriptTurns.index(blocks: blocks, source: source)
+        for turn in turnIndex.turns {
+            let userBlock = blocks[turn.startIndex]
+            let turnBlocks = blocks[turn.startIndex..<turn.endIndex]
+
+            let anchorIndex = turn.agentBlockIndices.first.map { blocks[$0].globalBlockIndex }
+            let toolCallCount = turnBlocks.reduce(into: 0) { count, block in
+                if block.kind == .toolCall { count += 1 }
+            }
+            let lastBlock = turnBlocks.last(where: {
+                $0.kind.isTool || $0.kind == .error ||
+                TranscriptTurns.isAgentText($0, source: source) ||
+                $0.isInterruptControlMessage ||
+                ($0.kind == .meta && ToolInvocationIndex.isTurnAbortedNotice($0.text))
+            }) ?? userBlock
+            let durationSeconds = duration(from: userBlock.timestamp, to: lastBlock.timestamp)
+
+            if let anchorIndex {
+                turns[anchorIndex] = TurnTiming(durationSeconds: durationSeconds, toolCallCount: toolCallCount)
+            }
+        }
+
+        return (turns, tools)
+    }
+
+    /// Seconds from `start` to `end`; nil if either is missing or the delta is
+    /// negative (clock skew — never surface a bogus negative duration).
+    private static func duration(from start: Date?, to end: Date?) -> Double? {
+        guard let start, let end else { return nil }
+        let delta = end.timeIntervalSince(start)
+        return delta >= 0 ? delta : nil
+    }
+
+    // MARK: - Static badge formatting (Phase 3 Task 19)
+
+    /// Pure duration formatter, shared by the turn chip and the per-tool
+    /// duration suffix. Bucket is chosen from the RAW (unrounded) value:
+    /// < 10s → one decimal (`"4.8s"`); 10–59.999...s → whole seconds
+    /// (`"42s"`); >= 60s → minutes + whole seconds (`"1m 12s"`). All
+    /// rounding is `String(format:)`'s standard round-half-to-even-on-the-
+    /// underlying-double behavior — e.g. `9.95` (not exactly representable)
+    /// renders `"9.9s"`, not `"10.0s"` (pinned by
+    /// `TranscriptTurnTimingTests.testFormatDurationRoundingBoundary`).
+    static func formatDuration(_ seconds: Double) -> String {
+        guard seconds >= 60 else {
+            if seconds < 10 {
+                return String(format: "%.1fs", seconds)
+            }
+            return "\(Int(seconds.rounded()))s"
+        }
+        let totalSeconds = Int(seconds.rounded())
+        let minutes = totalSeconds / 60
+        let remainderSeconds = totalSeconds % 60
+        return "\(minutes)m \(remainderSeconds)s"
+    }
+
+    /// Assembled turn-chip text: `"4.8s · 1 call"` / `"4.8s"` (0 calls) /
+    /// `""` (nil duration — the caller renders nothing, never an empty chip).
+    /// Pure so the assembly rule is unit-testable independent of the view.
+    static func turnChipText(durationSeconds: Double?, toolCallCount: Int) -> String {
+        guard let durationSeconds else { return "" }
+        let formatted = formatDuration(durationSeconds)
+        guard toolCallCount > 0 else { return formatted }
+        return "\(formatted) · \(toolCallCount) call\(toolCallCount == 1 ? "" : "s")"
+    }
+}

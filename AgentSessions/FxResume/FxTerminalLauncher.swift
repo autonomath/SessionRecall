@@ -1,0 +1,48 @@
+import Foundation
+
+@MainActor
+protocol FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws
+}
+
+@MainActor
+final class FxTerminalLauncher: FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws {
+        try AgentTerminalLauncher.launchInTerminal(shellCommand: package.shellCommand, domain: "FxTerminalLauncher")
+    }
+}
+
+@MainActor
+final class FxITermLauncher: FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws {
+        try AgentTerminalLauncher.launchInITerm(shellCommand: package.shellCommand, domain: "FxITermLauncher")
+    }
+}
+
+@MainActor
+final class FxWarpLauncher: FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws {
+        try await AgentTerminalLauncher.launchInWarp(shellCommand: package.displayCommand, cwd: package.workingDirectory?.path, kind: .warp)
+    }
+}
+
+@MainActor
+final class FxWarpPreviewLauncher: FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws {
+        try await AgentTerminalLauncher.launchInWarp(shellCommand: package.displayCommand, cwd: package.workingDirectory?.path, kind: .warpPreview)
+    }
+}
+
+@MainActor
+final class FxGhosttyLauncher: FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws {
+        try await AgentTerminalLauncher.launchInGhostty(shellCommand: package.displayCommand, cwd: package.workingDirectory?.path)
+    }
+}
+
+@MainActor
+final class FxMactermLauncher: FxTerminalLaunching {
+    func launchInTerminal(_ package: FxResumeCommandBuilder.CommandPackage) async throws {
+        try await AgentTerminalLauncher.launchInMacterm(shellCommand: package.shellCommand, cwd: package.workingDirectory?.path)
+    }
+}

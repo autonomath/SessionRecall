@@ -1,0 +1,20 @@
+{
+  "agents": [
+    { "id": "codex", "public_name": "Codex" },
+    { "id": "claude", "public_name": "Claude" },
+    { "id": "opencode", "public_name": "OpenCode" },
+    { "id": "cursor", "public_name": "Cursor" },
+    { "id": "copilot", "public_name": "GitHub Copilot CLI" },
+    { "id": "pi", "public_name": "Pi" },
+    { "id": "antigravity", "public_name": "Antigravity CLI" },
+    { "id": "hermes", "public_name": "Hermes" },
+    { "id": "openclaw", "public_name": "OpenClaw" },
+    { "id": "kimi", "public_name": "Kimi Code" },
+    { "id": "grok", "public_name": "Grok CLI" },
+    { "id": "qwen", "public_name": "Qwen Code" },
+    { "id": "devin", "public_name": "Devin CLI" },
+    { "id": "fx", "public_name": "fx" },
+    { "id": "cline", "public_name": "Cline" },
+    { "id": "deepseek-harness", "public_name": "DeepSeek Harness" }
+  ]
+}

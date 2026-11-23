@@ -1,0 +1,133 @@
+import Foundation
+
+/// Turns a Devin `message_nodes.chat_message` payload into `SessionEvent`s.
+///
+/// Shapes verified with `scripts/devin_sessions_schema_probe.py` against 253
+/// real sessions at CLI 3000.3.27 (`0becb483`). In that survey `content` was
+/// always a plain string and the structure lived in sibling keys — but nothing
+/// in the store enforces that, and a provider that sends parts arrays would be
+/// read as a turn with no content, so `textContent` accepts both shapes:
+///
+/// - `system` — `{message_id, role, content, metadata}`
+/// - `user` — same, plus an optional `images` array and
+///   `metadata.is_user_input`
+/// - `assistant` — plus `tool_calls` and `thinking`. `tool_calls[]` entries are
+///   `{id, index, kind, name, arguments}` where **`arguments` is a JSON object**,
+///   not the JSON *string* Grok and Kimi use. `thinking` is
+///   `{signature, thinking}`; only the latter is renderable.
+/// - `tool` — plus `tool_call_id` keying it back to the call, and an optional
+///   `images` array of `{width, height, base64_data}`.
+enum DevinSessionParser {
+    /// Builds the events for one node. A single assistant node can yield an
+    /// assistant reply, a thinking block, and several tool calls.
+    static func events(fromChatMessage json: String, nodeID: Int64, time: Date?) -> [SessionEvent] {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [meta(nodeID: nodeID, suffix: "raw", role: nil, text: nil, time: time, raw: json)]
+        }
+
+        let role = object["role"] as? String ?? "?"
+        let content = textContent(from: object["content"])
+        let messageID = object["message_id"] as? String
+
+        switch role {
+        case "user":
+            var text = content
+            if let images = object["images"] as? [[String: Any]], !images.isEmpty {
+                // Images are inline base64; the transcript shows a marker, not
+                // the payload, so a 1.5 MB screenshot never reaches the body.
+                let markers = Array(repeating: "[image]", count: images.count).joined(separator: "\n")
+                text = [markers, content].compactMap { $0 }.joined(separator: "\n")
+            }
+            return [SessionEvent(id: "\(nodeID)-u", timestamp: time, kind: .user, role: role, text: text,
+                                 toolName: nil, toolInput: nil, toolOutput: nil,
+                                 messageID: messageID, parentID: nil, isDelta: false, rawJSON: json)]
+
+        case "assistant":
+            var out: [SessionEvent] = []
+            if let thinking = (object["thinking"] as? [String: Any])?["thinking"] as? String,
+               !thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                out.append(meta(nodeID: nodeID, suffix: "think", role: "thinking",
+                                text: "[thinking] \(thinking)", time: time, raw: json))
+            }
+            if let content, !content.isEmpty {
+                out.append(SessionEvent(id: "\(nodeID)-a", timestamp: time, kind: .assistant, role: role, text: content,
+                                        toolName: nil, toolInput: nil, toolOutput: nil,
+                                        messageID: messageID, parentID: nil, isDelta: false, rawJSON: json))
+            }
+            for (index, call) in (object["tool_calls"] as? [[String: Any]] ?? []).enumerated() {
+                out.append(SessionEvent(id: "\(nodeID)-t\(index)", timestamp: time, kind: .tool_call, role: role, text: nil,
+                                        toolName: call["name"] as? String,
+                                        toolInput: jsonString(call["arguments"]),
+                                        toolOutput: nil,
+                                        toolCallID: ToolCallID.from(call["id"]),
+                                        messageID: call["id"] as? String,
+                                        parentID: messageID, isDelta: false, rawJSON: json))
+            }
+            if out.isEmpty {
+                out.append(meta(nodeID: nodeID, suffix: "a", role: role, text: nil, time: time, raw: json))
+            }
+            return out
+
+        case "tool":
+            var output = content
+            if let images = object["images"] as? [[String: Any]], !images.isEmpty {
+                // Same marker rule as the user arm: the payload never reaches
+                // the transcript body.
+                let markers = Array(repeating: "[image]", count: images.count).joined(separator: "\n")
+                output = [markers, content].compactMap { $0 }.joined(separator: "\n")
+            }
+            return [SessionEvent(id: "\(nodeID)-r", timestamp: time, kind: .tool_result, role: role, text: nil,
+                                 toolName: nil, toolInput: nil, toolOutput: output,
+                                 toolCallID: ToolCallID.from(object["tool_call_id"]),
+                                 messageID: object["tool_call_id"] as? String,
+                                 parentID: nil, isDelta: false, rawJSON: json)]
+
+        case "system":
+            return [meta(nodeID: nodeID, suffix: "s", role: role, text: content, time: time, raw: json)]
+
+        default:
+            return [meta(nodeID: nodeID, suffix: "m", role: role, text: content, time: time, raw: json)]
+        }
+    }
+
+    /// `content` is a plain string in every node the 253-session survey saw, but
+    /// the OpenAI-shaped parts array is the other form providers send and the
+    /// store does not constrain it. Reading only the string form turns such a
+    /// node into a contentless turn — for an assistant node that means falling
+    /// through to the `meta` fallback, which the default filters hide, so the
+    /// turn disappears from the transcript rather than rendering wrong. Same
+    /// tolerance as `GrokSessionParser.textContent`.
+    private static func textContent(from content: Any?) -> String? {
+        if let string = content as? String { return string }
+        guard let parts = content as? [[String: Any]] else { return nil }
+        let chunks: [String] = parts.compactMap { part in
+            switch part["type"] as? String {
+            case "text": return part["text"] as? String
+            case "image", "image_url": return "[image]"
+            default: return nil
+            }
+        }
+        let joined = chunks.joined(separator: "\n")
+        return joined.isEmpty ? nil : joined
+    }
+
+    private static func meta(nodeID: Int64, suffix: String, role: String?, text: String?, time: Date?, raw: String) -> SessionEvent {
+        SessionEvent(id: "\(nodeID)-\(suffix)", timestamp: time, kind: .meta, role: role, text: text,
+                     toolName: nil, toolInput: nil, toolOutput: nil,
+                     messageID: nil, parentID: nil, isDelta: false, rawJSON: raw)
+    }
+
+    /// `tool_calls[].arguments` arrives as a JSON object. Serialised with sorted
+    /// keys so the rendered form is stable between runs.
+    private static func jsonString(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let string = value as? String { return string }
+        guard let text = ToolJSON.string(from: value, pretty: false) else { return nil }
+        let byteCount = text.utf8.count
+        if byteCount > 32_768 {
+            return "[OMITTED large JSON payload bytes=\(byteCount)]"
+        }
+        return text
+    }
+}

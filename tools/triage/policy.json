@@ -1,0 +1,6 @@
+{
+  "repos": ["jazzyalex/agent-sessions", "jazzyalex/homebrew-agent-sessions"],
+  "agent": "claude",
+  "agent_model": "claude-sonnet-5",
+  "lookback_hours": 48
+}

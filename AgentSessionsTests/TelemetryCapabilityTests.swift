@@ -1,0 +1,106 @@
+import XCTest
+@testable import AgentSessions
+
+/// Every source must state, explicitly, what telemetry it can and cannot produce.
+/// The field is non-optional on `SessionSourceDescriptor` so the compiler forces a
+/// declaration for every source — a new source cannot silently inherit
+/// "no telemetry" and then be mistaken for a source that was audited and found
+/// wanting.
+final class TelemetryCapabilityTests: XCTestCase {
+
+    func testEverySourceDeclaresCapabilities() {
+        XCTAssertEqual(SessionSource.allCases.count, 17,
+                       "A source was added or removed — update the telemetry capability table too")
+        for source in SessionSource.allCases {
+            _ = SessionSourceRegistry.descriptor(for: source).telemetry
+        }
+    }
+
+    // An `unavailable`/`partial` verdict without a reason is the failure this whole
+    // type exists to prevent: it reads identically to "not audited yet".
+    func testAllSourcesDeclareNonEmptyReasons() {
+        for source in SessionSource.allCases {
+            let t = SessionSourceRegistry.descriptor(for: source).telemetry
+            for cap in [t.configuration, t.tokens, t.cost, t.weeklyQuota] {
+                if case .unavailable(let reason) = cap {
+                    XCTAssertFalse(reason.isEmpty, "\(source) declares an unavailable with no reason")
+                }
+                if case .partial(let reason) = cap {
+                    XCTAssertFalse(reason.isEmpty, "\(source) declares a partial with no reason")
+                }
+            }
+        }
+    }
+
+    /// The sources wired to an audited telemetry provider. Everything else must
+    /// remain unavailable even after an audit proves that its store has no usable
+    /// telemetry.
+    private static let dispatchableSources: Set<SessionSource> = [
+        .codex, .claude, .antigravity, .opencode, .hermes, .copilot, .droid,
+        .openclaw, .cursor, .pi, .kimi, .grok, .devin, .fx, .cline, .deepseekHarness, .qwen
+    ]
+
+    func testNonDispatchableSourcesDeclareNothingAvailable() {
+        for source in SessionSource.allCases where !Self.dispatchableSources.contains(source) {
+            let t = SessionSourceRegistry.descriptor(for: source).telemetry
+            for cap in [t.configuration, t.tokens, t.cost, t.weeklyQuota] {
+                guard case .unavailable = cap else {
+                    return XCTFail("\(source) must be unavailable until its format is audited")
+                }
+            }
+        }
+    }
+
+    /// Every source the engine can actually dispatch must declare it, and vice
+    /// versa — a mismatch means either dead code or a silently ignored source.
+    func testSupportedSourcesDeclareConfigurationOrTokens() {
+        for source in Self.dispatchableSources {
+            let t = SessionSourceRegistry.descriptor(for: source).telemetry
+            XCTAssertTrue(t.configuration.isAvailable || t.tokens.isAvailable,
+                          "\(source) must produce at least one audited telemetry dimension")
+        }
+    }
+
+    func testCursorDeclaresConfigurationOnlyWithHonestTokenBoundary() {
+        let telemetry = SessionSourceRegistry.descriptor(for: .cursor).telemetry
+        XCTAssertEqual(
+            telemetry.configuration,
+            .partial("current model comes from loaded Session metadata; Cursor transcripts do not record first-observed model or model-change history")
+        )
+        XCTAssertEqual(
+            telemetry.tokens,
+            .unavailable("Cursor Agent transcript JSONL and chat metadata do not record attributable token components")
+        )
+    }
+
+    func testDevinRecordsAuditedNegativeTelemetryEvidence() {
+        let telemetry = SessionSourceRegistry.descriptor(for: .devin).telemetry
+        XCTAssertEqual(
+            telemetry.configuration,
+            .partial("current model comes from the shared session row; Devin exposes no audited per-turn model or effort history")
+        )
+        XCTAssertEqual(
+            telemetry.tokens,
+            .unavailable("3000.6.7 audit: num_tokens is always null; num_tokens_preceding is a context cursor")
+        )
+        XCTAssertEqual(
+            telemetry.cost,
+            .unavailable("3000.6.7 audit: cogs_json is configuration and recorded cost fields are always zero")
+        )
+        XCTAssertEqual(telemetry.weeklyQuota, .unavailable("no account-level quota feed"))
+    }
+
+    func testWeeklyQuotaIsAvailableOnlyForProvidersWithAccountQuotaFeeds() {
+        for source in SessionSource.allCases {
+            let cap = SessionSourceRegistry.descriptor(for: source).telemetry.weeklyQuota
+            if source == .codex || source == .claude {
+                XCTAssertTrue(cap.isAvailable, "\(source) has a weekly quota feed")
+            } else if case .unavailable = cap {
+                continue
+            } else {
+                XCTFail("\(source) has no audited account-level weekly quota feed")
+            }
+        }
+    }
+
+}

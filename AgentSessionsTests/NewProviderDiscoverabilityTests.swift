@@ -1,0 +1,251 @@
+import XCTest
+@testable import AgentSessions
+
+final class NewProviderDiscoverabilityTests: XCTestCase {
+
+    // MARK: - SessionSource Metadata
+
+    func testVersionIntroducedIsDefinedForAllSources() {
+        for source in SessionSource.allCases {
+            XCTAssertFalse(source.versionIntroduced.isEmpty, "\(source) missing versionIntroduced")
+        }
+    }
+
+    func testFeatureDescriptionIsDefinedForAllSources() {
+        for source in SessionSource.allCases {
+            XCTAssertFalse(String(localized: source.featureDescription).isEmpty, "\(source) missing featureDescription")
+        }
+    }
+
+    func testEveryVersionIntroducedProducesValidProviderHighlight() {
+        // Round-trip: every source's versionIntroduced must produce a non-empty
+        // "new provider" What's New highlight, guarding against typo mismatches.
+        let versions = Set(SessionSource.allCases.map(\.versionIntroduced))
+        for version in versions {
+            let items = WhatsNewCatalog.providerHighlights(for: version)
+            XCTAssertFalse(items.isEmpty, "versionIntroduced \"\(version)\" should produce at least one provider highlight")
+        }
+    }
+
+    func testCursorVersionIntroduced() {
+        XCTAssertEqual(SessionSource.cursor.versionIntroduced, "3.2")
+    }
+
+    func testDeepSeekHarnessVersionIntroduced() {
+        XCTAssertEqual(SessionSource.deepseekHarness.versionIntroduced, "5.5")
+        XCTAssertEqual(String(localized: SessionSource.deepseekHarness.featureDescription),
+                       "Browse your DeepSeek sessions")
+    }
+
+    func testOriginalProvidersHaveEarlyVersions() {
+        XCTAssertEqual(SessionSource.codex.versionIntroduced, "1.0")
+        XCTAssertEqual(SessionSource.claude.versionIntroduced, "1.0")
+    }
+
+    // MARK: - AgentEnablement Helpers
+
+    func testEnablementKeyReturnsCorrectKeyForEachSource() {
+        XCTAssertEqual(AgentEnablement.enablementKey(for: .codex), "AgentEnabledCodex")
+        XCTAssertEqual(AgentEnablement.enablementKey(for: .cursor), "AgentEnabledCursor")
+    }
+
+    /// Droid is availability-gated, and that is a product ruling rather than a mechanical
+    /// default: it is not a supported source until a steward takes it on, so it must not be
+    /// on for users who do not run it. It was `.always` (K7) purely to mirror pre-refactor
+    /// runtime behavior. Pinned so the cohort cannot be flipped back without reading this.
+    ///
+    /// Availability is deterministic here: `AppRuntime.isHostedByTooling` is true under
+    /// XCTest, so `isAvailable` degrades to a stored-preference read, which an empty
+    /// suite answers `false` for every source.
+    func testIsEnabled_droidIsOffByDefaultWhenItIsNotAvailable() {
+        let suite = "test.enabled.droid.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        XCTAssertFalse(AgentEnablement.isAvailable(.droid, defaults: defaults),
+                       "precondition: nothing is available in an empty suite under test hosting")
+        XCTAssertFalse(AgentEnablement.isEnabled(.droid, defaults: defaults),
+                       "droid is availability-gated: unsupported until a steward, so off unless installed")
+        XCTAssertEqual(SessionSourceRegistry.descriptor(for: .droid).defaultEnabled, .whenAvailable)
+    }
+
+
+    func testIsEnabled_availabilityGatedSourceIsOffWhenUnavailable() {
+        let suite = "test.enabled.hermes.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        for source in [SessionSource.hermes, .openclaw, .cursor, .pi, .kimi, .grok, .qwen, .devin, .fx, .cline, .droid, .deepseekHarness] {
+            XCTAssertFalse(AgentEnablement.isEnabled(source, defaults: defaults),
+                           "\(source.rawValue) is availability-gated and must stay off when unavailable")
+        }
+    }
+
+    func testIsEnabled_defaultOnCohortIsOnWithNoStoredPreference() {
+        let suite = "test.enabled.defaulton.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        for source in [SessionSource.codex, .claude, .antigravity, .opencode, .copilot] {
+            XCTAssertTrue(AgentEnablement.isEnabled(source, defaults: defaults),
+                          "\(source.rawValue) belongs to the default-ON cohort")
+        }
+    }
+
+    func testIsEnabled_explicitPreferenceWinsOverBothCohorts() {
+        let suite = "test.enabled.explicit.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        defaults.set(false, forKey: AgentEnablement.enablementKey(for: .droid))
+        defaults.set(true, forKey: AgentEnablement.enablementKey(for: .hermes))
+
+        XCTAssertFalse(AgentEnablement.isEnabled(.droid, defaults: defaults))
+        XCTAssertTrue(AgentEnablement.isEnabled(.hermes, defaults: defaults))
+    }
+
+    func testEnablementKeyMatchesRegistryDescriptorForEverySource() {
+        for source in SessionSource.allCases {
+            XCTAssertEqual(AgentEnablement.enablementKey(for: source),
+                           SessionSourceRegistry.descriptor(for: source).enablementKey,
+                           "\(source.rawValue) enablement key drifted from its descriptor")
+        }
+    }
+
+    func testMigrateKnownAvailableProviders_populatesFromExplicitPreferences() {
+        let suite = "test.migrate.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        // Simulate an existing user who explicitly enabled codex and claude
+        defaults.set(true, forKey: AgentEnablement.enablementKey(for: .codex))
+        defaults.set(true, forKey: AgentEnablement.enablementKey(for: .claude))
+
+        AgentEnablement.migrateKnownAvailableProvidersIfNeeded(defaults: defaults)
+
+        let known = defaults.stringArray(forKey: PreferencesKey.Agents.knownAvailableProviders) ?? []
+        XCTAssertTrue(known.contains("codex"))
+        XCTAssertTrue(known.contains("claude"))
+        XCTAssertFalse(known.contains("cursor"), "Cursor has no explicit pref — should not be in known set")
+    }
+
+    func testMigrateKnownAvailableProviders_isNoOpOnSubsequentRuns() {
+        let suite = "test.migrate.noop.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        defaults.set(true, forKey: AgentEnablement.enablementKey(for: .codex))
+        AgentEnablement.migrateKnownAvailableProvidersIfNeeded(defaults: defaults)
+
+        // Now add an explicit pref for cursor AFTER migration
+        defaults.set(true, forKey: AgentEnablement.enablementKey(for: .cursor))
+        AgentEnablement.migrateKnownAvailableProvidersIfNeeded(defaults: defaults)
+
+        let known = defaults.stringArray(forKey: PreferencesKey.Agents.knownAvailableProviders) ?? []
+        XCTAssertFalse(known.contains("cursor"), "Second migration should be a no-op")
+    }
+
+    // MARK: - Detection Logic
+
+    func testNewlyAvailableProviders_returnsProviderNotInKnownSetWithNoExplicitPref() {
+        let suite = "test.detect.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        // Known set has codex and claude
+        defaults.set(["codex", "claude"], forKey: PreferencesKey.Agents.knownAvailableProviders)
+        // No explicit pref for cursor — simulates implicit isAvailable() default
+
+        let candidates = AgentEnablement.newlyAvailableProviders(
+            availableSources: [.codex, .claude, .cursor],
+            defaults: defaults
+        )
+
+        XCTAssertEqual(candidates, [.cursor])
+    }
+
+    func testNewlyAvailableProviders_excludesProviderWithExplicitPref() {
+        let suite = "test.detect.explicit.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        defaults.set(["codex"], forKey: PreferencesKey.Agents.knownAvailableProviders)
+        // User explicitly set cursor to true — they already know about it
+        defaults.set(true, forKey: AgentEnablement.enablementKey(for: .cursor))
+
+        let candidates = AgentEnablement.newlyAvailableProviders(
+            availableSources: [.codex, .cursor],
+            defaults: defaults
+        )
+
+        XCTAssertTrue(candidates.isEmpty, "Provider with explicit pref should not be a candidate")
+    }
+
+    func testNewlyAvailableProviders_excludesProviderAlreadyInKnownSet() {
+        let suite = "test.detect.known.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        defaults.set(["codex", "cursor"], forKey: PreferencesKey.Agents.knownAvailableProviders)
+
+        let candidates = AgentEnablement.newlyAvailableProviders(
+            availableSources: [.codex, .cursor],
+            defaults: defaults
+        )
+
+        XCTAssertTrue(candidates.isEmpty, "Provider already in known set should not be a candidate")
+    }
+
+    func testNewlyAvailableProviders_returnsEmptyWhenNoNewProviders() {
+        let suite = "test.detect.empty.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        let allRaw = SessionSource.allCases.map(\.rawValue)
+        defaults.set(allRaw, forKey: PreferencesKey.Agents.knownAvailableProviders)
+
+        let candidates = AgentEnablement.newlyAvailableProviders(
+            availableSources: Set(SessionSource.allCases),
+            defaults: defaults
+        )
+
+        XCTAssertTrue(candidates.isEmpty)
+    }
+
+    // MARK: - New Provider Highlights (What's New)
+
+    func testProviderHighlights_returnsCursorItemForVersion3_2() {
+        let items = WhatsNewCatalog.providerHighlights(for: "3.2")
+        XCTAssertEqual(items.count, 1)
+        let item = items[0]
+        XCTAssertEqual(item.kind, .highlight)
+        XCTAssertTrue(String(localized: item.title).contains("Cursor"), "provider highlight should name Cursor")
+        XCTAssertEqual(item.iconSystemName, SessionSource.cursor.iconName)
+    }
+
+    func testProviderHighlights_returnsDeepSeekHarnessItemForVersion5_5() {
+        let items = WhatsNewCatalog.providerHighlights(for: "5.5")
+        XCTAssertEqual(items.count, 1)
+        let item = items[0]
+        XCTAssertEqual(item.kind, .highlight)
+        XCTAssertEqual(String(localized: item.title), "New: DeepSeek")
+        XCTAssertEqual(item.iconSystemName, SessionSource.deepseekHarness.iconName)
+    }
+
+    func testProviderHighlights_returnsEmptyForUnknownVersion() {
+        XCTAssertTrue(WhatsNewCatalog.providerHighlights(for: "99.0").isEmpty)
+    }
+
+    func testProviderHighlights_returnsEmptyForVersionWithNoNewProviders() {
+        // Version "2.9" exists as a real app version but no provider has versionIntroduced == "2.9"
+        XCTAssertTrue(WhatsNewCatalog.providerHighlights(for: "2.9").isEmpty,
+                      "Version with no new providers should produce no highlights")
+    }
+
+    func testWhatsNewForVersion3_2IncludesProviderHighlight() {
+        // The assembled What's New list for 3.2 should surface the Cursor highlight.
+        let items = WhatsNewCatalog.assemble(for: "3.2")
+        let hasCursorHighlight = items.contains { $0.kind == .highlight && String(localized: $0.title).contains("Cursor") }
+        XCTAssertTrue(hasCursorHighlight, "What's New for 3.2 should include the Cursor provider highlight")
+    }
+}

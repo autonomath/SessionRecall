@@ -1,0 +1,6440 @@
+import SwiftUI
+import AppKit
+import Combine
+
+enum HUDLiveState: Equatable {
+    case active
+    case idle
+}
+
+enum HUDIdleReason: String, Equatable, Sendable {
+    case generic      // Idle — waiting at prompt or unknown state
+    case errorOrStuck // No prompt detected for >30 minutes
+
+    var label: String {
+        switch self {
+        case .generic:      return "Waiting"
+        case .errorOrStuck: return "Stuck"
+        }
+    }
+}
+
+enum HUDDisplayPriority: Int, Equatable {
+    case active = 0
+    case waitingFresh = 1
+    case waitingStale = 2
+}
+
+enum HUDAgentType: Equatable {
+    case codex
+    case claude
+    case opencode
+    case shell
+
+    var label: String {
+        switch self {
+        case .codex: return "Codex"
+        case .claude: return "Claude"
+        case .opencode: return "OpenCode"
+        case .shell: return "Shell"
+        }
+    }
+
+    var standardTextColor: Color {
+        switch self {
+        case .codex: return .agentCodex
+        case .claude: return .agentClaude
+        case .opencode: return .agentOpenCode
+        case .shell: return .secondary
+        }
+    }
+}
+
+enum HUDNavigationConfidence: Equatable {
+    /// Resolved via log-path or direct session-ID match.
+    case exact
+    /// Resolved via runtime session-ID match.
+    case runtimeID
+    /// Resolved only via working-directory / cwd fallback.
+    case cwdOnly
+    /// No indexed session found.
+    case none
+
+    var isNavigable: Bool {
+        switch self {
+        case .exact, .runtimeID: return true
+        case .cwdOnly, .none: return false
+        }
+    }
+}
+
+struct HUDRow: Identifiable, Equatable {
+    let id: String
+    let source: SessionSource
+    let agentType: HUDAgentType
+    let projectName: String
+    let displayName: String
+    let liveState: HUDLiveState
+    let preview: String
+    let elapsed: String
+    let lastSeenAt: Date?
+    let itermSessionId: String?
+    let revealURL: URL?
+    let tty: String?
+    let termProgram: String?
+    let tabTitle: String?
+    let cleanedTabTitle: String?
+    let resolvedSessionID: String?
+    let runtimeSessionID: String?
+    let parentSessionID: String?
+    let logPath: String?
+    let workingDirectory: String?
+    let lastActivityAt: Date?
+    let lastActivityTooltip: String?
+    let idleReason: HUDIdleReason?
+    let activeSubagentCount: Int
+    let navigationConfidence: HUDNavigationConfidence
+
+    init(id: String,
+         source: SessionSource,
+         agentType: HUDAgentType,
+         projectName: String,
+         displayName: String,
+         liveState: HUDLiveState,
+         preview: String,
+         elapsed: String,
+         lastSeenAt: Date?,
+         itermSessionId: String?,
+         revealURL: URL?,
+         tty: String?,
+         termProgram: String?,
+         tabTitle: String? = nil,
+         cleanedTabTitle: String? = nil,
+         resolvedSessionID: String? = nil,
+         runtimeSessionID: String? = nil,
+         parentSessionID: String? = nil,
+         logPath: String? = nil,
+         workingDirectory: String? = nil,
+         lastActivityAt: Date? = nil,
+         lastActivityTooltip: String? = nil,
+         idleReason: HUDIdleReason? = nil,
+         activeSubagentCount: Int = 0,
+         navigationConfidence: HUDNavigationConfidence = .none) {
+        self.id = id
+        self.source = source
+        self.agentType = agentType
+        self.projectName = projectName
+        self.displayName = displayName
+        self.liveState = liveState
+        self.preview = preview
+        self.elapsed = elapsed
+        self.lastSeenAt = lastSeenAt
+        self.itermSessionId = itermSessionId
+        self.revealURL = revealURL
+        self.tty = tty
+        self.termProgram = termProgram
+        self.tabTitle = tabTitle
+        self.cleanedTabTitle = cleanedTabTitle
+        self.resolvedSessionID = resolvedSessionID
+        self.runtimeSessionID = runtimeSessionID
+        self.parentSessionID = parentSessionID
+        self.logPath = logPath
+        self.workingDirectory = workingDirectory
+        self.lastActivityAt = lastActivityAt
+        self.lastActivityTooltip = lastActivityTooltip
+        self.idleReason = idleReason
+        self.activeSubagentCount = activeSubagentCount
+        self.navigationConfidence = navigationConfidence
+    }
+
+    static func == (lhs: HUDRow, rhs: HUDRow) -> Bool {
+        lhs.id == rhs.id
+            && lhs.source == rhs.source
+            && lhs.agentType == rhs.agentType
+            && lhs.projectName == rhs.projectName
+            && lhs.displayName == rhs.displayName
+            && lhs.liveState == rhs.liveState
+            && lhs.preview == rhs.preview
+            && lhs.lastSeenAt == rhs.lastSeenAt
+            && lhs.itermSessionId == rhs.itermSessionId
+            && lhs.revealURL == rhs.revealURL
+            && lhs.tty == rhs.tty
+            && lhs.termProgram == rhs.termProgram
+            && lhs.tabTitle == rhs.tabTitle
+            && lhs.cleanedTabTitle == rhs.cleanedTabTitle
+            && lhs.resolvedSessionID == rhs.resolvedSessionID
+            && lhs.runtimeSessionID == rhs.runtimeSessionID
+            && lhs.parentSessionID == rhs.parentSessionID
+            && lhs.logPath == rhs.logPath
+            && lhs.workingDirectory == rhs.workingDirectory
+            && lhs.lastActivityAt == rhs.lastActivityAt
+            && lhs.elapsed == rhs.elapsed
+            && lhs.lastActivityTooltip == rhs.lastActivityTooltip
+            && lhs.idleReason == rhs.idleReason
+            && lhs.activeSubagentCount == rhs.activeSubagentCount
+            && lhs.navigationConfidence == rhs.navigationConfidence
+    }
+}
+
+private enum AgentCockpitHUDTheme {
+    static let cornerRadius: CGFloat = 12
+    static let toolbarButtonCornerRadius: CGFloat = 7
+    /// Toolbar grouping rhythm: controls that belong to the same family sit at
+    /// `toolbarIntraGroupSpacing`, distinct families at `toolbarGroupSpacing`.
+    /// The gaps — not the ordering — are what make the groups legible.
+    static let toolbarIntraGroupSpacing: CGFloat = 2
+    static let toolbarGroupSpacing: CGFloat = 10
+}
+
+
+
+
+
+struct HUDLiveSessionSummary: Equatable {
+    let activeCount: Int
+    let waitingCount: Int
+}
+
+struct LegacyMappedRow: Identifiable {
+    let id: String
+    let source: SessionSource
+    let title: String
+    let liveState: CodexLiveState
+    let lastSeenAt: Date?
+    let repo: String
+    let date: Date?
+    let focusURL: URL?
+    let itermSessionId: String?
+    let tty: String?
+    let termProgram: String?
+    let tabTitle: String?
+    let resolvedSessionID: String?
+    let sessionID: String?
+    let parentSessionID: String?
+    let logPath: String?
+    let workingDirectory: String?
+    let lastActivityAt: Date?
+    let idleReason: HUDIdleReason?
+    let isDefinitiveMatch: Bool
+}
+
+struct SessionLookupIndexes {
+    let byLogPath: [String: Session]
+    let bySessionID: [String: Session]
+    let byWorkspace: [String: Session]
+}
+
+struct HUDRowsSnapshot: Equatable {
+    let rows: [HUDRow]
+    let activeCount: Int
+    let idleCount: Int
+}
+
+/// The Quota Meter's OpenCode sessions group: running OpenCode sessions, their
+/// count, and each session's own token or API-equivalent cost rate. No quota or
+/// subscription data (there is none for OpenCode yet).
+///
+/// "Running" means every eligible detected live OpenCode session, working or idle.
+/// The group is a pure filter over the HUD's `rowsForDisplay`, so it inherits every
+/// row rule `makeRowsSnapshot` applies: the probe-directory filter (source-independent,
+/// so it also drops OpenCode presences in a Codex or Claude probe directory), the
+/// unresolved-placeholder rule (unresolved subagents always hidden; other unresolved
+/// presences kept only with a session ID, log path, focus target or workspace match),
+/// and resolved-session dedup. It adds no rule of its own, and its count is always the
+/// size of the exact row list it shows. Detection limits are upstream: headless
+/// candidates are not proven to be real conversations, and OpenCode log matching does
+/// not cover every SQLite-store session.
+struct OpenCodeHUDGroupModel: Equatable {
+    /// OpenCode rows from `rowsForDisplay`, deduplicated by id, in incoming order.
+    let rows: [HUDRow]
+    let visibleRows: [HUDRow]
+    let overflowCount: Int
+    /// Each row's own session rate, keyed by `OpenCodeHUDGroup.sessionID(for:)`.
+    /// Empty when rates are off or not yet sampled.
+    var rates: [String: OpenCodeRateValue] = [:]
+    /// The unit rates are shown in; nil when this surface shows no rates, so rows
+    /// keep the plain label layout without rate and bar columns.
+    var rateUnit: RunwayRateUnit? = nil
+
+    var totalCount: Int { rows.count }
+
+    /// The load bars' scale: the fastest working visible row, floored at 1 like the
+    /// runway's `maxDisplayRate`.
+    var maxBarRate: Double {
+        let rates = visibleRows.compactMap { row in
+            OpenCodeHUDGroup.sessionID(for: row).map { OpenCodeHUDGroup.loadBar(for: self.rates[$0]).displayRate }
+        }
+        return max(1, rates.max() ?? 0)
+    }
+}
+
+/// What one OpenCode row's runway load bar draws.
+struct OpenCodeLoadBar: Equatable {
+    let displayRate: Double
+    let confidence: RunwayAttributionConfidence
+}
+
+/// What a row's rate column shows, when it shows a rate rather than the state label.
+struct OpenCodeRateCell: Equatable {
+    let text: String
+    /// Drives the projection color; read from the number, never the formatted text.
+    let isPositive: Bool
+    let help: String?
+    /// The session is idle and this is its newest burst's rate; the row keeps the
+    /// idle label next to it.
+    var isIdle: Bool = false
+}
+
+enum OpenCodeHUDGroup {
+    /// Session rows shown before the "+N more" line. The group's own budget; it is
+    /// deliberately not the runway's burn-attribution row budget.
+    static let maxVisibleSessions = 4
+
+    /// `nil` hides the group: live detection off, the OpenCode agent disabled, or no
+    /// running OpenCode session (owner decision 2026-10-21: no empty state).
+    static func make(rows: [HUDRow],
+                     detectionEnabled: Bool,
+                     openCodeEnabled: Bool,
+                     rates: [String: OpenCodeRateValue] = [:],
+                     rateUnit: RunwayRateUnit? = nil) -> OpenCodeHUDGroupModel? {
+        guard detectionEnabled, openCodeEnabled else { return nil }
+        var seen: Set<String> = []
+        // Incoming order is kept on purpose: `rowsForDisplay` already applies the
+        // HUD's priority order and its hidden-window churn rules.
+        let openCodeRows = rows.filter { $0.source == .opencode && seen.insert($0.id).inserted }
+        guard !openCodeRows.isEmpty else { return nil }
+        let visible = Array(openCodeRows.prefix(maxVisibleSessions))
+        return OpenCodeHUDGroupModel(
+            rows: openCodeRows,
+            visibleRows: visible,
+            overflowCount: openCodeRows.count - visible.count,
+            rates: rates,
+            rateUnit: rateUnit
+        )
+    }
+
+    /// Only a working row's own rate fills its bar. Idle rows (even with a fresh
+    /// rate), Free, unpriced and not-yet-measured rows keep an empty track, as the
+    /// runway does for its idle and waiting rows.
+    static func loadBar(for value: OpenCodeRateValue?) -> OpenCodeLoadBar {
+        switch value {
+        case .rate(let amount, _):
+            return OpenCodeLoadBar(displayRate: amount, confidence: .direct)
+        case .idle, .idleRecent:
+            return OpenCodeLoadBar(displayRate: 0, confidence: .idle)
+        case .working, .free, .unpriced, .unavailable, .none:
+            return OpenCodeLoadBar(displayRate: 0, confidence: .waiting)
+        }
+    }
+
+    /// The same visibility `make` decides, for callers that only need a Bool.
+    static func isVisible(rows: [HUDRow], detectionEnabled: Bool, openCodeEnabled: Bool) -> Bool {
+        make(rows: rows, detectionEnabled: detectionEnabled, openCodeEnabled: openCodeEnabled) != nil
+    }
+
+    /// The OpenCode session a row shows; its rate is keyed by this ID.
+    static func sessionID(for row: HUDRow) -> String? {
+        row.resolvedSessionID ?? row.runtimeSessionID
+    }
+
+    /// The toolbar's lens control applies to OpenCode rates too, so it is available
+    /// for an OpenCode-only Quota Meter.
+    static func controlAvailable(providersShown: Bool, openCodeGroupVisible: Bool) -> Bool {
+        providersShown || openCodeGroupVisible
+    }
+
+    /// Rates appear only where the runway would: not when it is set to Always Off,
+    /// and not in a collapsed strip.
+    static func showsRates(visibility: QuotaMeterRunwayVisibility, isStrip: Bool, stripExpanded: Bool) -> Bool {
+        visibility != .alwaysOff && (!isStrip || stripExpanded)
+    }
+
+    /// The values a view may draw: none when rates are hidden, and none from a
+    /// snapshot sampled for another lens.
+    static func displayedRates(snapshot: OpenCodeRateSnapshot, presentation: RunwayPresentation,
+                               showsRates: Bool) -> [String: OpenCodeRateValue] {
+        guard showsRates, snapshot.presentation == presentation else { return [:] }
+        return snapshot.values
+    }
+
+    /// What this surface asks the sampler for: its visible sessions and whether each
+    /// is working. nil when it shows no rates.
+    static func demand(group: OpenCodeHUDGroupModel?, showsRates: Bool) -> OpenCodeRateDemand? {
+        guard showsRates, let group else { return nil }
+        var sessions: [String: Bool] = [:]
+        for row in group.visibleRows {
+            guard let id = sessionID(for: row) else { continue }
+            sessions[id] = (sessions[id] ?? false) || row.liveState == .active
+        }
+        return sessions.isEmpty ? nil : OpenCodeRateDemand(sessions: sessions)
+    }
+
+    /// The rate column for a value, or nil to keep the working/idle label.
+    static func rateCell(for value: OpenCodeRateValue?) -> OpenCodeRateCell? {
+        switch value {
+        case .rate(let amount, let unit):
+            return OpenCodeRateCell(text: RunwayTimeFormatting.rate(amount, unit: unit, confidence: .direct),
+                                    isPositive: amount > 0, help: nil)
+        case .free:
+            return OpenCodeRateCell(text: String(localized: "Free"), isPositive: false, help: nil)
+        case .unpriced(let models, let components):
+            return OpenCodeRateCell(text: "—", isPositive: false,
+                                    help: unpricedHelp(unknownModels: models, missingComponents: components))
+        case .unavailable:
+            return OpenCodeRateCell(text: "—", isPositive: false,
+                                    help: String(localized: "Usage data for this session is incomplete.",
+                                                 comment: "Quota Meter OpenCode row tooltip: recent usage records are unreadable or invalid, so no rate is shown."))
+        case .idleRecent(let shown):
+            guard let cell = rateCell(for: shown) else { return nil }
+            return OpenCodeRateCell(text: cell.text, isPositive: false, help: cell.help, isIdle: true)
+        case .working, .idle, .none:
+            return nil
+        }
+    }
+
+    /// Every unpriced reason the burst has, one line each.
+    static func unpricedHelp(unknownModels: [String], missingComponents: [String]) -> String {
+        var lines: [String] = []
+        if !unknownModels.isEmpty {
+            let list = unknownModels.joined(separator: ", ")
+            lines.append(String(localized: "No API price for \(list)",
+                                comment: "Quota Meter OpenCode row tooltip in the $ lens. %@ is a comma-separated list of model IDs."))
+        }
+        if !missingComponents.isEmpty {
+            let list = missingComponents.joined(separator: ", ")
+            lines.append(String(localized: "Missing API price component: \(list)",
+                                comment: "Quota Meter OpenCode row tooltip in the $ lens. %@ lists model:component pairs, e.g. gpt-5:cacheWrite5m."))
+        }
+        if lines.isEmpty {
+            lines.append(String(localized: "No API price for this session's recent usage.",
+                                comment: "Quota Meter OpenCode row tooltip in the $ lens when no specific reason is known."))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Idle reasons are heuristic, so a long-idle session reads "idle", never "Stuck".
+    static func stateLabel(for row: HUDRow) -> LocalizedStringResource {
+        row.liveState == .active
+            ? LocalizedStringResource("working", comment: "Quota Meter OpenCode group: the session is processing a turn.")
+            : LocalizedStringResource("idle", comment: "Quota Meter OpenCode group: the session is open but not processing.")
+    }
+
+    static func runningText(count: Int) -> LocalizedStringResource {
+        LocalizedStringResource("\(count) running",
+                                comment: "Quota Meter OpenCode group header: number of detected running OpenCode sessions.")
+    }
+
+    static func overflowText(count: Int) -> LocalizedStringResource {
+        LocalizedStringResource("+\(count) more",
+                                comment: "Quota Meter OpenCode group: number of running sessions not listed above.")
+    }
+}
+
+private struct HUDWaitingCounts {
+    let active: Int
+    let idle: Int
+    let freshIdle: Int
+    let staleIdle: Int
+}
+
+private struct HUDPresentationInputs: Equatable {
+    let canonicalRows: [HUDRow]
+    let snapshotTimestamp: Date
+    let orderedRowIDs: [String]
+    let isWindowVisibleForOrdering: Bool
+
+    static func == (lhs: HUDPresentationInputs, rhs: HUDPresentationInputs) -> Bool {
+        lhs.canonicalRows == rhs.canonicalRows
+            && lhs.orderedRowIDs == rhs.orderedRowIDs
+            && lhs.isWindowVisibleForOrdering == rhs.isWindowVisibleForOrdering
+    }
+}
+
+private struct HUDPresentationState {
+    let inputs: HUDPresentationInputs
+    let rowsForDisplay: [HUDRow]
+    let shownSessionCount: Int
+
+    static let empty = HUDPresentationState(
+        inputs: HUDPresentationInputs(
+            canonicalRows: [],
+            snapshotTimestamp: .distantPast,
+            orderedRowIDs: [],
+            isWindowVisibleForOrdering: true
+        ),
+        rowsForDisplay: [],
+        shownSessionCount: 0
+    )
+}
+
+/// Cheap per-source content fingerprint for `AgentCockpitHUDDerivedStateModel`'s
+/// `$allSessions` sinks. A provider's `@Published allSessions` can refire with
+/// content the HUD doesn't care about (e.g. a focused-session hydration or an
+/// unrelated background-monitor write that replaces the whole array via
+/// copy-on-write for a single entry) — `Equatable` on `[Session]` would catch
+/// this too, but at O(n) cost including every session's `events` array, which
+/// is the exact per-body cost the row-body diet exists to avoid. This
+/// fingerprint compares only the stored fields that feed the HUD rows
+/// snapshot — identity/order (`id`), freshness (`modifiedAt`, `eventCount`),
+/// the title-determining inputs (`customTitle`, `lightweightTitle`, and
+/// `events.isEmpty`, which flips `Session.title`'s computation branch on
+/// lightweight→full hydration), and the projectLabel inputs
+/// (`lightweightRepoName`, `lightweightCwd`, which metadata repairs like
+/// `ClaudeSessionIndexer.fixupHydratedClaudeMetadataIfNeeded` rewrite while
+/// id/modifiedAt/eventCount stay identical). No per-entry allocations beyond
+/// the entry array itself; the optional-string members share storage with the
+/// session's own values.
+/// Internal (not private) so `SessionListFingerprintTests` can pin the
+/// skip/bump decision semantics the sinks rely on.
+struct SessionListFingerprint: Equatable {
+    private let entries: [FingerprintEntry]
+
+    private struct FingerprintEntry: Equatable {
+        let id: String
+        let modifiedAt: Date
+        let eventCount: Int
+        let eventsIsEmpty: Bool
+        let customTitle: String?
+        let lightweightTitle: String?
+        let lightweightCwd: String?
+        let lightweightRepoName: String?
+    }
+
+    init(_ sessions: [Session]) {
+        entries = sessions.map {
+            FingerprintEntry(
+                id: $0.id,
+                modifiedAt: $0.modifiedAt,
+                eventCount: $0.eventCount,
+                eventsIsEmpty: $0.events.isEmpty,
+                customTitle: $0.customTitle,
+                lightweightTitle: $0.lightweightTitle,
+                lightweightCwd: $0.lightweightCwd,
+                lightweightRepoName: $0.lightweightRepoName
+            )
+        }
+    }
+}
+
+@MainActor
+private final class AgentCockpitHUDDerivedStateModel: ObservableObject {
+    @Published private(set) var snapshot = HUDRowsSnapshot(rows: [], activeCount: 0, idleCount: 0)
+    @Published private(set) var snapshotTimestamp: Date = Date()
+
+    private weak var activeCodex: CodexActiveSessionsModel?
+    private var codexSessions: [Session]
+    private var claudeSessions: [Session]
+    private var opencodeSessions: [Session]
+    private var codexSessionsFingerprint: SessionListFingerprint
+    private var claudeSessionsFingerprint: SessionListFingerprint
+    private var opencodeSessionsFingerprint: SessionListFingerprint
+    private var lookupIndexes: SessionLookupIndexes
+    private var presences: [CodexActivePresence] = []
+    private var isCompact: Bool
+    private var lastShowProbeInHUD: Bool = UserDefaults.standard.bool(forKey: PreferencesKey.Cockpit.showProbeSessionsInHUD)
+
+    // MARK: Claude cloud sessions
+    //
+    // Cloud sessions have no local process, so they cannot come from the presence
+    // poll. The fetch is owned by `ClaudeCloudLiveModel`, NOT by this model: an
+    // earlier version polled from `rebuildIfReady`, which returns early when the
+    // weak `activeCodex` is unbound and is gated by `HUDRebuildGate`, so the fetch
+    // never ran and no cloud row ever appeared. This model only reads.
+    private var cloudRows: [HUDRow] { ClaudeCloudLiveModel.shared.rows }
+    private var cloudRowsVersion: UInt64 { ClaudeCloudLiveModel.shared.version }
+    private var cloudRowsCancellable: AnyCancellable?
+    private var cancellables: Set<AnyCancellable> = []
+    private var activeCancellable: AnyCancellable?
+    private var subagentBadgeCancellable: AnyCancellable?
+    private var rebuildScheduled: Bool = false
+    private var sessionsGeneration: UInt64 = 0
+    private var rebuildGate = HUDRebuildGate(staleReclassifyInterval: 5)
+#if DEBUG
+    private struct DebugRebuildState {
+        var rebuildCount: UInt64 = 0
+        var lookupRebuildCount: UInt64 = 0
+    }
+    private static let debugRebuildLock = NSLock()
+    private static var debugRebuildState = DebugRebuildState()
+
+    static func debugRebuildSnapshot() -> (rebuildCount: UInt64, lookupRebuildCount: UInt64) {
+        debugRebuildLock.lock()
+        let state = debugRebuildState
+        debugRebuildLock.unlock()
+        return (
+            rebuildCount: state.rebuildCount,
+            lookupRebuildCount: state.lookupRebuildCount
+        )
+    }
+
+    private static func recordDebugRebuild() {
+        debugRebuildLock.lock()
+        debugRebuildState.rebuildCount &+= 1
+        debugRebuildLock.unlock()
+    }
+
+    private static func recordDebugLookupRebuild() {
+        debugRebuildLock.lock()
+        debugRebuildState.lookupRebuildCount &+= 1
+        debugRebuildLock.unlock()
+    }
+#endif
+
+    init(codexIndexer: SessionIndexer, claudeIndexer: ClaudeSessionIndexer, opencodeIndexer: OpenCodeSessionIndexer, initialCompact: Bool) {
+        codexSessions = codexIndexer.allSessions
+        claudeSessions = claudeIndexer.allSessions
+        opencodeSessions = opencodeIndexer.allSessions
+        codexSessionsFingerprint = SessionListFingerprint(codexSessions)
+        claudeSessionsFingerprint = SessionListFingerprint(claudeSessions)
+        opencodeSessionsFingerprint = SessionListFingerprint(opencodeSessions)
+        lookupIndexes = Self.buildSessionLookupIndexes(
+            codexSessions: codexSessions,
+            claudeSessions: claudeSessions,
+            opencodeSessions: opencodeSessions
+        )
+        isCompact = initialCompact
+
+        // Each sink below skips the rebuild when the incoming array is
+        // content-identical to what the HUD already has. `@Published` fires on
+        // every assignment regardless of equality, and a provider's
+        // `allSessions` can be reassigned (copy-on-write whole-array replace
+        // for a single-session update, an unrelated background-monitor write,
+        // etc.) without any content change relevant to HUD rows. Before this
+        // guard, every such refire unconditionally bumped `sessionsGeneration`
+        // and ran `rebuildLookupIndexes()` (O(n) over all sessions, string
+        // normalization + dictionary inserts) — bypassing `HUDRebuildGate`
+        // entirely, since the gate only sees `sessionsGeneration` AFTER it was
+        // already bumped. This was the dominant cost behind the W7 Task 0
+        // HUD-storm sample evidence (scheduleRebuild/rebuildIfReady/
+        // makeRowsSnapshot ~800/5228 main-thread samples).
+        codexIndexer.$allSessions
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                let fingerprint = SessionListFingerprint(sessions)
+                guard fingerprint != codexSessionsFingerprint else { return }
+                codexSessionsFingerprint = fingerprint
+                codexSessions = sessions
+                sessionsGeneration &+= 1
+                rebuildLookupIndexes()
+                scheduleRebuild()
+            }
+            .store(in: &cancellables)
+
+        claudeIndexer.$allSessions
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                let fingerprint = SessionListFingerprint(sessions)
+                guard fingerprint != claudeSessionsFingerprint else { return }
+                claudeSessionsFingerprint = fingerprint
+                claudeSessions = sessions
+                sessionsGeneration &+= 1
+                rebuildLookupIndexes()
+                scheduleRebuild()
+            }
+            .store(in: &cancellables)
+
+        opencodeIndexer.$allSessions
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                let fingerprint = SessionListFingerprint(sessions)
+                guard fingerprint != opencodeSessionsFingerprint else { return }
+                opencodeSessionsFingerprint = fingerprint
+                opencodeSessions = sessions
+                sessionsGeneration &+= 1
+                rebuildLookupIndexes()
+                scheduleRebuild()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let showProbes = UserDefaults.standard.bool(forKey: PreferencesKey.Cockpit.showProbeSessionsInHUD)
+                if showProbes != self.lastShowProbeInHUD {
+                    self.lastShowProbeInHUD = showProbes
+                    self.scheduleRebuild()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    func bind(activeCodex: CodexActiveSessionsModel) {
+        rebuildGate.forceNextRebuild()
+        self.activeCodex = activeCodex
+        presences = activeCodex.presences
+        activeCancellable = activeCodex.presenceUpdates.sink { [weak self] presences in
+            guard let self else { return }
+            self.presences = presences
+            scheduleRebuild()
+        }
+        subagentBadgeCancellable = activeCodex.badgeTicks.sink { [weak self] _ in
+            self?.scheduleRebuild()
+        }
+        // Cloud rows arrive from a network poll, not from the presence stream, so
+        // nothing else here would ever rebuild the snapshot when they change. The
+        // model held the correct rows for minutes while the HUD kept rendering a
+        // snapshot built before they arrived.
+        cloudRowsCancellable = NotificationCenter.default
+            .publisher(for: ClaudeCloudLiveModel.rowsDidChange)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.rebuildGate.forceNextRebuild()
+                self.scheduleRebuild()
+            }
+        scheduleRebuild()
+    }
+
+    func setCompact(_ compact: Bool, activeCodex: CodexActiveSessionsModel) {
+        self.activeCodex = activeCodex
+        guard isCompact != compact else { return }
+        isCompact = compact
+        scheduleRebuild()
+    }
+
+    private func rebuildLookupIndexes() {
+        lookupIndexes = Self.buildSessionLookupIndexes(
+            codexSessions: codexSessions,
+            claudeSessions: claudeSessions,
+            opencodeSessions: opencodeSessions
+        )
+#if DEBUG
+        Self.recordDebugLookupRebuild()
+#endif
+    }
+
+    private func scheduleRebuild() {
+        guard !rebuildScheduled else { return }
+        rebuildScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.rebuildScheduled = false
+            self.rebuildIfReady()
+        }
+    }
+
+    private func rebuildIfReady(activeCodex: CodexActiveSessionsModel? = nil) {
+        let activeCodex = activeCodex ?? self.activeCodex
+        guard let activeCodex else { return }
+        let now = Date()
+        let showProbes = UserDefaults.standard.bool(forKey: PreferencesKey.Cockpit.showProbeSessionsInHUD)
+        // C3: rendered row titles read this preference directly (`Session.title`
+        // via `PreferencesKey.Unified.skipAgentsPreamble`) -- default `true`
+        // when unset, matching `Session.title`'s own default so the gate's
+        // notion of "current value" agrees with what will actually render.
+        let skipAgentsPreamble = UserDefaults.standard.object(forKey: PreferencesKey.Unified.skipAgentsPreamble) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: PreferencesKey.Unified.skipAgentsPreamble)
+        ClaudeCloudLiveModel.shared.startIfNeeded()
+        let gateInputs = HUDRebuildGate.Inputs(
+            membershipVersion: activeCodex.activeMembershipVersion,
+            badgeVersion: activeCodex.subagentBadgeVersion,
+            sessionsGeneration: sessionsGeneration,
+            isCompact: isCompact,
+            showProbes: showProbes,
+            skipAgentsPreamble: skipAgentsPreamble,
+            cloudRowsVersion: cloudRowsVersion
+        )
+        guard rebuildGate.shouldRebuild(inputs: gateInputs, now: now) else { return }
+#if DEBUG
+        let _hudSpan = Perf.begin("hudRebuild", thresholdMs: 4)
+        defer { Perf.end(_hudSpan) }
+#endif
+        let activeSubagentCounts = CodexActiveSessionsModel.activeSubagentCounts(
+            presences: presences,
+            sessionsByLogPath: lookupIndexes.byLogPath,
+            now: now
+        )
+        let nextSnapshot = AgentCockpitHUDView.makeRowsSnapshot(
+            codexSessions: codexSessions,
+            claudeSessions: claudeSessions,
+            opencodeSessions: opencodeSessions,
+            presences: presences,
+            activeSubagentCounts: activeSubagentCounts,
+            activeCodex: activeCodex,
+            isCompact: isCompact,
+            lookupIndexes: lookupIndexes,
+            showProbePresences: showProbes,
+            cloudRows: cloudRows,
+            now: now
+        )
+        if nextSnapshot != snapshot {
+            snapshot = nextSnapshot
+            snapshotTimestamp = now
+        }
+#if DEBUG
+        Self.recordDebugRebuild()
+#endif
+    }
+
+    /// Moved from `AgentCockpitHUDView` (T3) -- the only real callers are this
+    /// model's `init` and `rebuildLookupIndexes()`; `AgentCockpitHUDView` keeps
+    /// a thin static forwarder only because `liveSessionSummary(activeCodex:
+    /// codexIndexer:...)` (used by `StatusItemController`/`UsageMenuBar`,
+    /// outside this model entirely) needs a lookup-index build independent of
+    /// any model instance.
+    static func buildSessionLookupIndexes(codexSessions: [Session],
+                                          claudeSessions: [Session],
+                                          opencodeSessions: [Session] = []) -> SessionLookupIndexes {
+        let supportedSources: Set<SessionSource> = [.codex, .claude, .opencode]
+        let allSessions = codexSessions + claudeSessions + opencodeSessions
+
+        var byLogPath: [String: Session] = [:]
+        var bySessionID: [String: Session] = [:]
+        var byWorkspace: [String: Session] = [:]
+        byLogPath.reserveCapacity(allSessions.count)
+        bySessionID.reserveCapacity(allSessions.count * 2)
+        byWorkspace.reserveCapacity(allSessions.count)
+
+        for session in allSessions where supportedSources.contains(session.source) {
+            let logKey = CodexActiveSessionsModel.logLookupKey(
+                source: session.source,
+                normalizedPath: CodexActiveSessionsModel.normalizePath(session.filePath)
+            )
+            byLogPath[logKey] = AgentCockpitHUDView.preferredSession(existing: byLogPath[logKey], incoming: session)
+
+            for runtimeID in CodexActiveSessionsModel.liveSessionIDCandidates(for: session) {
+                let sid = runtimeID.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !sid.isEmpty else { continue }
+                let sessionKey = CodexActiveSessionsModel.sessionLookupKey(source: session.source, sessionId: sid)
+                bySessionID[sessionKey] = AgentCockpitHUDView.preferredSession(existing: bySessionID[sessionKey], incoming: session)
+            }
+
+            if let cwd = AgentCockpitHUDView.normalizedWorkingDirectory(session.cwd), !cwd.isEmpty {
+                let workspaceKey = AgentCockpitHUDView.workspaceLookupKey(source: session.source, normalizedPath: cwd)
+                byWorkspace[workspaceKey] = AgentCockpitHUDView.preferredSession(existing: byWorkspace[workspaceKey], incoming: session)
+            }
+        }
+
+        return SessionLookupIndexes(byLogPath: byLogPath, bySessionID: bySessionID, byWorkspace: byWorkspace)
+    }
+}
+
+/// Where the Quota Meter view is hosted: the floating window, or the expanded menu bar strip.
+enum QuotaMeterSurface {
+    case window
+    /// Content only: no toolbar, window chrome or right-click controls; always dark;
+    /// counts as pinned for usage polling because the strip stays on screen.
+    case strip
+}
+
+/// The single owner of the usage models' cockpit signal and `Cockpit.hudOpen`. Every Quota
+/// Meter surface on screen registers under its own ID, so a rebuild, a handoff or a second
+/// surface can never clear or overwrite another surface's signal. Applies on the next
+/// run-loop turn, so a handoff (old surface out, new surface in) does not flash "hidden".
+@MainActor
+enum QuotaMeterPollingRegistry {
+    private static var surfaces: [UUID: QuotaMeterPollingSignal.Surface] = [:]
+    private static var applied: QuotaMeterPollingSignal?
+    private static var applyScheduled = false
+
+    static func set(_ id: UUID, _ surface: QuotaMeterPollingSignal.Surface?) {
+        guard surfaces[id] != surface else { return }
+        surfaces[id] = surface
+        guard !applyScheduled else { return }
+        applyScheduled = true
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                applyScheduled = false
+                apply()
+            }
+        }
+    }
+
+    private static func apply() {
+        let signal = QuotaMeterPollingSignal.combine(Array(surfaces.values))
+        guard signal != applied else { return }
+        applied = signal
+        UserDefaults.standard.set(signal.visible, forKey: PreferencesKey.Cockpit.hudOpen)
+        CodexUsageModel.shared.setCockpitVisible(signal.visible, pinned: signal.pinned)
+        ClaudeUsageModel.shared.setCockpitVisible(signal.visible, pinned: signal.pinned)
+    }
+}
+
+struct AgentCockpitHUDView: View {
+    let codexIndexer: SessionIndexer
+    let claudeIndexer: ClaudeSessionIndexer
+    let opencodeIndexer: OpenCodeSessionIndexer
+    let surface: QuotaMeterSurface
+    @Environment(CodexActiveSessionsModel.self) var activeCodex
+
+    @AppStorage("AppAppearance") private var appAppearanceRaw: String = AppAppearance.system.rawValue
+    @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var activeEnabled: Bool = true
+    /// Same key and fallback as `HUDLimitsRowsPanel`, so the toolbar's lens control
+    /// appears exactly when the panel shows the OpenCode group.
+    @AppStorage(PreferencesKey.Agents.openCodeEnabled) private var openCodeAgentEnabled = true
+    @AppStorage(PreferencesKey.Cockpit.hudPinned) private var isPinned: Bool = false
+    /// Defaults OFF, and must stay off until the compact height model accounts
+    /// for the limits footer.
+    ///
+    /// `compactContentHeight` is `toolbar + rows` and nothing else, but Compact
+    /// also renders `HUDLimitsBar` whenever `showLimits` is on. Auto-fit sizes
+    /// the window from that model, so the footer takes its intrinsic height and
+    /// starves the flexible session list — the shorter the fit, the more of the
+    /// list disappears. Turning this on by default shipped that squeeze to
+    /// everyone; it was reverted.
+    ///
+    /// The blank box under "No sessions" with auto-fit off is real, but it is
+    /// not this flag's to fix: the fix is teaching the height model about the
+    /// footer (measure it, as the Quota Meter already does via
+    /// `LimitsContentHeightKey`), then revisiting this default.
+    @AppStorage(PreferencesKey.Cockpit.hudReduceTransparency) private var reduceTransparency: Bool = true
+
+    @Environment(\.accessibilityReduceTransparency) private var systemReduceTransparency
+
+    private var hudBackground: some ShapeStyle {
+        if systemReduceTransparency { return AnyShapeStyle(.ultraThickMaterial) }
+        if reduceTransparency { return AnyShapeStyle(.thickMaterial) }
+        return AnyShapeStyle(.regularMaterial)
+    }
+
+    @State private var activeConsumerID = UUID()
+    @State private var orderedRowIDs: [String] = []
+    @State private var latestCanonicalRows: [HUDRow] = []
+    @State private var latestCanonicalRowsSnapshotAt: Date = Date()
+    @State private var presentationClockNow: Date = Date()
+    @State private var isWindowVisibleForOrdering: Bool = true
+    @State private var wasWindowHiddenSinceLastVisible: Bool = false
+    @State private var hiddenMembershipChurnDetected: Bool = false
+    @State private var hiddenPriorityChurnDetected: Bool = false
+    @State private var highlightedRowIDs: Set<String> = []
+    @State private var isCockpitWindowKey: Bool = true
+    /// Pointer has rested on the window past the dwell. Reveals chrome under
+    /// `.onHover`; under `.onDemand` it only surfaces the hint, since the whole
+    /// point of that mode is that the pointer alone changes nothing.
+    @State private var pointerDwelled: Bool = false
+    /// Chrome was revealed by an explicit right-click (`.onDemand` only).
+    @State private var demandRevealed: Bool = false
+    /// Pointer is within the HUD. Tracked separately from `pointerDwelled` so a
+    /// popover closing can re-evaluate the collapse without waiting for a hover
+    /// transition that may never come.
+    @State private var isPointerInsideWindow: Bool = false
+    @State private var compactToolbarHideTask: Task<Void, Never>? = nil
+    @State private var compactToolbarRevealTask: Task<Void, Never>? = nil
+    @State private var presentationState: HUDPresentationState = .empty
+    @StateObject private var derivedState: AgentCockpitHUDDerivedStateModel
+    @State private var limitsContentHeight: CGFloat = 30
+
+    private let fullBodyMinHeight: CGFloat = 170
+    private let compactBodyRowHeight: CGFloat = 31
+    private let compactBodyMinRowsWhenToolbarHidden: CGFloat = 3
+    private let compactBodyMaxRowsWhenToolbarVisible: CGFloat = 10
+    private static let staleWaitingThreshold: TimeInterval = 4 * 60 * 60
+    private static let presentationClockInterval: TimeInterval = 30
+    private let presentationClock = Timer.publish(
+        every: AgentCockpitHUDView.presentationClockInterval,
+        on: .main,
+        in: .common
+    ).autoconnect()
+
+    private static let codexRolloutTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
+        return formatter
+    }()
+
+    private static let activityTooltipFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.timeZone = .current
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .medium
+        return formatter
+    }()
+
+    /// Chrome modes are a Quota Meter concern only. Full has a permanent
+    /// toolbar; Compact keeps its own hover-reveal.
+    private var quotaMeterChrome: QuotaMeterChrome {
+        QuotaMeterChrome.current(raw: quotaMeterChromeRaw)
+    }
+
+    private var resolvedShowsCompactToolbar: Bool {
+        return quotaMeterChrome.showsChrome(pointerDwelled: pointerDwelled, demandRevealed: demandRevealed)
+    }
+
+    private var showsRightClickHint: Bool {
+        return quotaMeterChrome.showsRightClickHint(
+            pointerDwelled: pointerDwelled,
+            demandRevealed: demandRevealed
+        )
+    }
+
+
+    private var measuredLimitsContentHeight: CGFloat {
+        return max(30, limitsContentHeight)
+    }
+
+    /// Natural width of the compact limits row at the active font size. Drives the
+    /// limits-only window's fixed width so it hugs its content (no right-edge dead
+    /// space) and resizes once when the Enlarged font is toggled.
+    private var measuredLimitsContentWidth: CGFloat {
+        HUDLimitsColumnLayout.compactContentWidth(enlarged: quotaMeterEnlarged)
+    }
+
+    @AppStorage(PreferencesKey.codexUsageEnabled) private var codexUsageEnabledForLimits: Bool = false
+    @AppStorage(PreferencesKey.claudeUsageEnabled) private var claudeUsageEnabledForLimits: Bool = false
+    @AppStorage(PreferencesKey.Agents.codexEnabled) private var codexAgentEnabledForLimits: Bool = true
+    @AppStorage(PreferencesKey.Agents.claudeEnabled) private var claudeAgentEnabledForLimits: Bool = true
+    @AppStorage(PreferencesKey.quotaMeterRunwayPresentation) private var runwayPresentationRaw = RunwayPresentation.fiveHour.rawValue
+    @AppStorage(PreferencesKey.quotaMeterHiddenProviders) private var quotaMeterHiddenProvidersRaw = QuotaMeterProviderVisibility.defaultRawValue
+    @AppStorage(PreferencesKey.quotaMeterEnlarged) private var quotaMeterEnlarged = false
+    @AppStorage(PreferencesKey.quotaMeterChrome) private var quotaMeterChromeRaw = QuotaMeterChrome.onDemand.rawValue
+    @AppStorage(PreferencesKey.quotaMeterPlacement) private var quotaMeterPlacementRaw = QuotaMeterPlacement.floating.rawValue
+    /// Set only inside the menu bar strip.
+    @Environment(\.quotaStripExpanded) private var stripExpanded
+    @Environment(\.quotaStripPopoverReporter) private var reportStripPopover
+    @State private var showRunwayPresentationPopover = false
+    @State private var showProviderVisibilityPopover = false
+    @State private var showChromePopover = false
+    @State private var showProbePopover = false
+    @ObservedObject private var probeCoordinator = ProbeCoordinator.shared
+    @EnvironmentObject private var codexUsageModel: CodexUsageModel
+    @EnvironmentObject private var claudeUsageModel: ClaudeUsageModel
+
+    init(codexIndexer: SessionIndexer, claudeIndexer: ClaudeSessionIndexer, opencodeIndexer: OpenCodeSessionIndexer,
+         surface: QuotaMeterSurface = .window) {
+        self.codexIndexer = codexIndexer
+        self.claudeIndexer = claudeIndexer
+        self.opencodeIndexer = opencodeIndexer
+        self.surface = surface
+        _derivedState = StateObject(
+            wrappedValue: AgentCockpitHUDDerivedStateModel(
+                codexIndexer: codexIndexer,
+                claudeIndexer: claudeIndexer,
+                opencodeIndexer: opencodeIndexer,
+                initialCompact: true
+            )
+        )
+    }
+
+    private var pollingSurface: QuotaMeterPollingSignal.Surface {
+        surface == .strip ? .strip : .window(pinned: isPinned)
+    }
+
+    var body: some View {
+        let appAppearance = AppAppearance(rawValue: appAppearanceRaw) ?? .system
+        Group {
+            if surface == .strip {
+                // The strip extends black hardware, so it is always dark.
+                hudContent.environment(\.colorScheme, .dark)
+            } else {
+                switch appAppearance {
+                case .light: hudContent.preferredColorScheme(.light)
+                case .dark: hudContent.preferredColorScheme(.dark)
+                case .system: hudContent
+                }
+            }
+        }
+        .onAppear {
+            activeCodex.setCockpitConsumerVisible(true, consumerID: activeConsumerID)
+            activeCodex.setCockpitWindowVisible(true, consumerID: activeConsumerID)
+            CodexUsageModel.shared.setAppActive(NSApp.isActive)
+            ClaudeUsageModel.shared.setAppActive(NSApp.isActive)
+            QuotaMeterPollingRegistry.set(activeConsumerID, pollingSurface)
+        }
+        .onDisappear {
+            activeCodex.setCockpitWindowVisible(false, consumerID: activeConsumerID)
+            activeCodex.setCockpitConsumerVisible(false, consumerID: activeConsumerID)
+            QuotaMeterPollingRegistry.set(activeConsumerID, nil)
+            cancelCompactToolbarRevealTask()
+            cancelCompactToolbarHideTask()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            CodexUsageModel.shared.setAppActive(true)
+            ClaudeUsageModel.shared.setAppActive(true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            CodexUsageModel.shared.setAppActive(false)
+            ClaudeUsageModel.shared.setAppActive(false)
+        }
+        .onChange(of: isPinned) { _, _ in
+            QuotaMeterPollingRegistry.set(activeConsumerID, pollingSurface)
+        }
+    }
+
+    private var hudContent: some View {
+        let snapshot = derivedState.snapshot
+        let snapshotTimestamp = derivedState.snapshotTimestamp
+        let presentationTimestamp = max(snapshotTimestamp, presentationClockNow)
+        let canonicalRows = activeEnabled ? snapshot.rows : []
+        let currentPresentationInputs = HUDPresentationInputs(
+            canonicalRows: canonicalRows,
+            snapshotTimestamp: presentationTimestamp,
+            orderedRowIDs: orderedRowIDs,
+            isWindowVisibleForOrdering: isWindowVisibleForOrdering
+        )
+        let displayState = presentationState.inputs == currentPresentationInputs
+            ? presentationState
+            : Self.makePresentationState(from: currentPresentationInputs)
+        let showsCompactToolbar = resolvedShowsCompactToolbar
+
+        return configuredHUDContent(
+            snapshot: snapshot,
+            displayState: displayState,
+            showsCompactToolbar: showsCompactToolbar
+        )
+        .onAppear {
+            derivedState.bind(activeCodex: activeCodex)
+            derivedState.setCompact(true, activeCodex: activeCodex)
+            presentationClockNow = max(presentationClockNow, snapshotTimestamp)
+            presentationState = Self.makePresentationState(from: currentPresentationInputs)
+            synchronizeOrderedRows(
+                with: canonicalRows,
+                previousRows: [],
+                previousSnapshotAt: presentationTimestamp,
+                incomingSnapshotAt: presentationTimestamp
+            )
+            latestCanonicalRows = canonicalRows
+            latestCanonicalRowsSnapshotAt = presentationTimestamp
+        }
+        .onChange(of: canonicalRows) { oldRows, rows in
+            let presentationTimestamp = max(presentationClockNow, derivedState.snapshotTimestamp)
+            synchronizeOrderedRows(
+                with: rows,
+                previousRows: oldRows,
+                previousSnapshotAt: latestCanonicalRowsSnapshotAt,
+                incomingSnapshotAt: presentationTimestamp
+            )
+            latestCanonicalRows = rows
+            latestCanonicalRowsSnapshotAt = presentationTimestamp
+            refreshPresentationState(
+                canonicalRows: rows,
+                snapshotTimestamp: presentationTimestamp
+            )
+        }
+        .onChange(of: isWindowVisibleForOrdering) { _, isVisible in
+            guard isVisible else { return }
+            let now = Date()
+            presentationClockNow = now
+            refreshPresentationState(canonicalRows: latestCanonicalRows, snapshotTimestamp: now)
+            synchronizeOrderedRows(
+                with: latestCanonicalRows,
+                previousRows: latestCanonicalRows,
+                previousSnapshotAt: latestCanonicalRowsSnapshotAt,
+                incomingSnapshotAt: now
+            )
+            latestCanonicalRowsSnapshotAt = now
+        }
+        .onChange(of: orderedRowIDs) { _, _ in
+            refreshPresentationState(canonicalRows: canonicalRows, snapshotTimestamp: presentationTimestamp)
+        }
+        .onChange(of: activeEnabled) { _, _ in
+            refreshPresentationState(canonicalRows: canonicalRows, snapshotTimestamp: presentationTimestamp)
+        }
+        .onReceive(presentationClock) { now in
+            guard isWindowVisibleForOrdering else { return }
+            presentationClockNow = now
+            let presentationTimestamp = max(now, derivedState.snapshotTimestamp)
+            synchronizeOrderedRows(
+                with: latestCanonicalRows,
+                previousRows: latestCanonicalRows,
+                previousSnapshotAt: latestCanonicalRowsSnapshotAt,
+                incomingSnapshotAt: presentationTimestamp
+            )
+            latestCanonicalRowsSnapshotAt = presentationTimestamp
+            refreshPresentationState(canonicalRows: latestCanonicalRows, snapshotTimestamp: presentationTimestamp)
+        }
+        .onHover { hovering in
+            guard surface == .window else { return }
+            handleCompactWindowHoverChange(hovering)
+        }
+        // Dismissing a popover from outside the HUD produces no hover event, so
+        // re-run the collapse decision once it closes.
+        .onChange(of: isToolbarPopoverOpen) { _, open in
+            // The strip owns its open/close; it only needs to know a popover is up. Its header
+            // must not run the window's hover-collapse (the strip never reports hover).
+            if surface == .strip {
+                reportStripPopover?(open)
+                return
+            }
+            guard !open, !isPointerInsideWindow else { return }
+            handleCompactWindowHoverChange(false)
+        }
+        // The strip's right-click toolbar goes away when the strip collapses.
+        .onChange(of: stripExpanded) { _, expanded in
+            guard surface == .strip, expanded == false, demandRevealed else { return }
+            demandRevealed = false
+        }
+        // The mode is changed *from the toolbar*, so the new mode must not yank
+        // the toolbar — and the popover anchored to it — out from under the
+        // pointer. Hand it an already-revealed state to land in; the ordinary
+        // pointer-out collapse takes over from there.
+        .onChange(of: quotaMeterChromeRaw) { _, _ in
+            guard isPointerInsideWindow || showChromePopover else { return }
+            switch quotaMeterChrome {
+            case .always:
+                break
+            case .onHover:
+                pointerDwelled = true
+            case .onDemand:
+                demandRevealed = true
+            }
+        }
+        // Both are overlays, never members of the layout: the no-expansion
+        // promise of .onDemand is structural, not a rule a later edit has to
+        // remember.
+        .applyIf(surface == .strip || quotaMeterChrome.respondsToRightClick) { view in
+            view.overlay(HUDRightClickCatcher(onRightClick: revealChromeOnDemand))
+        }
+        .overlay(alignment: .bottom) {
+            if surface == .window && showsRightClickHint {
+                HUDRightClickHintPill()
+                    .padding(.bottom, 6)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: showsRightClickHint)
+        .onPreferenceChange(LimitsContentHeightKey.self) { height in
+            guard height.isFinite, height > 0 else { return }
+            limitsContentHeight = height
+        }
+        .applyIf(true) { view in
+            view.ignoresSafeArea(.container, edges: .top)
+        }
+    }
+
+    private func configuredHUDContent(snapshot: HUDRowsSnapshot,
+                                      displayState: HUDPresentationState,
+                                      showsCompactToolbar: Bool) -> AnyView {
+        if surface == .strip {
+            // The strip draws its own black notch shape around this content.
+            return AnyView(
+                hudStack(snapshot: snapshot, displayState: displayState, showsCompactToolbar: demandRevealed)
+                    .fixedSize()
+                    .background(
+                        CockpitWindowVisibilityObserver { isVisible in
+                            handleWindowVisibilityChange(isVisible: isVisible)
+                        } onKeyWindowChanged: { _ in }
+                        .allowsHitTesting(false)
+                    )
+            )
+        }
+        return AnyView(
+            hudStack(
+                snapshot: snapshot,
+                displayState: displayState,
+                showsCompactToolbar: showsCompactToolbar
+            )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(
+            RoundedRectangle(cornerRadius: AgentCockpitHUDTheme.cornerRadius, style: .continuous)
+                .fill(hudBackground)
+                .shadow(color: Color.black.opacity(0.12), radius: 14, x: 0, y: 8)
+        )
+        .background(
+            AgentCockpitHUDWindowConfigurator(
+                isPinned: isPinned,
+                limitsContentHeight: measuredLimitsContentHeight,
+                limitsContentWidth: measuredLimitsContentWidth,
+                activeEnabled: activeEnabled,
+                compactToolbarVisible: showsCompactToolbar
+            )
+            .allowsHitTesting(false)
+        )
+        .background(
+            CockpitWindowVisibilityObserver { isVisible in
+                handleWindowVisibilityChange(isVisible: isVisible)
+            } onKeyWindowChanged: { isKey in
+                handleWindowKeyChange(isKey: isKey)
+            }
+            .allowsHitTesting(false)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: AgentCockpitHUDTheme.cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AgentCockpitHUDTheme.cornerRadius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
+        )
+        )
+    }
+
+    @ViewBuilder
+    private func hudStack(snapshot: HUDRowsSnapshot,
+                          displayState: HUDPresentationState,
+                          showsCompactToolbar: Bool) -> some View {
+        VStack(spacing: 0) {
+            if showsCompactToolbar {
+                header(activeCount: snapshot.activeCount, idleCount: snapshot.idleCount,
+                       openCodeGroupVisible: OpenCodeHUDGroup.isVisible(rows: displayState.rowsForDisplay,
+                                                                        detectionEnabled: activeEnabled,
+                                                                        openCodeEnabled: openCodeAgentEnabled))
+                    .background(Color.primary.opacity(0.04))
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                Rectangle()
+                    .fill(Color.primary.opacity(0.10))
+                    .frame(height: 0.5)
+                    .transition(.opacity)
+            }
+
+            if !activeEnabled {
+                disabledCallout
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+            }
+
+            HUDLimitsRowsPanel(
+                activeRows: displayState.rowsForDisplay,
+                detectionEnabled: activeEnabled,
+                // The strip has no toolbar to reveal, so its extra lines always show.
+                showsChrome: surface == .strip ? true : showsCompactToolbar,
+                hiddenProvidersRaw: $quotaMeterHiddenProvidersRaw
+            )
+
+            if surface == .window {
+                hiddenShortcuts
+            }
+        }
+    }
+
+    private func refreshPresentationState(canonicalRows: [HUDRow],
+                                          snapshotTimestamp: Date) {
+        presentationState = Self.makePresentationState(
+            from: HUDPresentationInputs(
+                canonicalRows: canonicalRows,
+                snapshotTimestamp: snapshotTimestamp,
+                orderedRowIDs: orderedRowIDs,
+                isWindowVisibleForOrdering: isWindowVisibleForOrdering
+            )
+        )
+    }
+
+    /// Whether the dwell has anyone listening. Compact always listens; the Quota
+    /// Meter only does when its chrome mode reads the pointer at all.
+    private var dwellTimerArmed: Bool {
+        quotaMeterChrome.armsDwellTimer()
+    }
+
+    /// A toolbar popover is its own window, so reaching for it reads as leaving
+    /// the HUD. Collapsing then would yank the chrome out from under the popover
+    /// still anchored to it.
+    private var isToolbarPopoverOpen: Bool {
+        showRunwayPresentationPopover || showProviderVisibilityPopover || showChromePopover || showProbePopover
+    }
+
+    private func handleCompactWindowHoverChange(_ hovering: Bool) {
+        isPointerInsideWindow = hovering
+        if hovering {
+            // Hover intent: require a short dwell before revealing so a quick
+            // accidental pass over the pinned window does not expand it. This
+            // does not depend on window focus, so it works on a pinned,
+            // non-active window.
+            cancelCompactToolbarHideTask()
+            guard dwellTimerArmed else { return }
+            guard !pointerDwelled, compactToolbarRevealTask == nil else { return }
+            compactToolbarRevealTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    pointerDwelled = true
+                }
+                compactToolbarRevealTask = nil
+            }
+            return
+        }
+
+        // Hover out: drop a pending dwell, then collapse promptly so the window
+        // returns to its compact widget footprint. On-demand chrome collapses on
+        // the same path — revealing it is deliberate, dismissing it needn't be.
+        cancelCompactToolbarRevealTask()
+        cancelCompactToolbarHideTask()
+        guard pointerDwelled || demandRevealed else { return }
+        guard !isToolbarPopoverOpen else { return }
+        compactToolbarHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                pointerDwelled = false
+                demandRevealed = false
+            }
+            compactToolbarHideTask = nil
+        }
+    }
+
+    private func clearRevealState() {
+        guard pointerDwelled || demandRevealed else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            pointerDwelled = false
+            demandRevealed = false
+        }
+    }
+
+    /// Explicit reveal on right-click. The hint keeps recurring on later hovers —
+    /// right-click is the only route to the toolbar, so the reminder never retires.
+    private func revealChromeOnDemand() {
+        // The strip has no hover chrome: right-click is always its way to the toolbar.
+        guard surface == .strip || quotaMeterChrome.respondsToRightClick else { return }
+        cancelCompactToolbarHideTask()
+        guard !demandRevealed else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            demandRevealed = true
+        }
+    }
+
+    private func cancelCompactToolbarHideTask() {
+        compactToolbarHideTask?.cancel()
+        compactToolbarHideTask = nil
+    }
+
+    private func cancelCompactToolbarRevealTask() {
+        compactToolbarRevealTask?.cancel()
+        compactToolbarRevealTask = nil
+    }
+
+    @ViewBuilder
+    private func header(activeCount _: Int, idleCount _: Int, openCodeGroupVisible: Bool) -> some View {
+        let runwayControlAvailable = OpenCodeHUDGroup.controlAvailable(
+            providersShown: runwayProvidersShown, openCodeGroupVisible: openCodeGroupVisible)
+        return
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                // Destinations zone: both buttons leave the Quota Meter for
+                // another window, so they lead together and stay out of the
+                // view-options cluster on the right.
+                HStack(spacing: AgentCockpitHUDTheme.toolbarIntraGroupSpacing) {
+                    cockpitOpenButton
+                    cockpitSettingsButton
+                }
+
+                Spacer(minLength: 0)
+
+                // Keep the runway controls intact before shedding the probe. The
+                // Wk/Hr/$/tk selector changes what the drawer reports, so it must
+                // not be the first control displaced by another toolbar button.
+                // Text size lives in Quota Meter Settings instead of competing
+                // for this width.
+                //
+                // Chrome and pin survive to the last rung; the destinations zone
+                // sits outside ViewThatFits and never drops.
+                ViewThatFits(in: .horizontal) {
+                    limitsToolbarCluster(showRunway: runwayControlAvailable, showProbe: true)
+                    limitsToolbarCluster(showRunway: runwayControlAvailable, showProbe: false)
+                    limitsToolbarCluster(showRunway: false, showProbe: false)
+
+                    Color.clear
+                        .frame(width: 0, height: 1)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+            .padding(.bottom, 10)
+        }
+    }
+
+    private var cockpitOpenButton: some View {
+        Button {
+            AppWindowRouter.showAgentSessionsWindow()
+        } label: {
+            Image(systemName: "rectangle.stack")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: false, tint: nil))
+        .help("Open Agent Sessions")
+    }
+
+    private var cockpitSettingsButton: some View {
+        Button {
+            NotificationCenter.default.post(
+                name: .showPreferencesTab,
+                object: nil,
+                userInfo: ["tab": PreferencesTab.agentCockpit.rawValue]
+            )
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: false, tint: nil))
+        .help("Open Quota Meter settings")
+    }
+
+    /// The toolbar's own visibility control. Load-bearing: with no context menu,
+    /// the toolbar is the only control surface the Quota Meter has, so it has to
+    /// carry the switch that hides it — otherwise turning it off means a
+    /// round-trip through Settings, and `.onDemand` has no visible way back.
+    private var cockpitChromeButton: some View {
+        let chrome = quotaMeterChrome
+        return Button {
+            showChromePopover.toggle()
+        } label: {
+            Image(systemName: "rectangle.topthird.inset.filled")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: chrome != .always, tint: nil))
+        .help("Toolbar: \(chrome.title) — choose when this toolbar appears.")
+        .popover(isPresented: $showChromePopover, arrowEdge: .bottom) {
+            HUDChromeVisibilityPopover(quotaMeterChromeRaw: $quotaMeterChromeRaw)
+        }
+    }
+
+    private var cockpitPinButton: some View {
+        Button {
+            isPinned.toggle()
+        } label: {
+            Image(systemName: isPinned ? "pin.fill" : "pin")
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: isPinned, tint: isPinned ? .orange : nil))
+        .help(isPinned ? "Unpin — stop keeping on top" : "Pin — keep above all windows")
+    }
+
+    private var runwayProvidersShown: Bool {
+        QuotaMeterProvider.allCases.contains { quotaMeterProviderShown($0) }
+    }
+
+    private func quotaMeterProviderConfigured(_ provider: QuotaMeterProvider) -> Bool {
+        switch provider {
+        case .codex: return codexAgentEnabledForLimits && codexUsageEnabledForLimits
+        case .claude: return claudeAgentEnabledForLimits && claudeUsageEnabledForLimits
+        }
+    }
+
+    private func quotaMeterProviderShown(_ provider: QuotaMeterProvider) -> Bool {
+        quotaMeterProviderConfigured(provider)
+            && QuotaMeterProviderVisibility.isVisible(provider, hiddenProvidersRaw: quotaMeterHiddenProvidersRaw)
+    }
+
+    private var quotaMeterProviderOptions: [QuotaMeterProviderOption] {
+        QuotaMeterProvider.allCases.map {
+            QuotaMeterProviderOption(provider: $0, configured: quotaMeterProviderConfigured($0))
+        }
+    }
+
+    private var cockpitProviderVisibilityButton: some View {
+        let filtering = QuotaMeterProvider.allCases.contains {
+            quotaMeterProviderConfigured($0) && !quotaMeterProviderShown($0)
+        }
+        return Button {
+            showProviderVisibilityPopover.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "person.2")
+                    .font(.system(size: 9.5, weight: .semibold))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .opacity(0.6)
+            }
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: filtering, tint: nil))
+        .help("Choose which agent sections appear in Quota Meter.")
+        .popover(isPresented: $showProviderVisibilityPopover, arrowEdge: .bottom) {
+            HUDProviderVisibilityPopover(
+                hiddenProvidersRaw: $quotaMeterHiddenProvidersRaw,
+                options: quotaMeterProviderOptions
+            )
+        }
+    }
+
+    /// The runway rate selector. When the drawer appears (Automatic by default) is a
+    /// Settings choice only, so the toolbar keeps room for the Menu Bar button.
+    private var runwayPresentationButton: some View {
+        let presentation = RunwayPresentation.current(raw: runwayPresentationRaw)
+        return Button {
+            showRunwayPresentationPopover.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.triangle.swap")
+                    .font(.system(size: 9.5, weight: .semibold))
+                Text(presentation.shortLabel)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .opacity(0.6)
+            }
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: presentation != .fiveHour, tint: nil))
+        .help("Session runway rate: 5-hour, tokens, dollars, or weekly.")
+        .popover(isPresented: $showRunwayPresentationPopover, arrowEdge: .bottom) {
+            HUDRunwayPresentationPopover(runwayPresentationRaw: $runwayPresentationRaw)
+        }
+    }
+
+    /// Manual hard-probe trigger (spec 2026-07-18). Eligibility mirrors the
+    /// probe guards: provider enabled + usage tracking on + coordinator idle
+    /// + model idle (isUpdating also covers ordinary refreshes, which make
+    /// the model reject) + auth not alarming (suppressed would be a no-op).
+    private var cockpitProbeButton: some View {
+        Button {
+            showProbePopover.toggle()
+        } label: {
+            Image(systemName: "bolt.badge.clock")
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: false, tint: nil))
+        .help("Probe usage now via the provider CLI (may consume tokens).")
+        .popover(isPresented: $showProbePopover, arrowEdge: .bottom) {
+            HUDProbePopover(
+                claudeEligible: claudeProbeEligible,
+                codexEligible: codexProbeEligible,
+                claudeShown: quotaMeterProviderShown(.claude),
+                codexShown: quotaMeterProviderShown(.codex),
+                claudeDisabledReason: claudeProbeDisabledReason,
+                codexDisabledReason: codexProbeDisabledReason,
+                onProbe: { claude, codex in
+                    if claude && codex { ProbeCoordinator.shared.requestBoth() }
+                    else if claude { ProbeCoordinator.shared.request(.claude) }
+                    else if codex { ProbeCoordinator.shared.request(.codex) }
+                }
+            )
+        }
+        .disabled(!QuotaMeterProvider.allCases.contains { quotaMeterProviderShown($0) })
+    }
+
+    private var claudeProbeEligible: Bool {
+        quotaMeterProviderShown(.claude)
+            && !probeCoordinator.isBusy(.claude)
+            && !claudeUsageModel.isUpdating
+            && !(claudeUsageModel.authStatus?.state.isAlarming ?? false)
+    }
+
+    private var codexProbeEligible: Bool {
+        quotaMeterProviderShown(.codex)
+            && !probeCoordinator.isBusy(.codex)
+            && !codexUsageModel.isUpdating
+            && !(codexUsageModel.authStatus?.state.isAlarming ?? false)
+    }
+
+    /// Explains why the Claude probe item is disabled, mirroring the guards
+    /// in `claudeProbeEligible` (first match wins); nil when eligible.
+    private var claudeProbeDisabledReason: String? {
+        if probeCoordinator.isBusy(.claude) || claudeUsageModel.isUpdating {
+            return "A probe or refresh is already running."
+        }
+        if claudeUsageModel.authStatus?.state.isAlarming == true {
+            return "Signed out / auth needs attention — probing would hit a login screen."
+        }
+        return nil
+    }
+
+    /// Explains why the Codex probe item is disabled, mirroring the guards
+    /// in `codexProbeEligible` (first match wins); nil when eligible.
+    private var codexProbeDisabledReason: String? {
+        if probeCoordinator.isBusy(.codex) || codexUsageModel.isUpdating {
+            return "A probe or refresh is already running."
+        }
+        if codexUsageModel.authStatus?.state.isAlarming == true {
+            return "Signed out / auth needs attention — probing would hit a login screen."
+        }
+        return nil
+    }
+
+    /// Marks pin as belonging to no group — it is window behavior, not a
+    /// Quota Meter setting.
+    private var toolbarHairline: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.12))
+            .frame(width: 1, height: 16)
+    }
+
+    /// One rung of the Quota Meter's trailing cluster. The chrome button is never
+    /// shed — it is the only way back from `.onDemand`, so it outranks even the
+    /// runway controls when width runs short.
+    private func limitsToolbarCluster(showRunway: Bool,
+                                      showProbe: Bool) -> some View {
+        HStack(spacing: AgentCockpitHUDTheme.toolbarGroupSpacing) {
+            if showRunway {
+                runwayPresentationButton
+            }
+            // This selector never sheds: it is the in-window route for restoring
+            // a provider after the user hides its section.
+            cockpitProviderVisibilityButton
+            if showProbe {
+                cockpitProbeButton
+            }
+            if surface == .window {
+                cockpitChromeButton
+            }
+            toolbarHairline
+            if surface == .window {
+                cockpitMoveToMenuBarButton
+                cockpitPinButton
+            } else {
+                // The strip hides Pin (the stored preference is unchanged) and offers the
+                // way back to the floating window instead.
+                cockpitMoveToFloatingButton
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    /// Switches the Quota Meter to the notch (placement `menuBar`).
+    private var cockpitMoveToMenuBarButton: some View {
+        Button {
+            quotaMeterPlacementRaw = QuotaMeterPlacement.menuBar.rawValue
+        } label: {
+            NotchGlyph()
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: false, tint: nil))
+        .help("Move Quota Meter to Notch")
+        .accessibilityLabel("Move Quota Meter to Notch")
+    }
+
+    /// Switches the Quota Meter back to the floating window (placement `floating`).
+    private var cockpitMoveToFloatingButton: some View {
+        Button {
+            quotaMeterPlacementRaw = QuotaMeterPlacement.floating.rawValue
+        } label: {
+            Image(systemName: "macwindow")
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(HUDIconButtonStyle(isOn: false, tint: nil))
+        .help("Move Quota Meter to Desktop")
+    }
+
+    /// The Quota Meter's chrome strips `.titled` and disables the standard
+    /// window buttons, so AppKit has no close button to press and the standard
+    /// Cmd+W reaches `performClose` and merely beeps. This puts it back.
+    private var hiddenShortcuts: some View {
+        Button("") {
+            AppWindowRouter.closeAgentCockpitWindow()
+        }
+        .keyboardShortcut("w", modifiers: .command)
+        .frame(width: 0, height: 0)
+        .opacity(0)
+    }
+
+    private static func makePresentationState(from inputs: HUDPresentationInputs) -> HUDPresentationState {
+        let rowsForDisplay = rowsOrderedForDisplay(
+            orderedRowIDs: inputs.orderedRowIDs,
+            canonicalRows: inputs.canonicalRows
+        )
+        return HUDPresentationState(
+            inputs: inputs,
+            rowsForDisplay: rowsForDisplay,
+            shownSessionCount: rowsForDisplay.count
+        )
+    }
+
+    private static func rowsOrderedForDisplay(orderedRowIDs: [String],
+                                              canonicalRows: [HUDRow]) -> [HUDRow] {
+        guard !orderedRowIDs.isEmpty else { return canonicalRows }
+
+        let byID = Dictionary(uniqueKeysWithValues: canonicalRows.map { ($0.id, $0) })
+        let ordered = orderedRowIDs.compactMap { byID[$0] }
+        let orderedSet = Set(ordered.map(\.id))
+        if ordered.count == canonicalRows.count {
+            return ordered
+        }
+        let trailing = canonicalRows.filter { !orderedSet.contains($0.id) }
+        return ordered + trailing
+    }
+
+    private func rowsOrderedForDisplay(from canonicalRows: [HUDRow]) -> [HUDRow] {
+        Self.rowsOrderedForDisplay(orderedRowIDs: orderedRowIDs, canonicalRows: canonicalRows)
+    }
+
+    private func synchronizeOrderedRows(with canonicalRows: [HUDRow],
+                                        previousRows: [HUDRow],
+                                        previousSnapshotAt: Date,
+                                        incomingSnapshotAt: Date) {
+        let incomingIDs = canonicalRows.map(\.id)
+
+        guard !orderedRowIDs.isEmpty else {
+            orderedRowIDs = incomingIDs
+            return
+        }
+
+        if !isWindowVisibleForOrdering {
+            wasWindowHiddenSinceLastVisible = true
+            if Self.hasMembershipChurn(existing: orderedRowIDs, incoming: incomingIDs) {
+                hiddenMembershipChurnDetected = true
+            }
+            if Self.hasPriorityChurn(existing: previousRows,
+                                     existingSnapshotAt: previousSnapshotAt,
+                                     incoming: canonicalRows,
+                                     incomingSnapshotAt: incomingSnapshotAt) {
+                hiddenPriorityChurnDetected = true
+            }
+            return
+        }
+
+        if wasWindowHiddenSinceLastVisible {
+            if hiddenMembershipChurnDetected || hiddenPriorityChurnDetected {
+                orderedRowIDs = incomingIDs
+            } else {
+                let merge = Self.stableMergedOrder(existing: orderedRowIDs, incoming: incomingIDs)
+                orderedRowIDs = merge.order
+                queueInsertionHighlights(for: merge.inserted)
+            }
+            wasWindowHiddenSinceLastVisible = false
+            hiddenMembershipChurnDetected = false
+            hiddenPriorityChurnDetected = false
+            return
+        }
+
+        if Self.hasPriorityChurn(existing: previousRows,
+                                 existingSnapshotAt: previousSnapshotAt,
+                                 incoming: canonicalRows,
+                                 incomingSnapshotAt: incomingSnapshotAt) {
+            orderedRowIDs = incomingIDs
+            return
+        }
+
+        let merge = Self.stableMergedOrder(existing: orderedRowIDs, incoming: incomingIDs)
+        orderedRowIDs = merge.order
+        queueInsertionHighlights(for: merge.inserted)
+    }
+
+
+    private func handleWindowVisibilityChange(isVisible: Bool) {
+        activeCodex.setCockpitWindowVisible(isVisible, consumerID: activeConsumerID)
+        guard isWindowVisibleForOrdering != isVisible else { return }
+        isWindowVisibleForOrdering = isVisible
+        if !isVisible {
+            wasWindowHiddenSinceLastVisible = true
+        }
+    }
+
+    private func handleWindowKeyChange(isKey: Bool) {
+        withAnimation(.easeInOut(duration: 0.14)) {
+            isCockpitWindowKey = isKey
+        }
+    }
+
+    private func goToSession(_ row: HUDRow) {
+        guard activeEnabled, row.navigationConfidence.isNavigable else { return }
+        guard let resolvedSessionID = row.resolvedSessionID else {
+            NSSound.beep()
+            return
+        }
+        let pendingRequest = PendingCockpitNavigationRequest(
+            unifiedSessionID: resolvedSessionID,
+            sourceRawValue: row.source.rawValue,
+            runtimeSessionID: row.runtimeSessionID,
+            logPath: row.logPath,
+            workingDirectory: row.workingDirectory,
+            createdAt: Date()
+        )
+        CockpitNavigationBridge.store(pendingRequest)
+
+        AppWindowRouter.showAgentSessionsWindow()
+
+        var payload: [AnyHashable: Any] = ["source": row.source.rawValue]
+        if let runtimeSessionID = row.runtimeSessionID, !runtimeSessionID.isEmpty {
+            payload["runtimeSessionID"] = runtimeSessionID
+        }
+        if let logPath = row.logPath, !logPath.isEmpty {
+            payload["logPath"] = logPath
+        }
+        if let workingDirectory = row.workingDirectory, !workingDirectory.isEmpty {
+            payload["workingDirectory"] = workingDirectory
+        }
+        postGoToSessionNotification(
+            unifiedSessionID: resolvedSessionID,
+            payload: payload,
+            attempt: 0
+        )
+    }
+
+    private func postGoToSessionNotification(unifiedSessionID: String,
+                                             payload: [AnyHashable: Any],
+                                             attempt: Int) {
+        NotificationCenter.default.post(
+            name: .navigateToSessionFromCockpit,
+            object: unifiedSessionID,
+            userInfo: payload
+        )
+
+        guard attempt < 8 else { return }
+        guard CockpitNavigationBridge.hasPending(unifiedSessionID: unifiedSessionID) else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            postGoToSessionNotification(
+                unifiedSessionID: unifiedSessionID,
+                payload: payload,
+                attempt: attempt + 1
+            )
+        }
+    }
+
+    private func revealLog(_ row: HUDRow) {
+        guard let path = row.logPath else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    private func openWorkingDirectory(_ row: HUDRow) {
+        guard let path = row.workingDirectory else { return }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+    }
+
+    private func copyToPasteboard(_ text: String?) {
+        guard let text else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(trimmed, forType: .string)
+    }
+
+    private func normalizedTabTitle(_ row: HUDRow) -> String? {
+        row.cleanedTabTitle
+    }
+
+    private var disabledCallout: some View {
+        PreferenceCallout {
+            Text("Live session detection (Beta) is disabled in Settings → Quota Meter.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    static func liveSessionSummary(activeCodex: CodexActiveSessionsModel) -> HUDLiveSessionSummary {
+        let presences = displayableLiveSummaryPresences(from: activeCodex.presences, lookupIndexes: nil)
+        let activeCount = presences.reduce(into: 0) { count, presence in
+            if activeCodex.liveState(for: presence) == .activeWorking {
+                count += 1
+            }
+        }
+        let waitingCount = max(0, presences.count - activeCount)
+        return HUDLiveSessionSummary(activeCount: activeCount, waitingCount: waitingCount)
+    }
+
+    static func liveSessionSummary(activeCodex: CodexActiveSessionsModel,
+                                   lookupIndexes: SessionLookupIndexes?) -> HUDLiveSessionSummary {
+        let presences = displayableLiveSummaryPresences(from: activeCodex.presences, lookupIndexes: lookupIndexes)
+        let activeCount = presences.reduce(into: 0) { count, presence in
+            if activeCodex.liveState(for: presence) == .activeWorking {
+                count += 1
+            }
+        }
+        let waitingCount = max(0, presences.count - activeCount)
+        return HUDLiveSessionSummary(activeCount: activeCount, waitingCount: waitingCount)
+    }
+
+    static func liveSessionSummary(activeCodex: CodexActiveSessionsModel,
+                                   codexIndexer: SessionIndexer,
+                                   claudeIndexer: ClaudeSessionIndexer,
+                                   opencodeIndexer: OpenCodeSessionIndexer) -> HUDLiveSessionSummary {
+        liveSessionSummary(
+            activeCodex: activeCodex,
+            lookupIndexes: buildSessionLookupIndexes(
+                codexSessions: codexIndexer.allSessions,
+                claudeSessions: claudeIndexer.allSessions,
+                opencodeSessions: opencodeIndexer.allSessions
+            )
+        )
+    }
+
+    private static func displayableLiveSummaryPresences(from presences: [CodexActivePresence],
+                                                        lookupIndexes: SessionLookupIndexes?) -> [CodexActivePresence] {
+        let supportedSources: Set<SessionSource> = [.codex, .claude, .opencode]
+        let showProbes = UserDefaults.standard.bool(forKey: PreferencesKey.Cockpit.showProbeSessionsInHUD)
+        let filtered = presences.filter { presence in
+            guard supportedSources.contains(presence.source) else { return false }
+            if !showProbes {
+                if CodexProbeConfig.isProbeWorkingDirectory(presence.workspaceRoot)
+                    || ClaudeProbeConfig.isProbeWorkingDirectory(presence.workspaceRoot) {
+                    return false
+                }
+            }
+            let hasWorkspaceMatch = hasWorkspaceMatchForSummary(presence, lookupIndexes: lookupIndexes)
+            return !Self.shouldHideUnresolvedPresencePlaceholder(
+                presence,
+                resolvedSession: nil,
+                hasWorkspaceMatch: hasWorkspaceMatch
+            )
+        }
+
+        let coalesced = CodexActiveSessionsModel.coalescePresencesByTTY(filtered)
+        var byKey: [String: CodexActivePresence] = [:]
+        byKey.reserveCapacity(coalesced.count)
+        for presence in coalesced {
+            let key = liveSummaryPresenceKey(for: presence)
+            byKey[key] = preferredLiveSummaryPresence(existing: byKey[key], incoming: presence)
+        }
+        return Array(byKey.values)
+    }
+
+    private static func hasWorkspaceMatchForSummary(_ presence: CodexActivePresence,
+                                                    lookupIndexes: SessionLookupIndexes?) -> Bool {
+        guard let lookupIndexes else { return false }
+        return Self.resolveByWorkspace(
+            presence.workspaceRoot,
+            source: presence.source,
+            lookupIndexes: lookupIndexes
+        ) != nil
+    }
+
+    private static func liveSummaryPresenceKey(for presence: CodexActivePresence) -> String {
+        if let sessionID = presence.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sessionID.isEmpty {
+            return CodexActiveSessionsModel.sessionLookupKey(source: presence.source, sessionId: sessionID)
+        }
+        if let logPath = presence.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !logPath.isEmpty {
+            return CodexActiveSessionsModel.logLookupKey(
+                source: presence.source,
+                normalizedPath: CodexActiveSessionsModel.normalizePath(logPath)
+            )
+        }
+        if let tty = normalizeTTY(presence.tty) {
+            return "\(presence.source.rawValue)|tty:\(tty)"
+        }
+        if let workspace = normalizedWorkingDirectory(presence.workspaceRoot), !workspace.isEmpty {
+            return workspaceLookupKey(source: presence.source, normalizedPath: workspace)
+        }
+        if let sourceFilePath = presence.sourceFilePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sourceFilePath.isEmpty {
+            return "\(presence.source.rawValue)|src:\(CodexActiveSessionsModel.normalizePath(sourceFilePath))"
+        }
+        if let pid = presence.pid {
+            return "\(presence.source.rawValue)|pid:\(pid)"
+        }
+        return CodexActiveSessionsModel.presenceKey(for: presence)
+    }
+
+    private static func preferredLiveSummaryPresence(existing: CodexActivePresence?,
+                                                     incoming: CodexActivePresence) -> CodexActivePresence {
+        guard let existing else { return incoming }
+        let existingSeen = existing.lastSeenAt ?? .distantPast
+        let incomingSeen = incoming.lastSeenAt ?? .distantPast
+        if incomingSeen != existingSeen {
+            return incomingSeen > existingSeen ? incoming : existing
+        }
+        let existingHasJoin = (existing.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            || (existing.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        let incomingHasJoin = (incoming.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            || (incoming.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        if existingHasJoin != incomingHasJoin {
+            return incomingHasJoin ? incoming : existing
+        }
+        return existing
+    }
+
+    static func makeRowsSnapshot(codexSessions: [Session],
+                                             claudeSessions: [Session],
+                                             opencodeSessions: [Session],
+                                             presences: [CodexActivePresence],
+                                             activeSubagentCounts: [String: Int],
+                                             activeCodex: CodexActiveSessionsModel,
+                                             isCompact: Bool,
+                                             lookupIndexes: SessionLookupIndexes,
+                                             showProbePresences: Bool = false,
+                                             cloudRows: [HUDRow] = [],
+                                             now: Date = Date()) -> HUDRowsSnapshot {
+        let supportedSources: Set<SessionSource> = [.codex, .claude, .opencode]
+        let allSessions = codexSessions + claudeSessions + opencodeSessions
+        // S2: extracted to `SessionRowsBuilder` when this direct-join key
+        // computation was duplicated byte-identically across live-row builders.
+        let directJoinFallbackKeys = SessionRowsBuilder.directJoinFallbackKeys(for: allSessions) { session in
+            activeCodex.presence(for: session)
+        }
+        let fallbackBySessionKey = SessionRowsBuilder.buildFallbackPresenceMap(
+            sessions: allSessions,
+            presences: presences,
+            directJoinSessionKeys: directJoinFallbackKeys
+        )
+
+        var fallbackSessionByPresenceKey: [String: Session] = [:]
+        fallbackSessionByPresenceKey.reserveCapacity(fallbackBySessionKey.count)
+
+        for session in allSessions {
+            let sessionKey = SessionRowsBuilder.fallbackPresenceKey(source: session.source, sessionID: session.id)
+            guard let presence = fallbackBySessionKey[sessionKey] else { continue }
+            let presenceKey = CodexActiveSessionsModel.presenceKey(for: presence)
+            guard presenceKey != "unknown" else { continue }
+            fallbackSessionByPresenceKey[presenceKey] = Self.preferredSession(
+                existing: fallbackSessionByPresenceKey[presenceKey],
+                incoming: session
+            )
+        }
+
+        // Build per-workspace session pools so multiple presences in the same
+        // directory can each resolve to a different session (sorted newest-first).
+        var workspaceSessionPool: [String: [Session]] = [:]
+        for session in allSessions where supportedSources.contains(session.source) {
+            if let cwd = Self.normalizedWorkingDirectory(session.cwd), !cwd.isEmpty {
+                let key = Self.workspaceLookupKey(source: session.source, normalizedPath: cwd)
+                workspaceSessionPool[key, default: []].append(session)
+            }
+        }
+        for key in workspaceSessionPool.keys {
+            workspaceSessionPool[key]?.sort { $0.modifiedAt > $1.modifiedAt }
+        }
+
+        var claimedSessionIDs: Set<String> = []
+        var mappedRows: [LegacyMappedRow] = []
+        mappedRows.reserveCapacity(presences.count)
+        for presence in presences {
+            guard supportedSources.contains(presence.source) else { continue }
+            if !showProbePresences {
+                if CodexProbeConfig.isProbeWorkingDirectory(presence.workspaceRoot)
+                    || ClaudeProbeConfig.isProbeWorkingDirectory(presence.workspaceRoot) {
+                    continue
+                }
+            }
+            let logNorm = presence.sessionLogPath.map(CodexActiveSessionsModel.normalizePath)
+            let presenceKey = CodexActiveSessionsModel.presenceKey(for: presence)
+
+            let resolvedByLogOrID = logNorm.flatMap { normalized in
+                lookupIndexes.byLogPath[CodexActiveSessionsModel.logLookupKey(source: presence.source, normalizedPath: normalized)]
+            } ?? Self.resolveBySessionID(presence.sessionId, source: presence.source, lookupIndexes: lookupIndexes)
+            let isDefinitiveMatch = resolvedByLogOrID != nil
+            let requiresOpenCodeIdentity = presence.source == .opencode
+            let candidate = resolvedByLogOrID
+                ?? (requiresOpenCodeIdentity ? nil : Self.resolveByWorkspace(presence.workspaceRoot, source: presence.source, lookupIndexes: lookupIndexes))
+                ?? fallbackSessionByPresenceKey[presenceKey]
+
+            // Prevent multiple workspace-only matches from claiming the same session.
+            // When the first-choice workspace match is already claimed, try to find
+            // another unclaimed session in the same workspace from the pool.
+            let session: Session?
+            if let candidate, !isDefinitiveMatch, !requiresOpenCodeIdentity {
+                if claimedSessionIDs.contains(candidate.id) {
+                    // First choice taken — find another session in the same workspace
+                    if let workspace = Self.normalizedWorkingDirectory(presence.workspaceRoot), !workspace.isEmpty {
+                        let poolKey = Self.workspaceLookupKey(source: presence.source, normalizedPath: workspace)
+                        let alternate = workspaceSessionPool[poolKey]?.first { !claimedSessionIDs.contains($0.id) }
+                        if let alternate {
+                            claimedSessionIDs.insert(alternate.id)
+                            session = alternate
+                        } else {
+                            session = nil
+                        }
+                    } else {
+                        session = nil
+                    }
+                } else {
+                    claimedSessionIDs.insert(candidate.id)
+                    session = candidate
+                }
+            } else {
+                session = candidate
+            }
+
+            if Self.shouldHideUnresolvedPresencePlaceholder(presence, resolvedSession: session, lookupIndexes: lookupIndexes) {
+                continue
+            }
+
+            let title = session?.title
+                ?? presence.sessionId.map { "Session \($0.prefix(8))" }
+                ?? "Active \(presence.source.displayName) session"
+
+            let repo = Self.projectLabel(resolvedSession: session, presence: presence)
+            let date = session?.modifiedAt ?? Self.parseSessionTimestamp(from: presence)
+            let lastActivityAt = activeCodex.lastActivityAt(for: presence) ?? date
+            let liveState = activeCodex.liveState(for: presence)
+            let idleReason = activeCodex.idleReason(for: presence)
+
+            let stableID: String =
+                "\(presence.source.rawValue)|" + (logNorm
+                ?? presence.sessionId
+                ?? presence.sourceFilePath
+                ?? presence.pid.map { "pid:\($0)" }
+                ?? presence.tty
+                ?? "\(presence.sessionLogPath ?? "unknown")|\(presence.pid ?? -1)")
+
+            mappedRows.append(LegacyMappedRow(
+                id: stableID,
+                source: presence.source,
+                title: title,
+                liveState: liveState,
+                lastSeenAt: presence.lastSeenAt,
+                repo: repo,
+                date: date,
+                focusURL: presence.revealURL,
+                itermSessionId: presence.terminal?.itermSessionId,
+                tty: presence.tty,
+                termProgram: presence.terminal?.termProgram,
+                tabTitle: presence.terminal?.tabTitle,
+                resolvedSessionID: session?.id,
+                sessionID: Self.authoritativeSessionID(for: presence, resolvedSession: session),
+                parentSessionID: session?.parentSessionID,
+                logPath: presence.sessionLogPath,
+                workingDirectory: session?.cwd ?? presence.workspaceRoot,
+                lastActivityAt: lastActivityAt,
+                idleReason: idleReason,
+                isDefinitiveMatch: isDefinitiveMatch
+            ))
+        }
+
+        let deduped = Self.dedupeRowsByResolvedSession(mappedRows)
+
+        let sorted = deduped.sorted { a, b in
+            let aState = Self.mapLiveStateForHUD(a.liveState)
+            let bState = Self.mapLiveStateForHUD(b.liveState)
+            let aPriority = Self.displayPriority(for: aState, lastActivityAt: a.lastActivityAt, now: now)
+            let bPriority = Self.displayPriority(for: bState, lastActivityAt: b.lastActivityAt, now: now)
+            if aPriority != bPriority {
+                return aPriority.rawValue < bPriority.rawValue
+            }
+            let da = a.lastActivityAt ?? .distantPast
+            let db = b.lastActivityAt ?? .distantPast
+            if da != db { return da > db }
+            if a.repo != b.repo { return a.repo.localizedCaseInsensitiveCompare(b.repo) == .orderedAscending }
+            return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+        }
+
+        let hudRows = sorted.map { row in
+            let hudState = Self.mapLiveStateForHUD(row.liveState)
+            let elapsed = isCompact ? "" : Self.elapsedLabel(from: row.lastActivityAt)
+            let activityTooltip = row.lastActivityAt.map { Self.activityTooltipFormatter.string(from: $0) }
+            let cleanedTabTitle = Self.normalizedCockpitTabTitle(row.tabTitle, source: row.source)
+            let confidence = Self.navigationConfidence(for: row)
+            return HUDRow(
+                id: row.id,
+                source: row.source,
+                agentType: Self.mapAgentType(row.source),
+                projectName: row.repo,
+                displayName: row.title,
+                liveState: hudState,
+                preview: row.title,
+                elapsed: elapsed,
+                lastSeenAt: row.lastSeenAt,
+                itermSessionId: row.itermSessionId,
+                revealURL: row.focusURL,
+                tty: row.tty,
+                termProgram: row.termProgram,
+                tabTitle: row.tabTitle,
+                cleanedTabTitle: cleanedTabTitle,
+                resolvedSessionID: row.resolvedSessionID,
+                runtimeSessionID: row.sessionID,
+                parentSessionID: row.parentSessionID,
+                logPath: row.logPath,
+                workingDirectory: row.workingDirectory,
+                lastActivityAt: row.lastActivityAt,
+                lastActivityTooltip: activityTooltip,
+                idleReason: row.idleReason,
+                activeSubagentCount: row.resolvedSessionID.flatMap { activeSubagentCounts[$0] }
+                    ?? row.sessionID.flatMap { activeSubagentCounts[$0] }
+                    ?? 0,
+                navigationConfidence: confidence
+            )
+        }
+
+        // Claude cloud sessions have no local process, so they never appear in the
+        // presence poll above. They are appended here, already mapped, so they take
+        // part in ordering and the active/waiting counts exactly like local rows.
+        let allRows = hudRows + cloudRows
+        let counts = Self.waitingCounts(for: allRows, now: now)
+        return HUDRowsSnapshot(rows: allRows, activeCount: counts.active, idleCount: counts.idle)
+    }
+
+    private static func elapsedLabel(from date: Date?) -> String {
+        guard let date else { return "—" }
+        let delta = max(Int(Date().timeIntervalSince(date)), 0)
+        if delta < 60 { return "\(delta)s" }
+        if delta < 3600 { return "\(delta / 60)m" }
+        if delta < 86400 { return "\(delta / 3600)h" }
+        return "\(delta / 86400)d"
+    }
+
+    static func mapLiveStateForHUD(_ liveState: CodexLiveState) -> HUDLiveState {
+        liveState == .activeWorking ? .active : .idle
+    }
+
+    static func displayPriority(for row: HUDRow, now: Date = Date()) -> HUDDisplayPriority {
+        displayPriority(for: row.liveState, lastActivityAt: row.lastActivityAt, now: now)
+    }
+
+    static func displayPriority(for liveState: HUDLiveState,
+                                lastActivityAt: Date?,
+                                now: Date = Date()) -> HUDDisplayPriority {
+        switch liveState {
+        case .active:
+            return .active
+        case .idle:
+            guard let lastActivityAt else { return .waitingFresh }
+            return now.timeIntervalSince(lastActivityAt) >= staleWaitingThreshold ? .waitingStale : .waitingFresh
+        }
+    }
+
+    static func isStaleWaiting(_ row: HUDRow, now: Date = Date()) -> Bool {
+        displayPriority(for: row, now: now) == .waitingStale
+    }
+
+    private static let trailingParentheticalRegex: NSRegularExpression = {
+        // Optional trailing "(...)" suffix used by iTerm tab defaults, e.g. "(codex*)".
+        guard let regex = try? NSRegularExpression(pattern: #"\s*\(([^()]*)\)\s*$"#) else {
+            fatalError("Invalid cockpit tab-title suffix regex.")
+        }
+        return regex
+    }()
+
+    private static let defaultTabTokensBySource: [SessionSource: Set<String>] = [
+        .codex: ["codex"],
+        .claude: ["claude", "claude code"],
+        .opencode: ["opencode"]
+    ]
+
+    static func normalizedCockpitTabTitle(_ rawTitle: String?, source: SessionSource) -> String? {
+        guard let rawTitle else { return nil }
+        let trimmed = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let defaultTokens = defaultTabTokensBySource[source, default: []]
+        guard !defaultTokens.isEmpty else { return trimmed }
+
+        let normalized = normalizeTabToken(trimmed)
+        if defaultTokens.contains(normalized) {
+            return nil
+        }
+
+        if let stripped = strippingTrailingDefaultSuffix(from: trimmed, defaults: defaultTokens) {
+            let normalizedStripped = normalizeTabToken(stripped)
+            guard !normalizedStripped.isEmpty, !defaultTokens.contains(normalizedStripped) else {
+                return nil
+            }
+            return stripped
+        }
+
+        return trimmed
+    }
+
+    private static func strippingTrailingDefaultSuffix(from text: String,
+                                                       defaults: Set<String>) -> String? {
+        let nsText = text as NSString
+        let range = NSRange(location: 0, length: nsText.length)
+        guard let match = trailingParentheticalRegex.firstMatch(in: text, options: [], range: range) else {
+            return nil
+        }
+        let suffixRange = match.range(at: 1)
+        guard suffixRange.location != NSNotFound else { return nil }
+        let suffix = nsText.substring(with: suffixRange)
+        guard defaults.contains(normalizeTabToken(suffix)) else {
+            return nil
+        }
+
+        let prefixRange = NSRange(location: 0, length: match.range.location)
+        let prefix = nsText.substring(with: prefixRange).trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix
+    }
+
+    private static func normalizeTabToken(_ text: String) -> String {
+        let lowered = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lowered.isEmpty else { return "" }
+
+        var sanitized = String()
+        sanitized.reserveCapacity(lowered.count)
+        for scalar in lowered.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                sanitized.unicodeScalars.append(scalar)
+            } else {
+                sanitized.append(" ")
+            }
+        }
+
+        return sanitized
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
+    static func counts(for rows: [HUDRow]) -> (active: Int, idle: Int) {
+        let active = rows.reduce(into: 0) { partial, row in
+            if row.liveState == .active { partial += 1 }
+        }
+        return (active: active, idle: rows.count - active)
+    }
+
+    static func liveSessionSummary(for rows: [HUDRow], now: Date = Date()) -> HUDLiveSessionSummary {
+        let counts = waitingCounts(for: rows, now: now)
+        return HUDLiveSessionSummary(activeCount: counts.active, waitingCount: counts.idle)
+    }
+
+    static func hasPriorityChurn(existing: [HUDRow], incoming: [HUDRow], now: Date = Date()) -> Bool {
+        hasPriorityChurn(
+            existing: existing,
+            existingSnapshotAt: now,
+            incoming: incoming,
+            incomingSnapshotAt: now
+        )
+    }
+
+    static func hasPriorityChurn(existing: [HUDRow],
+                                 existingSnapshotAt: Date,
+                                 incoming: [HUDRow],
+                                 incomingSnapshotAt: Date) -> Bool {
+        guard !existing.isEmpty, !incoming.isEmpty else { return false }
+        let existingIDs = existing.map(\.id)
+        let incomingIDs = incoming.map(\.id)
+        if Set(existingIDs) == Set(incomingIDs), existingIDs != incomingIDs {
+            return true
+        }
+        let existingPriorities = Dictionary(
+            uniqueKeysWithValues: existing.map { ($0.id, displayPriority(for: $0, now: existingSnapshotAt)) }
+        )
+        for row in incoming {
+            guard let existingPriority = existingPriorities[row.id] else { continue }
+            if existingPriority != displayPriority(for: row, now: incomingSnapshotAt) {
+                return true
+            }
+        }
+        return false
+    }
+
+
+    private func queueInsertionHighlights(for ids: [String]) {
+        let freshIDs = Set(ids)
+        guard !freshIDs.isEmpty else { return }
+        highlightedRowIDs.formUnion(freshIDs)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
+            withAnimation(.easeOut(duration: 0.20)) {
+                highlightedRowIDs.subtract(freshIDs)
+            }
+        }
+    }
+
+    static func stableMergedOrder(existing: [String], incoming: [String]) -> (order: [String], inserted: [String]) {
+        let incomingSet = Set(incoming)
+        let kept = existing.filter { incomingSet.contains($0) }
+        let keptSet = Set(kept)
+        let inserted = incoming.filter { !keptSet.contains($0) }
+        return (kept + inserted, inserted)
+    }
+
+    static func hasMembershipChurn(existing: [String], incoming: [String]) -> Bool {
+        Set(existing) != Set(incoming)
+    }
+
+
+
+    private static func waitingCounts(for rows: [HUDRow], now: Date = Date()) -> HUDWaitingCounts {
+        var active = 0
+        var idle = 0
+        var freshIdle = 0
+        var staleIdle = 0
+
+        for row in rows {
+            switch displayPriority(for: row, now: now) {
+            case .active:
+                active += 1
+            case .waitingFresh:
+                idle += 1
+                freshIdle += 1
+            case .waitingStale:
+                idle += 1
+                staleIdle += 1
+            }
+        }
+
+        return HUDWaitingCounts(active: active, idle: idle, freshIdle: freshIdle, staleIdle: staleIdle)
+    }
+
+    private static func sortRows(_ rows: [HUDRow], now: Date = Date()) -> [HUDRow] {
+        rows.sorted { a, b in
+            let aPriority = displayPriority(for: a, now: now)
+            let bPriority = displayPriority(for: b, now: now)
+            if aPriority != bPriority {
+                return aPriority.rawValue < bPriority.rawValue
+            }
+            let da = a.lastActivityAt ?? .distantPast
+            let db = b.lastActivityAt ?? .distantPast
+            if da != db { return da > db }
+            return a.displayName.localizedCaseInsensitiveCompare(b.displayName) == .orderedAscending
+        }
+    }
+
+    private static func mapAgentType(_ source: SessionSource) -> HUDAgentType {
+        switch source {
+        case .codex:
+            return .codex
+        case .claude:
+            return .claude
+        case .opencode:
+            return .opencode
+        default:
+            return .shell
+        }
+    }
+
+    static func navigationConfidence(for row: LegacyMappedRow) -> HUDNavigationConfidence {
+        guard row.resolvedSessionID != nil else { return .none }
+        if row.isDefinitiveMatch { return .exact }
+        if row.sessionID != nil { return .runtimeID }
+        return .cwdOnly
+    }
+
+    private static func authoritativeSessionID(for presence: CodexActivePresence, resolvedSession: Session?) -> String? {
+        if let sessionID = presence.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sessionID.isEmpty {
+            return sessionID
+        }
+        guard let resolvedSession else { return nil }
+        return CodexActiveSessionsModel.liveSessionIDCandidates(for: resolvedSession).first
+    }
+
+    private static func resolveBySessionID(_ id: String?, source: SessionSource, lookupIndexes: SessionLookupIndexes) -> Session? {
+        guard let id, !id.isEmpty else { return nil }
+        let key = CodexActiveSessionsModel.sessionLookupKey(source: source, sessionId: id)
+        return lookupIndexes.bySessionID[key]
+    }
+
+    private static func resolveByWorkspace(_ workspaceRoot: String?,
+                                           source: SessionSource,
+                                           lookupIndexes: SessionLookupIndexes) -> Session? {
+        guard let normalizedWorkspace = normalizedWorkingDirectory(workspaceRoot), !normalizedWorkspace.isEmpty else {
+            return nil
+        }
+        let exactKey = workspaceLookupKey(source: source, normalizedPath: normalizedWorkspace)
+        if let session = lookupIndexes.byWorkspace[exactKey] {
+            return session
+        }
+
+        // Parent/child matching serves real projects (session at the repo root,
+        // agent in a subfolder). A shared root is not a project: everything sits
+        // under it, so a fresh agent in /tmp/x took an old /tmp session's title.
+        guard !isSharedRootDirectory(normalizedWorkspace) else { return nil }
+        let sourcePrefix = "\(source.rawValue)|cwd:"
+        var best: (session: Session, score: Int)?
+        for (key, session) in lookupIndexes.byWorkspace {
+            guard key.hasPrefix(sourcePrefix) else { continue }
+            let sessionPath = String(key.dropFirst(sourcePrefix.count))
+            guard !sessionPath.isEmpty, !isSharedRootDirectory(sessionPath) else { continue }
+            let hasRelation =
+                normalizedWorkspace == sessionPath
+                || normalizedWorkspace.hasPrefix(sessionPath + "/")
+                || sessionPath.hasPrefix(normalizedWorkspace + "/")
+            guard hasRelation else { continue }
+            let candidate = (session: session, score: sessionPath.count)
+            if let best, best.score >= candidate.score {
+                continue
+            }
+            best = candidate
+        }
+        return best?.session
+    }
+
+    /// Folders that hold many unrelated projects. They still match exactly, but never
+    /// as a parent or child in `resolveByWorkspace`.
+    private static let sharedRootDirectories: Set<String> = {
+        let home = CodexActiveSessionsModel.normalizePath(NSHomeDirectory())
+        var roots: Set<String> = ["/", "/Users", "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp",
+                                  "/var/folders", "/private/var/folders", home]
+        roots.insert((home as NSString).deletingLastPathComponent)
+        roots.insert(CodexActiveSessionsModel.normalizePath(NSTemporaryDirectory()))
+        return roots
+    }()
+
+    private static func isSharedRootDirectory(_ normalizedPath: String) -> Bool {
+        sharedRootDirectories.contains(normalizedPath)
+    }
+
+    static func projectLabel(resolvedSession: Session?, presence: CodexActivePresence) -> String {
+        if let repoName = normalizedProjectLabel(resolvedSession?.repoName) {
+            return repoName
+        }
+        if let inferred = inferredProjectName(fromPath: resolvedSession?.cwd) {
+            return inferred
+        }
+        if let inferred = inferredProjectName(fromPath: presence.workspaceRoot) {
+            return inferred
+        }
+        if let repoDisplay = normalizedProjectLabel(resolvedSession?.repoDisplay), repoDisplay != "—" {
+            return repoDisplay
+        }
+        return "-"
+    }
+
+    private static func normalizedProjectLabel(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    private static func inferredProjectName(fromPath rawPath: String?) -> String? {
+        guard let rawPath = normalizedProjectLabel(rawPath) else { return nil }
+        let normalizedPath = CodexActiveSessionsModel.normalizePath(rawPath)
+        guard !normalizedPath.isEmpty else { return nil }
+        let genericNames = Set(["documents", "desktop", "downloads", "tmp", "temp", "src", "code"])
+
+        let url = URL(fileURLWithPath: normalizedPath)
+        let candidate = url.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !candidate.isEmpty, candidate != ".", !genericNames.contains(candidate.lowercased()) {
+            return candidate
+        }
+
+        let parent = url.deletingLastPathComponent().lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !parent.isEmpty, parent != ".", !genericNames.contains(parent.lowercased()) else { return nil }
+        return parent
+    }
+
+    private static func shouldHideUnresolvedPresencePlaceholder(_ presence: CodexActivePresence,
+                                                                resolvedSession: Session?,
+                                                                lookupIndexes: SessionLookupIndexes) -> Bool {
+        let hasWorkspaceMatch = Self.resolveByWorkspace(
+            presence.workspaceRoot,
+            source: presence.source,
+            lookupIndexes: lookupIndexes
+        ) != nil
+        return Self.shouldHideUnresolvedPresencePlaceholder(
+            presence,
+            resolvedSession: resolvedSession,
+            hasWorkspaceMatch: hasWorkspaceMatch
+        )
+    }
+
+    static func shouldHideUnresolvedPresencePlaceholder(_ presence: CodexActivePresence,
+                                                        resolvedSession: Session?,
+                                                        hasWorkspaceMatch: Bool) -> Bool {
+        guard resolvedSession == nil else { return false }
+        let kind = presence.kind?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if kind == "subagent" { return true }
+
+        let hasSessionID = presence.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasLogPath = presence.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasSessionID || hasLogPath { return false }
+        if presence.source == .opencode { return true }
+
+        if presence.source == .codex { return !hasWorkspaceMatch }
+
+        let hasRevealURL = presence.revealURL != nil
+        let hasITermGuid = CodexActiveSessionsModel.itermSessionGuid(from: presence.terminal?.itermSessionId)?.isEmpty == false
+        let termProgram = presence.terminal?.termProgram?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let reportsITermProgram = termProgram.contains("iterm")
+        let canFocusFallbackStrict = hasRevealURL || hasITermGuid || reportsITermProgram
+
+        if canFocusFallbackStrict { return false }
+        if hasWorkspaceMatch { return false }
+        return true
+    }
+
+    private static func dedupeRowsByResolvedSession(_ rows: [LegacyMappedRow]) -> [LegacyMappedRow] {
+        var byKey: [String: LegacyMappedRow] = [:]
+        byKey.reserveCapacity(rows.count)
+        // Secondary dedup: when multiple presences (e.g., parent + subagent) resolve
+        // to the same indexed session, merge them under the resolvedSessionID key.
+        var byResolvedID: [String: String] = [:]
+
+        for row in rows {
+            let key: String = {
+                if let id = row.sessionID, !id.isEmpty {
+                    return "\(row.source.rawValue)|sid:\(id)"
+                }
+                if let path = row.logPath {
+                    return CodexActiveSessionsModel.logLookupKey(
+                        source: row.source,
+                        normalizedPath: CodexActiveSessionsModel.normalizePath(path)
+                    )
+                }
+                if let tty = Self.normalizeTTY(row.tty) {
+                    return "\(row.source.rawValue)|tty:\(tty)"
+                }
+                if let workspace = Self.normalizedWorkingDirectory(row.workingDirectory), !workspace.isEmpty {
+                    return Self.workspaceLookupKey(source: row.source, normalizedPath: workspace)
+                }
+                if let itermSessionId = row.itermSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !itermSessionId.isEmpty {
+                    return "\(row.source.rawValue)|iterm:\(itermSessionId)"
+                }
+                return row.id
+            }()
+
+            // If this row resolves to an indexed session already claimed by another
+            // presence key, merge into that existing row instead of creating a new one.
+            if let resolvedID = row.resolvedSessionID, !resolvedID.isEmpty {
+                let resolvedKey = "\(row.source.rawValue)|resolved:\(resolvedID)"
+                if let existingKey = byResolvedID[resolvedKey], existingKey != key {
+                    byKey[existingKey] = Self.preferredRow(existing: byKey[existingKey], incoming: row)
+                    continue
+                }
+                byResolvedID[resolvedKey] = key
+            }
+
+            let existing = byKey[key]
+            byKey[key] = Self.preferredRow(existing: existing, incoming: row)
+        }
+
+        return Array(byKey.values)
+    }
+
+    private static func preferredRow(existing: LegacyMappedRow?, incoming: LegacyMappedRow) -> LegacyMappedRow {
+        guard let existing else { return incoming }
+        let winner: LegacyMappedRow
+        let loser: LegacyMappedRow
+        let existingHasDate = existing.date != nil
+        let incomingHasDate = incoming.date != nil
+        if existingHasDate != incomingHasDate {
+            winner = incomingHasDate ? incoming : existing
+            loser = incomingHasDate ? existing : incoming
+            return Self.mergeMetadata(into: winner, from: loser)
+        }
+        let existingSeen = existing.lastSeenAt ?? .distantPast
+        let incomingSeen = incoming.lastSeenAt ?? .distantPast
+        if incomingSeen != existingSeen {
+            winner = incomingSeen > existingSeen ? incoming : existing
+            loser = incomingSeen > existingSeen ? existing : incoming
+            return Self.mergeMetadata(into: winner, from: loser)
+        }
+        let existingHasJoin = (existing.sessionID?.isEmpty == false) || existing.logPath != nil
+        let incomingHasJoin = (incoming.sessionID?.isEmpty == false) || incoming.logPath != nil
+        if existingHasJoin != incomingHasJoin {
+            winner = incomingHasJoin ? incoming : existing
+            loser = incomingHasJoin ? existing : incoming
+            return Self.mergeMetadata(into: winner, from: loser)
+        }
+        if existing.liveState != incoming.liveState {
+            let existingCanProbe = Self.rowCanTailProbe(existing)
+            let incomingCanProbe = Self.rowCanTailProbe(incoming)
+            if existingCanProbe != incomingCanProbe {
+                winner = incomingCanProbe ? incoming : existing
+                loser = incomingCanProbe ? existing : incoming
+                return Self.mergeMetadata(into: winner, from: loser)
+            }
+            if existing.liveState == .activeWorking, incoming.liveState == .openIdle {
+                return Self.mergeMetadata(into: incoming, from: existing)
+            }
+            return Self.mergeMetadata(into: existing, from: incoming)
+        }
+        if incoming.title.count > existing.title.count {
+            return Self.mergeMetadata(into: incoming, from: existing)
+        }
+        return Self.mergeMetadata(into: existing, from: incoming)
+    }
+
+    static func mergeMetadata(into winner: LegacyMappedRow, from loser: LegacyMappedRow) -> LegacyMappedRow {
+        LegacyMappedRow(
+            id: winner.id,
+            source: winner.source,
+            title: winner.title,
+            liveState: winner.liveState,
+            lastSeenAt: winner.lastSeenAt ?? loser.lastSeenAt,
+            repo: winner.repo,
+            date: winner.date ?? loser.date,
+            focusURL: winner.focusURL ?? loser.focusURL,
+            // iTerm session GUID and TTY must stay paired to the same terminal session.
+            // A winner with a TTY but no GUID should use TTY-based focusing (the two-pass
+            // AppleScript falls through to the TTY pass). Inheriting a GUID from the loser
+            // would be wrong — that GUID belongs to a different terminal session and would
+            // navigate to the wrong tab.
+            itermSessionId: winner.itermSessionId ?? (winner.tty == nil ? loser.itermSessionId : nil),
+            tty: winner.tty ?? loser.tty,
+            termProgram: winner.termProgram ?? loser.termProgram,
+            tabTitle: winner.tabTitle ?? loser.tabTitle,
+            resolvedSessionID: winner.resolvedSessionID ?? loser.resolvedSessionID,
+            sessionID: winner.sessionID ?? loser.sessionID,
+            parentSessionID: winner.parentSessionID ?? loser.parentSessionID,
+            logPath: winner.logPath ?? loser.logPath,
+            workingDirectory: winner.workingDirectory ?? loser.workingDirectory,
+            lastActivityAt: winner.lastActivityAt ?? loser.lastActivityAt,
+            idleReason: winner.idleReason,
+            isDefinitiveMatch: winner.isDefinitiveMatch || loser.isDefinitiveMatch
+        )
+    }
+
+    private static func rowCanTailProbe(_ row: LegacyMappedRow) -> Bool {
+        CodexActiveSessionsModel.canAttemptITerm2TailProbe(
+            itermSessionId: row.itermSessionId,
+            tty: row.tty,
+            termProgram: row.termProgram
+        )
+    }
+
+    private static func parseSessionTimestamp(from presence: CodexActivePresence) -> Date? {
+        guard let path = presence.sessionLogPath else { return nil }
+        if presence.source != .codex {
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+               let date = attrs[.modificationDate] as? Date {
+                return date
+            }
+            return nil
+        }
+
+        let filename = URL(fileURLWithPath: path).lastPathComponent
+        guard filename.hasPrefix("rollout-") else { return nil }
+        guard let tRange = filename.range(of: #"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-"#,
+                                          options: .regularExpression) else {
+            return nil
+        }
+
+        let match = String(filename[tRange])
+        let ts = match
+            .replacingOccurrences(of: "rollout-", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+
+        return Self.codexRolloutTimestampFormatter.date(from: ts)
+    }
+
+    /// Moved to `AgentCockpitHUDDerivedStateModel` (T3) -- the only real
+    /// callers are that model's `init`/`rebuildLookupIndexes()`. This
+    /// forwarder stays because `liveSessionSummary(activeCodex:codexIndexer:...)`
+    /// below needs a lookup-index build independent of any model instance
+    /// (it's also called from `StatusItemController`/`UsageMenuBar`, outside
+    /// the HUD's derived-state model entirely).
+    static func buildSessionLookupIndexes(codexSessions: [Session],
+                                          claudeSessions: [Session],
+                                          opencodeSessions: [Session] = []) -> SessionLookupIndexes {
+        AgentCockpitHUDDerivedStateModel.buildSessionLookupIndexes(
+            codexSessions: codexSessions,
+            claudeSessions: claudeSessions,
+            opencodeSessions: opencodeSessions
+        )
+    }
+
+    fileprivate static func preferredSession(existing: Session?, incoming: Session) -> Session {
+        guard let existing else { return incoming }
+        if incoming.modifiedAt != existing.modifiedAt {
+            return incoming.modifiedAt > existing.modifiedAt ? incoming : existing
+        }
+        let incomingStart = incoming.startTime ?? .distantPast
+        let existingStart = existing.startTime ?? .distantPast
+        if incomingStart != existingStart {
+            return incomingStart > existingStart ? incoming : existing
+        }
+        if incoming.filePath != existing.filePath {
+            return incoming.filePath < existing.filePath ? incoming : existing
+        }
+        return incoming.id < existing.id ? incoming : existing
+    }
+
+    fileprivate static func normalizedWorkingDirectory(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let normalized = CodexActiveSessionsModel.normalizePath(raw)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func normalizeTTY(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("/dev/") {
+            return trimmed
+        }
+        return "/dev/\(trimmed)"
+    }
+
+    fileprivate static func workspaceLookupKey(source: SessionSource, normalizedPath: String) -> String {
+        "\(source.rawValue)|cwd:\(normalizedPath)"
+    }
+}
+
+private struct CockpitWindowVisibilityObserver: NSViewRepresentable {
+    let onVisibilityChanged: (Bool) -> Void
+    var onKeyWindowChanged: ((Bool) -> Void)? = nil
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            onVisibilityChanged: onVisibilityChanged,
+            onKeyWindowChanged: onKeyWindowChanged
+        )
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async { [weak view] in
+            context.coordinator.attach(to: view?.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onVisibilityChanged = onVisibilityChanged
+        context.coordinator.onKeyWindowChanged = onKeyWindowChanged
+        context.coordinator.attach(to: nsView.window)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    final class Coordinator {
+#if DEBUG
+        private struct DebugAttachmentState {
+            var attachedWindowCount: Int = 0
+            var activeObserverSetCount: Int = 0
+            var maxAttachedWindowCount: Int = 0
+            var maxActiveObserverSetCount: Int = 0
+        }
+        private static let debugAttachmentLock = NSLock()
+        private static var debugAttachmentState = DebugAttachmentState()
+
+        static func debugAttachmentSnapshot() -> (attachedWindows: Int, activeObserverSets: Int, maxAttachedWindows: Int, maxActiveObserverSets: Int) {
+            debugAttachmentLock.lock()
+            let state = debugAttachmentState
+            debugAttachmentLock.unlock()
+            return (
+                attachedWindows: state.attachedWindowCount,
+                activeObserverSets: state.activeObserverSetCount,
+                maxAttachedWindows: state.maxAttachedWindowCount,
+                maxActiveObserverSets: state.maxActiveObserverSetCount
+            )
+        }
+
+        private static func recordAttach() {
+            debugAttachmentLock.lock()
+            debugAttachmentState.attachedWindowCount += 1
+            debugAttachmentState.activeObserverSetCount += 1
+            debugAttachmentState.maxAttachedWindowCount = max(
+                debugAttachmentState.maxAttachedWindowCount,
+                debugAttachmentState.attachedWindowCount
+            )
+            debugAttachmentState.maxActiveObserverSetCount = max(
+                debugAttachmentState.maxActiveObserverSetCount,
+                debugAttachmentState.activeObserverSetCount
+            )
+            debugAttachmentLock.unlock()
+        }
+
+        private static func recordDetach() {
+            debugAttachmentLock.lock()
+            debugAttachmentState.attachedWindowCount = max(0, debugAttachmentState.attachedWindowCount - 1)
+            debugAttachmentState.activeObserverSetCount = max(0, debugAttachmentState.activeObserverSetCount - 1)
+            debugAttachmentLock.unlock()
+        }
+#endif
+        var onVisibilityChanged: (Bool) -> Void
+        var onKeyWindowChanged: ((Bool) -> Void)?
+        private weak var window: NSWindow?
+        private var miniObserver: NSObjectProtocol?
+        private var deminiObserver: NSObjectProtocol?
+        private var occlusionObserver: NSObjectProtocol?
+        private var closeObserver: NSObjectProtocol?
+        private var becameKeyObserver: NSObjectProtocol?
+        private var resignedKeyObserver: NSObjectProtocol?
+
+        init(onVisibilityChanged: @escaping (Bool) -> Void,
+             onKeyWindowChanged: ((Bool) -> Void)?) {
+            self.onVisibilityChanged = onVisibilityChanged
+            self.onKeyWindowChanged = onKeyWindowChanged
+        }
+
+        func attach(to newWindow: NSWindow?) {
+            guard let newWindow else { return }
+            guard window !== newWindow else { return }
+            detach()
+            window = newWindow
+#if DEBUG
+            Self.recordAttach()
+#endif
+
+            miniObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didMiniaturizeNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.emitCurrentVisibility()
+            }
+
+            deminiObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didDeminiaturizeNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.emitCurrentVisibility()
+            }
+
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.emitCurrentVisibility()
+            }
+
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.onVisibilityChanged(false)
+                self?.onKeyWindowChanged?(false)
+                self?.detach()
+            }
+
+            becameKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.emitCurrentKeyState()
+            }
+
+            resignedKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification,
+                object: newWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.emitCurrentKeyState()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                self?.emitCurrentVisibility()
+                self?.emitCurrentKeyState()
+            }
+        }
+
+        func detach() {
+            if let observer = miniObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = deminiObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = occlusionObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = closeObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = becameKeyObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if let observer = resignedKeyObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            miniObserver = nil
+            deminiObserver = nil
+            occlusionObserver = nil
+            closeObserver = nil
+            becameKeyObserver = nil
+            resignedKeyObserver = nil
+            if window != nil {
+#if DEBUG
+                Self.recordDetach()
+#endif
+            }
+            window = nil
+        }
+
+        private func emitCurrentVisibility() {
+            guard let window else { return }
+            let visible = !window.isMiniaturized && window.isVisible
+            onVisibilityChanged(visible)
+        }
+
+        private func emitCurrentKeyState() {
+            guard let window else { return }
+            onKeyWindowChanged?(window.isKeyWindow)
+        }
+
+        deinit {
+            detach()
+        }
+    }
+}
+
+private struct CockpitScrollViewScrollerConfigurator: NSViewRepresentable {
+    let alwaysVisible: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.attachIfNeeded(to: nsView)
+        context.coordinator.apply(alwaysVisible: alwaysVisible)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.restoreBaseline()
+    }
+
+    final class Coordinator {
+        private weak var scrollView: NSScrollView?
+        private var baselineAutohides: Bool?
+        private var baselineScrollerStyle: NSScroller.Style?
+
+        func attachIfNeeded(to view: NSView?) {
+            guard let candidate = enclosingScrollView(from: view) else { return }
+            guard scrollView !== candidate else { return }
+            scrollView = candidate
+            baselineAutohides = candidate.autohidesScrollers
+            baselineScrollerStyle = candidate.scrollerStyle
+        }
+
+        func apply(alwaysVisible: Bool) {
+            guard let scrollView else { return }
+            scrollView.hasVerticalScroller = true
+            if alwaysVisible {
+                scrollView.autohidesScrollers = false
+                scrollView.scrollerStyle = .legacy
+            } else {
+                if let baselineAutohides {
+                    scrollView.autohidesScrollers = baselineAutohides
+                }
+                if let baselineScrollerStyle {
+                    scrollView.scrollerStyle = baselineScrollerStyle
+                }
+            }
+        }
+
+        func restoreBaseline() {
+            apply(alwaysVisible: false)
+            scrollView = nil
+            baselineAutohides = nil
+            baselineScrollerStyle = nil
+        }
+
+        private func enclosingScrollView(from view: NSView?) -> NSScrollView? {
+            var current = view
+            while let node = current {
+                if let scrollView = node as? NSScrollView {
+                    return scrollView
+                }
+                if let enclosing = node.enclosingScrollView {
+                    return enclosing
+                }
+                current = node.superview
+            }
+            return nil
+        }
+
+        deinit {
+            restoreBaseline()
+        }
+    }
+}
+
+// MARK: - HUD Limits Bar
+
+private struct HUDLimitsProviderEntry {
+    let provider: QuotaMeterProvider
+    let source: UsageTrackingSource
+    let fiveHourLeft: Int
+    let weekLeft: Int
+    let fiveHourResetText: String
+    let weekResetText: String
+    /// Whether each window has a classified limit this snapshot. A dropped window
+    /// (e.g. OpenAI pausing the 5h limit) renders a calm "no limit" rather than a
+    /// misleading "0%". Defaults true so Claude / other callers are unchanged.
+    var hasFiveHourRateLimit: Bool = true
+    var hasWeekRateLimit: Bool = true
+    /// Provider sent rate-limit data we couldn't confidently interpret → the
+    /// absent line reads "can't verify" instead of the calm "no limit".
+    var usageFormatSuspect: Bool = false
+    let isInitialLoading: Bool
+    /// For Codex: the JSONL event timestamp. For Claude: the last poll time.
+    let lastDataTimestamp: Date?
+    let fiveHourProjectedRunoutAt: Date?
+    let fiveHourProjectionObservedAt: Date?
+    var fiveHourOnTrackObservedAt: Date? = nil
+    /// Unit-matched burn for the dropped 5h line, resolved from the same snapshot
+    /// as the session rows. nil when a complete rate cannot be shown.
+    var fiveHourBurnChip: String? = nil
+    /// Adaptive weekly header payload, resolved from this provider's visible
+    /// weekly snapshot by `QuotaMeterWeeklyHeaderResolver`. nil keeps the existing
+    /// header. Carried on the entry because the resolver needs the snapshot, which
+    /// only the rows panel has.
+    var weeklyHeader: QuotaMeterWeeklyHeaderStatus? = nil
+    /// Carries the Runway evidence reason into the compact header tooltip.
+    var weeklyCalibrationState: WeeklyRunwayCalibrationState? = nil
+    /// CLI auth status for this provider; when alarming, HUDLimitsBar swaps the
+    /// meter text for an AuthRemediationBanner. Left nil by callers (e.g. the
+    /// rows panel) that don't render the banner.
+    var authStatus: UsageAuthStatus? = nil
+    /// Shared meter state (`QuotaData.presentationState`) so every QM surface —
+    /// the limits bar, the Meter-mode rows panel, and the hover detail panel —
+    /// degrades exactly like the footer / menu bar: an auth-remediation cell
+    /// (`.needsAction`) or a spinning "reconnecting" cell (`.reconnecting`)
+    /// instead of a misleading "0% / no reset" meter.
+    var presentationState: QuotaData.PresentationState = .live
+    /// The same `QuotaData` value's compact reconnecting caption (e.g. "rate
+    /// limited — retrying…"), carried alongside `presentationState` so every
+    /// HUD surface renders the actual cause instead of a generic spinner.
+    var reconnectingCaption: LocalizedStringResource = "reconnecting…"
+    /// True when the provider explicitly returned a rate-limit response. Unlike
+    /// a short reconnect attempt, this can be a long server-directed pause and
+    /// should render without an endlessly spinning activity indicator.
+    var isRateLimited: Bool = false
+}
+
+private extension CodexRunwaySnapshot {
+    var hasRunwayContent: Bool {
+        !rows.isEmpty || burstSummary != nil
+    }
+
+    var runwayVisibleRowCount: Int {
+        rows.count + (burstSummary == nil ? 0 : 1)
+    }
+
+    var runwayPanelRows: Int {
+        if hasRunwayContent {
+            return min(5, runwayVisibleRowCount)
+        }
+        return 1
+    }
+}
+
+func quotaMeterVisibleRunwaySnapshot(from snapshot: CodexRunwaySnapshot?,
+                                     visibility: QuotaMeterRunwayVisibility) -> CodexRunwaySnapshot? {
+    guard let snapshot else { return nil }
+    switch visibility {
+    case .automatic:
+        return snapshot.hasRunwayContent ? snapshot : nil
+    case .alwaysOn:
+        return snapshot
+    case .alwaysOff:
+        return nil
+    }
+}
+
+/// Appends Claude cloud sessions to a runway snapshot as rate-less rows.
+///
+/// Cloud sessions run on Anthropic's infrastructure, so they have no local
+/// transcript and can never produce token activity — which is what every runway
+/// rate is derived from. `HUDRunwayIdentityReducer` therefore excludes them (it
+/// requires a non-empty `logPath`), and no amount of fixing upstream would help:
+/// the rate is unknowable, not merely missing.
+///
+/// So they are injected here instead, *after* all rate maths, ranking and overflow
+/// folding are final. Appended rows carry `displayRate: 0`, which cannot perturb
+/// `maxDisplayRate` (floored at 1), reordering, or the "+N sessions" summary. The
+/// drawer includes idle cloud rows; aggregate callers may exclude them because an
+/// idle session is not active unknown burn.
+///
+/// Runs at render time rather than in the loader for two reasons: the loader body
+/// executes off the main actor while `ClaudeCloudLiveModel` is main-actor isolated,
+/// and the loader only re-runs on a 5s bucket — so cloud rows would lag, and would
+/// vanish entirely whenever the quota request is nil.
+func appendingClaudeCloudRows(to snapshot: CodexRunwaySnapshot?,
+                              cloudHUDRows: [HUDRow],
+                              includeIdle: Bool = true) -> CodexRunwaySnapshot? {
+    let cloud = cloudHUDRows.filter {
+        $0.id.hasPrefix(ClaudeCloudHUDRowMapper.rowIDPrefix)
+            && (includeIdle || $0.liveState == .active)
+    }
+    guard !cloud.isEmpty else { return snapshot }
+
+    // Working sessions first, then alphabetical — a stable order, so rows do not
+    // shuffle between polls.
+    let ordered = cloud.sorted { lhs, rhs in
+        let lhsActive = lhs.liveState == .active
+        let rhsActive = rhs.liveState == .active
+        if lhsActive != rhsActive { return lhsActive }
+        return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+    }
+
+    var seen = Set(snapshot?.rows.map(\.id) ?? [])
+    let rows: [RunwayPauseImpactRow] = ordered.compactMap { row in
+        guard seen.insert(row.id).inserted else { return nil }
+        return RunwayPauseImpactRow(
+            id: row.id,
+            displayName: row.displayName,
+            isGoal: false,
+            deadline: .unavailable,
+            gainedSeconds: 0,
+            displayRate: 0,
+            confidence: .cloud
+        )
+    }
+    guard !rows.isEmpty else { return snapshot }
+
+    guard let snapshot else {
+        // No quota snapshot at all — Claude usage may be unfetched, at 0%, or its
+        // reset text unparsable. Cloud rows must still show, so synthesise a carrier.
+        // Only `baseline.rateUnit` is ever read on this path (the rate cell and the
+        // layout widths); nothing consumes the other baseline fields in the strip.
+        // Do not reuse this snapshot for anything that reads them.
+        let now = Date()
+        return CodexRunwaySnapshot(
+            baseline: RunwayProviderBaseline(
+                source: .claude,
+                remainingPercent: 0,
+                resetAt: now,
+                currentRunoutAt: now,
+                observedAt: now,
+                hasProjectedRunout: false,
+                windowMinutes: 300,
+                rateUnit: .quotaMinutesPerHour
+            ),
+            rows: rows,
+            burstSummary: nil
+        )
+    }
+
+    // Rebuilding a snapshot resets its aggregate metadata. Preserve both the
+    // token burn and dollar completeness before the provider header reads it.
+    // Appended, and `HUDRunwayPanel` additionally renders them below the "+N
+    // sessions" summary. Array position here does not decide display order — the
+    // panel partitions on `confidence == .cloud` — but appending keeps the local
+    // ranking that RunwayOverflowRule produced untouched and intact.
+    var merged = CodexRunwaySnapshot(
+        baseline: snapshot.baseline,
+        rows: snapshot.rows + rows,
+        burstSummary: snapshot.burstSummary
+    )
+    merged.aggregateTokensPerHour = snapshot.aggregateTokensPerHour
+    merged.dollarAggregateIncomplete = snapshot.dollarAggregateIncomplete
+    return merged
+}
+
+/// The dropped 5h line has no quota deadline. Its burn chip must use the unit
+/// actually displayed by the drawer, including a snapshot-wide dollar fallback.
+enum QuotaMeterBurnChipResolver {
+    static func text(snapshot: CodexRunwaySnapshot?) -> String? {
+        guard let snapshot else { return nil }
+        switch snapshot.baseline.rateUnit {
+        case .tokensPerHour:
+            guard let rate = snapshot.aggregateTokensPerHour,
+                  rate.isFinite, rate > 0 else { return nil }
+            return formatTokenRatePerHour(rate)
+        case .dollarsPerHour:
+            guard !snapshot.dollarAggregateIncomplete else { return nil }
+            var total = 0.0
+            for row in snapshot.rows {
+                switch row.confidence {
+                case .direct, .mixed:
+                    total += row.displayRate
+                case .idle:
+                    continue
+                case .waiting, .unsupported, .cloud:
+                    return nil
+                }
+            }
+            if let overflow = snapshot.burstSummary {
+                guard !overflow.containsWaitingActiveRate,
+                      !overflow.containsUnavailableActiveRate else { return nil }
+                total += overflow.displayRate
+            }
+            guard total.isFinite, total > 0 else { return nil }
+            return RunwayTimeFormatting.rate(total, unit: .dollarsPerHour, confidence: .direct)
+        case .quotaMinutesPerHour, .weeklyPercentPerHour:
+            return nil
+        }
+    }
+}
+
+/// The aggregate weekly burn the adaptive Quota Meter header reports while the
+/// `Wk` lens is the one the Session Runway is reporting.
+///
+/// It is the same figure the drawer is already ranking, summed: every measured
+/// row's `%/h` plus the `+N sessions` overflow. Pure, and internal rather than
+/// folded into the view, because the two rules that matter are invisible in a
+/// rendered row — which rows may contribute, and when the total is too incomplete
+/// to show at all.
+struct QuotaMeterWeeklyHeader: Equatable {
+    /// Summed weekly percent-per-hour across the contributing rows.
+    let aggregatePercentPerHour: Double
+    /// True remaining share of the weekly window (not the display-mode reading).
+    /// This is the numerator of the projection.
+    let remainingPercent: Double
+    let resetAt: Date
+
+    /// "4.4%/h". Always a number, so the header's shape never depends on how small
+    /// the burn is — but never a fabricated zero either: a total that would round
+    /// to "0.0" reads "<0.1%/h".
+    var aggregateText: String {
+        if aggregatePercentPerHour >= 10 {
+            // NOT String(format: "%.0f"): printf rounds half to EVEN, so a .5
+            // boundary could print a value one lower than the true one.
+            return "\(Int(aggregatePercentPerHour.rounded()))%/h"
+        }
+        let oneDecimal = String(format: "%.1f", aggregatePercentPerHour)
+        return oneDecimal == "0.0" ? "<0.1%/h" : "\(oneDecimal)%/h"
+    }
+
+    /// `remaining ÷ aggregate`, in seconds: how long the current burn takes to
+    /// exhaust what is left of the week. nil when nothing is left to burn.
+    func secondsToExhaustion() -> Double? {
+        guard aggregatePercentPerHour > 0, remainingPercent > 0 else { return nil }
+        return remainingPercent / aggregatePercentPerHour * 3600
+    }
+
+    /// The aggregate never reaches the weekly reset, so the header shows the
+    /// existing on-track signal instead of a run-out that cannot happen.
+    func isOnTrack(now: Date) -> Bool {
+        guard let seconds = secondsToExhaustion() else { return true }
+        return now.addingTimeInterval(seconds) >= resetAt
+    }
+
+    /// "▸14m" / "▸1h 30m" / "▸<1m", or nil when the header shows on-track instead.
+    /// No day unit on purpose: an on-track week never reaches this branch, and the
+    /// run-out column is 60pt wide.
+    func runoutText(now: Date) -> String? {
+        guard !isOnTrack(now: now), let seconds = secondsToExhaustion() else { return nil }
+        return "▸" + Self.compactDuration(seconds: seconds)
+    }
+
+    /// `<1m`, `Xm` under an hour, `Xh Ym` through one day, then a whole-hour lower
+    /// bound such as `>57h`. Long projections do not benefit from minute precision.
+    static func compactDuration(seconds: Double) -> String {
+        if seconds < 60 { return "<1m" }
+        if seconds > 24 * 3600 {
+            return ">\(Int(floor(seconds / 3600)))h"
+        }
+        // Round up so the approximation never tells the user they have less time
+        // than the projection supports.
+        let minutes = max(1, Int(ceil(seconds / 60)))
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        // A narrow no-break space separates the units without spending a full
+        // monospaced character or allowing the compact duration to wrap.
+        return remainder == 0 ? "\(hours)h" : "\(hours)h\u{202F}\(remainder)m"
+    }
+}
+
+/// What the weekly header can honestly say right now. Keeping these states in
+/// the weekly layout prevents a transient scan from making the rate and ETA
+/// silently disappear and reverting to a different-looking header.
+enum QuotaMeterWeeklyHeaderStatus: Equatable {
+    case estimate(QuotaMeterWeeklyHeader)
+    case measuring
+    case unavailable
+    case quiet
+    case exhausted
+}
+
+/// Resolves the adaptive weekly header, failing closed wherever the aggregate
+/// could be confidently wrong. nil is not an error: it means the row keeps the
+/// header it has always had.
+enum QuotaMeterWeeklyHeaderResolver {
+    static var localEstimateHelp: String {
+        String(localized: "Weekly burn estimated from account quota and local sessions, including archives. Concurrent work elsewhere may affect it; no ETA is shown.")
+    }
+
+    static func canProjectETA(calibrationState: WeeklyRunwayCalibrationState?) -> Bool {
+        calibrationState != .localEstimate
+    }
+
+    static func unavailableHelp(calibrationState: WeeklyRunwayCalibrationState?) -> String? {
+        switch calibrationState {
+        case .accountUnverified:
+            return String(localized: "Weekly burn unavailable: local activity cannot be matched to this Codex account.")
+        case .inconsistent:
+            return String(localized: "Weekly burn unavailable: recent account usage conflicts with the stored estimate.")
+        default:
+            return nil
+        }
+    }
+
+    static func status(isWeeklyLens: Bool,
+                       weekStale: Bool,
+                       fiveHourAbsent: Bool,
+                       suspect: Bool,
+                       remainingPercent: Double,
+                       hasActiveSession: Bool = true,
+                       snapshot: CodexRunwaySnapshot?) -> QuotaMeterWeeklyHeaderStatus? {
+        guard isWeeklyLens else { return nil }
+        guard !(fiveHourAbsent && suspect) else { return nil }
+        guard !weekStale else { return .unavailable }
+        guard remainingPercent > 0 else { return .exhausted }
+        guard hasActiveSession else { return .quiet }
+        guard let snapshot else { return .quiet }
+        // A cloud-only snapshot uses a synthetic non-weekly carrier because it has
+        // no local quota-derived runway. Cloud burn is permanently unknowable, not
+        // a unit transition that will eventually finish measuring.
+        if snapshot.rows.contains(where: { $0.confidence == .cloud }) {
+            return .unavailable
+        }
+        guard snapshot.baseline.rateUnit == .weeklyPercentPerHour else { return .measuring }
+
+        let hasUnavailableRate = snapshot.rows.contains {
+            $0.confidence == .unsupported
+        } || snapshot.burstSummary?.containsUnavailableActiveRate == true
+        let hasWaitingRate = snapshot.rows.contains { $0.confidence == .waiting }
+            || snapshot.burstSummary?.containsWaitingActiveRate == true
+        if hasUnavailableRate {
+            return .unavailable
+        }
+        if hasWaitingRate {
+            return .measuring
+        }
+        if let header = header(
+            isWeeklyLens: true,
+            weekStale: false,
+            fiveHourAbsent: fiveHourAbsent,
+            suspect: suspect,
+            remainingPercent: remainingPercent,
+            snapshot: snapshot
+        ) {
+            return .estimate(header)
+        }
+        return .quiet
+    }
+
+    /// - Parameters:
+    ///   - isWeeklyLens: `RunwayPresentation` is `.weekly` *and* the weekly window
+    ///     is present. 5h, tk and `$` all resolve to false and keep their existing
+    ///     header.
+    ///   - weekStale: the weekly reset copy is unavailable, so a run-out cannot be
+    ///     compared against a reset we do not have.
+    ///   - fiveHourAbsent / suspect: an absent 5h window may only read "∞" when the
+    ///     provider genuinely dropped it. "can't verify" must stay "can't verify".
+    ///   - remainingPercent: the provider's authoritative current weekly remainder;
+    ///     it wins over a missing or stale runway snapshot for exhaustion and ETA.
+    ///   - snapshot: the runway snapshot used for aggregation. It retains every
+    ///     active drawer row but may omit idle cloud rows, which are not burning.
+    static func header(isWeeklyLens: Bool,
+                       weekStale: Bool,
+                       fiveHourAbsent: Bool,
+                       suspect: Bool,
+                       remainingPercent: Double? = nil,
+                       snapshot: CodexRunwaySnapshot?) -> QuotaMeterWeeklyHeader? {
+        guard isWeeklyLens, !weekStale else { return nil }
+        guard !(fiveHourAbsent && suspect) else { return nil }
+        // Only a snapshot actually computed in weekly %/h can be summed as one. A
+        // placeholder left over from a lens switch still carries the old unit.
+        guard let snapshot, snapshot.baseline.rateUnit == .weeklyPercentPerHour else { return nil }
+
+        var total = 0.0
+        for row in snapshot.rows {
+            switch row.confidence {
+            case .direct, .mixed:
+                total += row.displayRate
+            case .idle:
+                continue
+            case .waiting, .unsupported, .cloud:
+                // An active row whose rate is unknown. The drawer shows it as a
+                // clock, "n/a" or "Cloud"; summing only the measurable rows would
+                // understate the burn and project a run-out that is too long, which
+                // is the one way this header can lie. Show nothing instead.
+                return nil
+            }
+        }
+        // The overflow summary is part of the same total: the drawer folds the
+        // rows it has no space for into "+N sessions", and their rates are summed
+        // there with the same per-row rule.
+        if let burstSummary = snapshot.burstSummary {
+            guard !burstSummary.containsWaitingActiveRate,
+                  !burstSummary.containsUnavailableActiveRate else { return nil }
+            total += burstSummary.displayRate
+        }
+
+        guard total.isFinite, total > 0 else { return nil }
+        let remaining = remainingPercent ?? snapshot.baseline.remainingPercent
+        guard remaining.isFinite, remaining > 0 else { return nil }
+        return QuotaMeterWeeklyHeader(
+            aggregatePercentPerHour: total,
+            remainingPercent: remaining,
+            resetAt: snapshot.baseline.resetAt
+        )
+    }
+}
+
+private struct LimitsContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Teaches the one gesture that `.onDemand` chrome depends on. Drawn as an
+/// overlay so it can never affect layout, and shown on every hover (it never
+/// retires) so the only route back to the toolbar stays findable.
+private struct HUDRightClickHintPill: View {
+    var body: some View {
+        Text("Right-click for controls")
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(
+                Capsule().strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
+            )
+    }
+}
+
+/// Catches a right-click (or control-click) anywhere it is layered over, while
+/// staying invisible to every other event.
+///
+/// SwiftUI has no right-click hook short of `.contextMenu`, which would insist
+/// on presenting a menu. This exists so the Quota Meter can reveal its real
+/// toolbar instead — one set of controls, not a menu duplicating them.
+private struct HUDRightClickCatcher: NSViewRepresentable {
+    let onRightClick: () -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = RightClickView()
+        view.onRightClick = onRightClick
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? RightClickView)?.onRightClick = onRightClick
+    }
+
+    final class RightClickView: NSView {
+        var onRightClick: (() -> Void)?
+
+        /// Claims the point only for right-mouse events, so left-clicks,
+        /// buttons underneath, and the double-click probe pass straight through
+        /// as if this view were not here.
+        ///
+        /// Load-bearing: this view covers the whole window, and the window is
+        /// dragged by its background. Returning self for a left-click would
+        /// swallow the drag and make the Quota Meter unmovable.
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let event = NSApp.currentEvent, isRightClick(event) else { return nil }
+            return super.hitTest(point)
+        }
+
+        override func rightMouseDown(with event: NSEvent) {
+            onRightClick?()
+        }
+
+        /// AppKit does not reliably synthesize `rightMouseDown` for a
+        /// control-click on a view that also accepts left clicks, so handle the
+        /// modifier form explicitly.
+        override func mouseDown(with event: NSEvent) {
+            if event.modifierFlags.contains(.control) {
+                onRightClick?()
+                return
+            }
+            super.mouseDown(with: event)
+        }
+
+        private func isRightClick(_ event: NSEvent) -> Bool {
+            switch event.type {
+            case .rightMouseDown, .rightMouseUp, .rightMouseDragged:
+                return true
+            case .leftMouseDown, .leftMouseUp:
+                return event.modifierFlags.contains(.control)
+            default:
+                return false
+            }
+        }
+    }
+}
+
+
+
+/// An isolated view that observes usage models independently so that
+/// polling updates don't cause the entire AgentCockpitHUDView to re-render.
+enum HUDRunwayIdentityReducer {
+    static func identities(from rows: [HUDRow], source: SessionSource = .codex) -> [RunwaySessionIdentity] {
+        let candidates = rows.compactMap { row -> RunwayHUDCandidate? in
+            guard row.source == source, row.liveState == .active else { return nil }
+            guard let logPath = row.logPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !logPath.isEmpty else {
+                return nil
+            }
+
+            let parentID = row.parentSessionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let nonEmptyParentID = parentID.flatMap { $0.isEmpty ? nil : $0 }
+            let sessionID = row.resolvedSessionID
+                ?? row.runtimeSessionID
+                ?? row.id
+            return RunwayHUDCandidate(
+                sessionID: sessionID,
+                parentSessionID: nonEmptyParentID,
+                displayName: compactName(for: row),
+                logPath: logPath
+            )
+        }
+
+        let candidateBySessionID = Dictionary(
+            candidates.map { ($0.sessionID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let parentBySessionID = Dictionary(
+            candidates.compactMap { candidate -> (String, String)? in
+                guard let parentSessionID = candidate.parentSessionID,
+                      parentSessionID != candidate.sessionID else {
+                    return nil
+                }
+                return (candidate.sessionID, parentSessionID)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var grouped: [String: (displayName: String, paths: Set<String>, hasRootRow: Bool)] = [:]
+        var order: [String] = []
+
+        for candidate in candidates {
+            let key = rootSessionID(for: candidate, parentBySessionID: parentBySessionID)
+            let display = candidateBySessionID[key]?.displayName ?? candidate.displayName
+            let isParentRow = candidate.sessionID == key
+
+            if var existing = grouped[key] {
+                existing.paths.insert(candidate.logPath)
+                if isParentRow && !existing.hasRootRow {
+                    existing.displayName = display
+                    existing.hasRootRow = true
+                }
+                grouped[key] = existing
+            } else {
+                order.append(key)
+                grouped[key] = (
+                    displayName: display,
+                    paths: [candidate.logPath],
+                    hasRootRow: candidateBySessionID[key] != nil
+                )
+            }
+        }
+
+        return order.compactMap { key in
+            guard let group = grouped[key] else { return nil }
+            return RunwaySessionIdentity(
+                id: key,
+                displayName: group.displayName,
+                isGoal: false,
+                logPaths: Array(group.paths).sorted()
+            )
+        }
+    }
+
+    private static func rootSessionID(for candidate: RunwayHUDCandidate,
+                                      parentBySessionID: [String: String]) -> String {
+        var current = candidate.parentSessionID ?? candidate.sessionID
+        var seen: Set<String> = [candidate.sessionID]
+        while let parent = parentBySessionID[current],
+              parent != current,
+              !seen.contains(parent) {
+            seen.insert(current)
+            current = parent
+        }
+        return current
+    }
+
+    private static func compactName(for row: HUDRow) -> String {
+        let candidates = [
+            row.displayName,
+            row.cleanedTabTitle,
+            row.workingDirectory.map { URL(fileURLWithPath: $0).lastPathComponent }
+        ]
+        let fallback = "\(row.source.displayName) session"
+        let trimmed = candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && !isPlaceholderTitle($0) } ?? fallback
+        guard !trimmed.isEmpty else { return fallback }
+        if trimmed.count <= 28 { return trimmed }
+        return String(trimmed.prefix(27)) + "…"
+    }
+
+    private static func isPlaceholderTitle(_ title: String) -> Bool {
+        // Match only the synthesized fallbacks ("Active <Agent> session" /
+        // "Session <id>"), not legitimate user titles that happen to start
+        // with "Active" and end with "session".
+        if title.hasPrefix("Session ") { return true }
+        let agentNames = SessionSource.allCases.flatMap { source in
+            [source.displayName, source.rawValue.capitalized]
+        }
+        return agentNames.contains { title == "Active \($0) session" }
+    }
+
+    private struct RunwayHUDCandidate {
+        let sessionID: String
+        let parentSessionID: String?
+        let displayName: String
+        let logPath: String
+    }
+}
+
+enum HUDRunwayRequestBuilder {
+    /// The rate unit + window a runway request should compute, resolved from the
+    /// user's preferred presentation against what the provider can actually show.
+    /// Snapshot-wide (whole provider, one unit) — never per-row.
+    struct RunwayResolvedPresentation: Equatable {
+        let rateUnit: RunwayRateUnit
+        let windowMinutes: Int
+    }
+
+    /// Pure resolver for the §5 fallback matrix. `windowMinutes` is the active-limit
+    /// window length (300 or 10080). `dollarPriceable` = a usable price table exists
+    /// (per-model gaps fall back later, snapshot-wide, in the loader).
+    static func effectivePresentation(preferred: RunwayPresentation,
+                                      hasFiveHour: Bool,
+                                      hasWeekly: Bool,
+                                      weeklyMeasurable: Bool,
+                                      dollarPriceable: Bool,
+                                      windowMinutes: Int) -> RunwayResolvedPresentation {
+        switch preferred {
+        case .token:
+            return RunwayResolvedPresentation(rateUnit: .tokensPerHour, windowMinutes: windowMinutes)
+        case .dollar:
+            return dollarPriceable
+                ? RunwayResolvedPresentation(rateUnit: .dollarsPerHour, windowMinutes: windowMinutes)
+                : RunwayResolvedPresentation(rateUnit: .tokensPerHour, windowMinutes: windowMinutes)
+        case .fiveHour:
+            return hasFiveHour
+                ? RunwayResolvedPresentation(rateUnit: .quotaMinutesPerHour, windowMinutes: windowMinutes)
+                : RunwayResolvedPresentation(rateUnit: .tokensPerHour, windowMinutes: windowMinutes)
+        case .weekly:
+            // Unconditional: `Wk` always renders in %/h and never degrades to
+            // tk/h. `hasWeekly`/`weeklyMeasurable` no longer pick the UNIT — they
+            // only decide what a row says inside it ("n/a" vs a waiting clock vs a
+            // number), which the loader resolves. Flipping the unit here was what
+            // made a Weekly selection silently show tokens.
+            _ = hasWeekly
+            _ = weeklyMeasurable
+            return RunwayResolvedPresentation(rateUnit: .weeklyPercentPerHour, windowMinutes: 10080)
+        }
+    }
+
+    static func request(activeRows: [HUDRow],
+                        projectedRunoutEnabled: Bool,
+                        codexAgentEnabled: Bool,
+                        codexUsageEnabled: Bool,
+                        fiveHourRemainingPercent: Int,
+                        fiveHourResetText: String,
+                        fiveHourProjectedRunoutAt: Date?,
+                        fiveHourProjectionObservedAt: Date?,
+                        windowMinutes: Int = 300,
+                        presentation: RunwayPresentation = .fiveHour,
+                        weekRemainingPercent: Int = 0,
+                        weekResetText: String = "",
+                        weeklyBurnRateEstimate: UsageLimitBurnRateEstimate? = nil,
+                        now: Date,
+                        maxRows: Int,
+                        forceVisible: Bool = false) -> CodexRunwaySnapshotRequest? {
+        // The `fiveHour*` params carry the *active* limit window — the 5h window
+        // when present, else the weekly window (OpenAI can drop the 5h window).
+        // `windowMinutes` is that window's length (300 = 5h, 10080 = weekly) and
+        // scales the m/h yardstick. Resets parse the same regardless of `kind`.
+        // When the user forces the drawer on, build the request even at 0%
+        // remaining so any active session still shows a real runway row.
+        guard codexAgentEnabled,
+              codexUsageEnabled,
+              forceVisible || fiveHourRemainingPercent > 0,
+              let resetAt = UsageResetText.resetDate(
+                kind: "5h",
+                source: .codex,
+                raw: fiveHourResetText,
+                now: now
+              ) else {
+            return nil
+        }
+        let freshProjectionObservedAt: Date? = {
+            guard projectedRunoutEnabled,
+                  let observedAt = fiveHourProjectionObservedAt,
+                  now.timeIntervalSince(observedAt) <= 3 * 60 else {
+                return nil
+            }
+            return observedAt
+        }()
+        // While the 5h window is dropped the runway tracks the long (weekly)
+        // window, but a weekly-scaled m/h would render on a 33.6× different scale
+        // than Claude's 5h "m/h" in the same view (2383 vs 32) — same label, two
+        // meanings. So on the long window the runway switches UNIT to raw token
+        // throughput (tk/h): window-independent, never absurd, and it auto-reverts
+        // to true 5h m/h when the window returns. Run-out/projection are unused in
+        // token mode. The short (5h) window keeps the fresh projection + reset
+        // fallback exactly as before.
+        let isLongWindow = windowMinutes >= CodexRateLimitWindowClassifier.shortLongSplitMinutes
+        let observedAt = isLongWindow ? now : (freshProjectionObservedAt ?? now)
+        let runoutAt: Date = isLongWindow
+            ? resetAt
+            : ((freshProjectionObservedAt.flatMap { _ in fiveHourProjectedRunoutAt }) ?? resetAt)
+        guard resetAt > observedAt,
+              runoutAt > observedAt else {
+            return nil
+        }
+
+        // Resolve the user's preferred presentation against what this provider can
+        // show (§5). The weekly window fields let weekly compute even while the 5h
+        // window is present; `hasFiveHour` = the active window IS the 5h window.
+        // Keep the weekly anchor in every presentation: the activity ledger
+        // records each polling cycle, even while the user views $ or 5h.
+        let weekResetAt = UsageResetText.resetAnchorDate(
+            kind: "Wk", source: .codex, raw: weekResetText, now: now)
+        let weeklyRunout = weekResetAt.flatMap { resetAt in
+            weeklyBurnRateEstimate?.projectedRunout(
+                remainingPercent: weekRemainingPercent, resetAt: resetAt, now: now)
+        }
+        let resolved = effectivePresentation(
+            preferred: presentation,
+            hasFiveHour: !isLongWindow,
+            hasWeekly: weekResetAt != nil,
+            weeklyMeasurable: weeklyRunout != nil,
+            dollarPriceable: !RunwayPriceTable.shared.isEmpty,
+            windowMinutes: windowMinutes)
+
+        let baseline: RunwayProviderBaseline
+        if resolved.rateUnit == .weeklyPercentPerHour {
+            // No longer gated on `weeklyRunout`: the weekly rate is now estimated
+            // from calibration × current activity, so the baseline's projected
+            // run-out is not a rate carrier here. Gating on it used to force the
+            // whole snapshot into the 5h/token branch.
+            baseline = RunwayProviderBaseline(
+                source: .codex,
+                remainingPercent: Double(weekRemainingPercent),
+                resetAt: weekResetAt ?? resetAt,
+                currentRunoutAt: weeklyRunout?.runoutAt ?? weekResetAt ?? resetAt,
+                observedAt: weeklyRunout?.observedAt ?? observedAt,
+                hasProjectedRunout: weeklyRunout != nil,
+                windowMinutes: 10080,
+                rateUnit: .weeklyPercentPerHour)
+        } else {
+            baseline = RunwayProviderBaseline(
+                source: .codex,
+                remainingPercent: Double(fiveHourRemainingPercent),
+                resetAt: resetAt,
+                currentRunoutAt: runoutAt,
+                observedAt: observedAt,
+                hasProjectedRunout: resolved.rateUnit == .quotaMinutesPerHour ? (freshProjectionObservedAt != nil) : false,
+                windowMinutes: windowMinutes,
+                rateUnit: resolved.rateUnit)
+        }
+        return CodexRunwaySnapshotRequest(
+            baseline: baseline,
+            identities: HUDRunwayIdentityReducer.identities(from: activeRows, source: .codex),
+            now: now,
+            maxRows: maxRows,
+            recentSessionsRoot: CodexRunwayRecentSessionScanner.defaultRoot(),
+            weeklyResetAt: weekResetAt,
+            expectedAccountHash: WeeklyQuotaCalibrationScope.hashAccount(
+                CodexCalibrationAccountScope.accountId(now: now)
+            ),
+            weeklyCalibration: WeeklyQuotaCalibrationStore.shared
+                .runwayCalibration(provider: "codex", now: now),
+            weeklyWindowAvailable: weekResetAt != nil,
+            weeklyCalibrationAbandoned: WeeklyQuotaCalibrationStore.shared
+                .calibrationAbandoned(provider: "codex", now: now)
+        )
+    }
+
+    static func claudeRequest(activeRows: [HUDRow],
+                              projectedRunoutEnabled: Bool,
+                              claudeAgentEnabled: Bool,
+                              claudeUsageEnabled: Bool,
+                              fiveHourRemainingPercent: Int,
+                              fiveHourResetText: String,
+                              fiveHourProjectedRunoutAt: Date?,
+                              fiveHourProjectionObservedAt: Date?,
+                              presentation: RunwayPresentation = .fiveHour,
+                              weekRemainingPercent: Int = 0,
+                              weekResetText: String = "",
+                              weeklyBurnRateEstimate: UsageLimitBurnRateEstimate? = nil,
+                              now: Date,
+                              maxRows: Int,
+                              forceVisible: Bool = false) -> CodexRunwaySnapshotRequest? {
+        guard claudeAgentEnabled,
+              claudeUsageEnabled,
+              forceVisible || fiveHourRemainingPercent > 0,
+              let resetAt = UsageResetText.resetDate(
+                kind: "5h",
+                source: .claude,
+                raw: fiveHourResetText,
+                now: now
+              ) else {
+            return nil
+        }
+        let freshProjectionObservedAt: Date? = {
+            guard projectedRunoutEnabled,
+                  let observedAt = fiveHourProjectionObservedAt,
+                  now.timeIntervalSince(observedAt) <= 3 * 60 else {
+                return nil
+            }
+            return observedAt
+        }()
+        let observedAt = freshProjectionObservedAt ?? now
+        // No fresh projection: derive run-out from average usage so far this
+        // window instead of pinning to resetAt, which makes the implied
+        // per-session burn rate explode as the reset approaches.
+        let runoutAt = (freshProjectionObservedAt.flatMap { _ in fiveHourProjectedRunoutAt })
+            ?? RunwayBaselineMath.averageBurnRunout(
+                remainingPercent: Double(fiveHourRemainingPercent),
+                resetAt: resetAt,
+                windowLength: RunwayBaselineMath.fiveHourWindow,
+                now: now)
+            ?? resetAt
+        guard resetAt > observedAt,
+              runoutAt > observedAt else {
+            return nil
+        }
+
+        // Claude always has a 5h ("session") window, so `.fiveHour` keeps m/h
+        // unchanged. Weekly uses the all-models weekly window fields.
+        let weekResetAt = presentation == .weekly
+            ? UsageResetText.resetDate(kind: "Wk", source: .claude, raw: weekResetText, now: now) : nil
+        let weeklyRunout = weekResetAt.flatMap { resetAt in
+            weeklyBurnRateEstimate?.projectedRunout(
+                remainingPercent: weekRemainingPercent, resetAt: resetAt, now: now)
+        }
+        let resolved = effectivePresentation(
+            preferred: presentation,
+            hasFiveHour: true,
+            hasWeekly: weekResetAt != nil,
+            weeklyMeasurable: weeklyRunout != nil,
+            dollarPriceable: !RunwayPriceTable.shared.isEmpty,
+            windowMinutes: 300)
+
+        let baseline: RunwayProviderBaseline
+        if resolved.rateUnit == .weeklyPercentPerHour {
+            // See the Codex builder: the weekly rate is estimated from calibration,
+            // so a missing projected run-out no longer forces a different unit.
+            baseline = RunwayProviderBaseline(
+                source: .claude,
+                remainingPercent: Double(weekRemainingPercent),
+                resetAt: weekResetAt ?? resetAt,
+                currentRunoutAt: weeklyRunout?.runoutAt ?? weekResetAt ?? resetAt,
+                observedAt: weeklyRunout?.observedAt ?? observedAt,
+                hasProjectedRunout: weeklyRunout != nil,
+                windowMinutes: 10080,
+                rateUnit: .weeklyPercentPerHour)
+        } else {
+            baseline = RunwayProviderBaseline(
+                source: .claude,
+                remainingPercent: Double(fiveHourRemainingPercent),
+                resetAt: resetAt,
+                currentRunoutAt: runoutAt,
+                observedAt: observedAt,
+                hasProjectedRunout: resolved.rateUnit == .quotaMinutesPerHour ? (freshProjectionObservedAt != nil) : false,
+                windowMinutes: 300,
+                rateUnit: resolved.rateUnit)
+        }
+        return CodexRunwaySnapshotRequest(
+            baseline: baseline,
+            identities: HUDRunwayIdentityReducer.identities(from: activeRows, source: .claude),
+            now: now,
+            maxRows: maxRows,
+            recentSessionsRoot: ClaudeRunwayRecentSessionScanner.defaultRoot(),
+            weeklyPercentPointsPerDollar: WeeklyQuotaCalibrationStore.shared
+                .percentPointsPerDollar(provider: "claude", now: now),
+            weeklyWindowAvailable: weekResetAt != nil,
+            weeklyCalibrationAbandoned: WeeklyQuotaCalibrationStore.shared
+                .calibrationAbandoned(provider: "claude", now: now)
+        )
+    }
+}
+
+/// One shared 5s clock for every HUD limits panel. The collapsed bar and the
+/// expanded rows panel both drive their `clockNow` (and the runway refresh keyed
+/// off it) from this single publisher, so they wake the main run loop together
+/// on one timer source instead of two independent, phase-offset 5s timers.
+private enum HUDSharedClock {
+    static let fiveSecond = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+}
+
+/// When Claude's model-scoped weekly window ("Current week (Fable)") earns a line in the
+/// Quota Meter. Internal, while the view that uses it stays private, because the *direction*
+/// of this rule is a product decision rather than an implementation detail — and one that
+/// reads both ways: "70% remaining" and "70% used" are opposites, and the wrong reading
+/// compiles and passes every other test. `ScopedWeeklyWindowVisibilityTests` pins it.
+enum ScopedWeeklyWindowVisibility {
+    /// Owner ruling 2026-08-28: surface the window once 70% or less REMAINS — the point is
+    /// to show it while the user is actively spending it, not to wait until it is nearly out.
+    static let thresholdRemainingPercent: Int = 70
+
+    static func shows(remainingPercent: Int?) -> Bool {
+        guard let remainingPercent else { return false }
+        return remainingPercent <= thresholdRemainingPercent
+    }
+}
+
+private struct HUDLimitsRowsPanel: View {
+    static func runwayRequest(activeRows: [HUDRow],
+                              projectedRunoutEnabled: Bool,
+                              codexAgentEnabled: Bool,
+                              codexUsageEnabled: Bool,
+                              fiveHourRemainingPercent: Int,
+                              fiveHourResetText: String,
+                              fiveHourProjectedRunoutAt: Date?,
+                              fiveHourProjectionObservedAt: Date?,
+                              windowMinutes: Int = 300,
+                              presentation: RunwayPresentation = .fiveHour,
+                              weekRemainingPercent: Int = 0,
+                              weekResetText: String = "",
+                              weeklyBurnRateEstimate: UsageLimitBurnRateEstimate? = nil,
+                              now: Date,
+                              maxRows: Int,
+                              forceVisible: Bool = false) -> CodexRunwaySnapshotRequest? {
+        HUDRunwayRequestBuilder.request(
+            activeRows: activeRows,
+            projectedRunoutEnabled: projectedRunoutEnabled,
+            codexAgentEnabled: codexAgentEnabled,
+            codexUsageEnabled: codexUsageEnabled,
+            fiveHourRemainingPercent: fiveHourRemainingPercent,
+            fiveHourResetText: fiveHourResetText,
+            fiveHourProjectedRunoutAt: fiveHourProjectedRunoutAt,
+            fiveHourProjectionObservedAt: fiveHourProjectionObservedAt,
+            windowMinutes: windowMinutes,
+            presentation: presentation,
+            weekRemainingPercent: weekRemainingPercent,
+            weekResetText: weekResetText,
+            weeklyBurnRateEstimate: weeklyBurnRateEstimate,
+            now: now,
+            maxRows: maxRows,
+            forceVisible: forceVisible
+        )
+    }
+
+
+    let activeRows: [HUDRow]
+    /// Live session detection (Settings → Quota Meter). Off hides the OpenCode
+    /// group; the parent's disabled callout explains why.
+    let detectionEnabled: Bool
+    /// The reset-credits line is part of the chrome layer, revealed and hidden
+    /// with the toolbar rather than on its own hover.
+    let showsChrome: Bool
+    /// Shared Quota Meter-only filter. The parent owns the `@AppStorage` binding
+    /// so toolbar changes rebuild this panel immediately.
+    @Binding var hiddenProvidersRaw: String
+    /// OpenCode session rates: this panel reports what it shows and draws the
+    /// sampler's snapshot. Injectable for tests.
+    var rateStore: OpenCodeRateStore = .shared
+    /// nil outside the menu bar strip; inside it, whether the strip is expanded.
+    @Environment(\.quotaStripExpanded) private var stripExpanded
+    /// This surface's identity in the rate store's demand.
+    @State private var rateSurfaceID = UUID()
+
+    /// Whether this surface draws OpenCode rates at all (Always Off, collapsed strip).
+    private var showsOpenCodeRates: Bool {
+        OpenCodeHUDGroup.showsRates(visibility: runwayVisibility,
+                                    isStrip: stripExpanded != nil,
+                                    stripExpanded: stripExpanded == true)
+    }
+
+    /// What this surface asks the sampler for; nil when it shows no OpenCode rates.
+    private var openCodeRateDemand: OpenCodeRateDemand? {
+        OpenCodeHUDGroup.demand(
+            group: OpenCodeHUDGroup.make(rows: activeRows, detectionEnabled: detectionEnabled,
+                                         openCodeEnabled: openCodeAgentEnabled),
+            showsRates: showsOpenCodeRates)
+    }
+
+    private func providerConfigured(_ provider: QuotaMeterProvider) -> Bool {
+        switch provider {
+        case .codex: return codexAgentEnabled && codexUsageEnabled
+        case .claude: return claudeAgentEnabled && claudeUsageEnabled
+        }
+    }
+
+    private func providerShown(_ provider: QuotaMeterProvider) -> Bool {
+        providerConfigured(provider)
+            && QuotaMeterProviderVisibility.isVisible(provider, hiddenProvidersRaw: hiddenProvidersRaw)
+    }
+
+    private func hideProvider(_ provider: QuotaMeterProvider) {
+        hiddenProvidersRaw = QuotaMeterProviderVisibility.setting(
+            provider,
+            visible: false,
+            hiddenProvidersRaw: hiddenProvidersRaw
+        )
+    }
+
+    /// Claude's model-scoped weekly window ("Current week (Fable)") as an on-demand line
+    /// under the Claude provider row — the same treatment Codex's reset-credits line gets,
+    /// revealed by `showsChrome`.
+    ///
+    /// Deliberately NOT in the provider row: `Wk:` there stays the all-models figure at all
+    /// times, and that row is a fixed-width layout with no spare column.
+    ///
+    /// Owner ruling 2026-08-28: surfaced once 70% or less remains — i.e. once the user is
+    /// actively spending that window. The trigger is remaining, not used; the two readings
+    /// are opposites.
+    private var claudeScopedWeekLine: String? {
+        guard let label = claudeUsageModel.weekScopedLabel,
+              let left = claudeUsageModel.weekOpusRemainingPercent,
+              ScopedWeeklyWindowVisibility.shows(remainingPercent: left) else { return nil }
+        let reset = UsageResetText.displayTextWithPrefix(
+            kind: "Wk",
+            source: .claude,
+            raw: claudeUsageModel.weekOpusResetText ?? "",
+            now: clockNow
+        )
+        return reset.isEmpty ? "Wk \(label): \(left)%" : "Wk \(label): \(left)% · \(reset)"
+    }
+
+    /// True only when `row(entry:)` is rendering the real meter, rather than an auth chip,
+    /// probe, idle or reconnecting cell. The scoped-week line carries a concrete number
+    /// that survives a failed fetch, so it must not sit under a row saying the provider's
+    /// data cannot be trusted. Mirrors the `.live` gate the menu-bar line already applies.
+    private func rowShowsLiveMeter(_ entry: HUDLimitsProviderEntry) -> Bool {
+        guard case .live = entry.presentationState else { return false }
+        return !isProbeVisible(probeCoordinator.displayState(for: entry.source, now: clockNow))
+    }
+    @EnvironmentObject private var codexUsageModel: CodexUsageModel
+    @EnvironmentObject private var claudeUsageModel: ClaudeUsageModel
+    @AppStorage(PreferencesKey.codexUsageEnabled) private var codexUsageEnabled = false
+    @AppStorage(PreferencesKey.claudeUsageEnabled) private var claudeUsageEnabled = false
+    @AppStorage(PreferencesKey.Agents.codexEnabled) private var codexAgentEnabled = true
+    @AppStorage(PreferencesKey.Agents.claudeEnabled) private var claudeAgentEnabled = true
+    /// Read here, after the cached snapshot, so toggling OpenCode updates the group
+    /// immediately without a HUD rebuild. Fallback `true` matches the descriptor's
+    /// `.always` default for an unset key.
+    @AppStorage(PreferencesKey.Agents.openCodeEnabled) private var openCodeAgentEnabled = true
+    @AppStorage(PreferencesKey.usageDisplayMode) private var usageDisplayModeRaw = UsageDisplayMode.left.rawValue
+    @AppStorage(PreferencesKey.usageLimitCockpitProjectionEnabled) private var projectedRunoutEnabled = true
+    @AppStorage(PreferencesKey.quotaMeterRunwayVisibility) private var runwayVisibilityRaw = QuotaMeterRunwayVisibility.automatic.rawValue
+    @AppStorage(PreferencesKey.quotaMeterRunwayPresentation) private var runwayPresentationRaw = RunwayPresentation.fiveHour.rawValue
+    @AppStorage(PreferencesKey.quotaMeterEnlarged) private var quotaMeterEnlarged = false
+    @State private var clockNow = Date()
+    @State private var codexRunwaySnapshot: CodexRunwaySnapshot?
+    @State private var claudeRunwaySnapshot: CodexRunwaySnapshot?
+    @ObservedObject private var probeCoordinator = ProbeCoordinator.shared
+
+    private var mode: UsageDisplayMode { UsageDisplayMode(rawValue: usageDisplayModeRaw) ?? .left }
+    private var runwayVisibility: QuotaMeterRunwayVisibility {
+        QuotaMeterRunwayVisibility.current(raw: runwayVisibilityRaw)
+    }
+
+    /// True while the `Wk` lens is the one the runway is actually reporting:
+    /// selected, and the weekly window is present. Shares `activeRunwayLensWindow`
+    /// with the header's underline, so the label marker and the adaptive header
+    /// cannot drift apart.
+    private func isWeeklyRunwayLens(fiveAbsent: Bool, weekAbsent: Bool) -> Bool {
+        activeRunwayLensWindow(
+            rawPresentation: runwayPresentationRaw,
+            fiveAbsent: fiveAbsent,
+            weekAbsent: weekAbsent
+        ) == .week
+    }
+
+    private func runwaySnapshot(for source: UsageTrackingSource) -> CodexRunwaySnapshot? {
+        var snapshot = source == .claude ? claudeRunwaySnapshot : codexRunwaySnapshot
+        if source == .claude {
+            // Read during body evaluation on purpose: `ClaudeCloudLiveModel` is
+            // @Observable, so this registers a dependency and the strip updates the
+            // moment the poll lands — independent of the HUD rebuild gate, which is
+            // what starved these rows before.
+            snapshot = appendingClaudeCloudRows(to: snapshot,
+                                                cloudHUDRows: ClaudeCloudLiveModel.shared.rows)
+        }
+        return snapshot
+    }
+
+    /// Idle cloud sessions stay visible in the drawer, but they are not active
+    /// unknown burn and therefore must not suppress an otherwise complete header.
+    private func weeklyHeaderSnapshot(for source: UsageTrackingSource) -> CodexRunwaySnapshot? {
+        guard source == .claude else { return codexRunwaySnapshot }
+        return appendingClaudeCloudRows(
+            to: claudeRunwaySnapshot,
+            cloudHUDRows: ClaudeCloudLiveModel.shared.rows,
+            includeIdle: false
+        )
+    }
+
+    private func visibleRunwaySnapshot(for source: UsageTrackingSource) -> CodexRunwaySnapshot? {
+        quotaMeterVisibleRunwaySnapshot(from: runwaySnapshot(for: source), visibility: runwayVisibility)
+    }
+
+    /// The scanner retains a short trailing sample after a session stops so its
+    /// detailed runway row can decay smoothly. The compact weekly header should
+    /// not turn that history into a current ETA once there is nothing running.
+    private func hasActiveRunwaySession(for source: UsageTrackingSource) -> Bool {
+        switch source {
+        case .codex:
+            return activeRows.contains { $0.source == .codex && $0.liveState == .active }
+        case .claude:
+            return activeRows.contains { $0.source == .claude && $0.liveState == .active }
+                || ClaudeCloudLiveModel.shared.rows.contains {
+                    $0.id.hasPrefix(ClaudeCloudHUDRowMapper.rowIDPrefix)
+                        && $0.liveState == .active
+                }
+        }
+    }
+
+    private var entries: [HUDLimitsProviderEntry] {
+        var out: [HUDLimitsProviderEntry] = []
+        if providerShown(.codex) {
+            let codexWeeklySnapshot = weeklyHeaderSnapshot(for: .codex)
+            out.append(HUDLimitsProviderEntry(
+                provider: .codex,
+                source: .codex,
+                fiveHourLeft: codexUsageModel.fiveHourRemainingPercent,
+                weekLeft: codexUsageModel.weekRemainingPercent,
+                fiveHourResetText: codexUsageModel.fiveHourResetText,
+                weekResetText: codexUsageModel.weekResetText,
+                hasFiveHourRateLimit: codexUsageModel.hasFiveHourRateLimit,
+                hasWeekRateLimit: codexUsageModel.hasWeekRateLimit,
+                usageFormatSuspect: codexUsageModel.usageFormatSuspect,
+                isInitialLoading: codexUsageModel.isUpdating && codexUsageModel.lastSuccessAt == nil,
+                lastDataTimestamp: codexUsageModel.lastEventTimestamp,
+                fiveHourProjectedRunoutAt: codexUsageModel.fiveHourProjectedRunoutAt,
+                fiveHourProjectionObservedAt: codexUsageModel.fiveHourProjectionObservedAt,
+                fiveHourOnTrackObservedAt: codexUsageModel.fiveHourOnTrackObservedAt,
+                fiveHourBurnChip: QuotaMeterBurnChipResolver.text(snapshot: visibleRunwaySnapshot(for: .codex)),
+                weeklyHeader: codexWeeklySnapshot?.weeklyCalibrationState == .localEstimate
+                    ? nil : QuotaMeterWeeklyHeaderResolver.status(
+                    isWeeklyLens: isWeeklyRunwayLens(
+                        fiveAbsent: !codexUsageModel.hasFiveHourRateLimit,
+                        weekAbsent: !codexUsageModel.hasWeekRateLimit
+                    ),
+                    weekStale: isResetInfoUnavailable(raw: codexUsageModel.weekResetText),
+                    fiveHourAbsent: !codexUsageModel.hasFiveHourRateLimit,
+                    suspect: codexUsageModel.usageFormatSuspect,
+                    remainingPercent: Double(codexUsageModel.weekRemainingPercent),
+                    hasActiveSession: hasActiveRunwaySession(for: .codex),
+                    snapshot: codexWeeklySnapshot
+                ),
+                weeklyCalibrationState: codexWeeklySnapshot?.weeklyCalibrationState,
+                authStatus: codexUsageModel.authStatus,
+                presentationState: QuotaData.codex(from: codexUsageModel).presentationState,
+                reconnectingCaption: QuotaData.codex(from: codexUsageModel).reconnectingCaption,
+                isRateLimited: QuotaData.codex(from: codexUsageModel).isRateLimited
+            ))
+        }
+        if providerShown(.claude) {
+            out.append(HUDLimitsProviderEntry(
+                provider: .claude,
+                source: .claude,
+                fiveHourLeft: claudeUsageModel.sessionRemainingPercent,
+                weekLeft: claudeUsageModel.weekAllModelsRemainingPercent,
+                fiveHourResetText: claudeUsageModel.sessionResetText,
+                weekResetText: claudeUsageModel.weekAllModelsResetText,
+                isInitialLoading: claudeUsageModel.isUpdating && claudeUsageModel.lastSuccessAt == nil,
+                lastDataTimestamp: claudeUsageModel.lastUpdate,
+                fiveHourProjectedRunoutAt: claudeUsageModel.fiveHourProjectedRunoutAt,
+                fiveHourProjectionObservedAt: claudeUsageModel.fiveHourProjectionObservedAt,
+                fiveHourOnTrackObservedAt: claudeUsageModel.fiveHourOnTrackObservedAt,
+                fiveHourBurnChip: QuotaMeterBurnChipResolver.text(snapshot: visibleRunwaySnapshot(for: .claude)),
+                weeklyHeader: QuotaMeterWeeklyHeaderResolver.status(
+                    isWeeklyLens: isWeeklyRunwayLens(fiveAbsent: false, weekAbsent: false),
+                    weekStale: isResetInfoUnavailable(raw: claudeUsageModel.weekAllModelsResetText),
+                    fiveHourAbsent: false,
+                    suspect: false,
+                    remainingPercent: Double(claudeUsageModel.weekAllModelsRemainingPercent),
+                    hasActiveSession: hasActiveRunwaySession(for: .claude),
+                    snapshot: weeklyHeaderSnapshot(for: .claude)
+                ),
+                authStatus: claudeUsageModel.authStatus,
+                presentationState: QuotaData.claude(from: claudeUsageModel).presentationState,
+                reconnectingCaption: QuotaData.claude(from: claudeUsageModel).reconnectingCaption,
+                isRateLimited: QuotaData.claude(from: claudeUsageModel).isRateLimited
+            ))
+        }
+        return out
+    }
+
+    /// Panel-wide column decisions, computed once per body pass from the same `entries`
+    /// snapshot (building `entries` is not cheap, and every row needs these).
+    private struct RowLayout {
+        let alignColumns: Bool
+        let weeklyGrid: Bool
+        let reserveProjectionSlot: Bool
+    }
+
+    private func rowLayout(for rows: [HUDLimitsProviderEntry]) -> RowLayout {
+        RowLayout(
+            alignColumns: rows.count > 1,
+            weeklyGrid: rows.contains { $0.weeklyHeader != nil },
+            reserveProjectionSlot: projectedRunoutEnabled && rows.contains { entry in
+                formatUsageProjectionLabel(
+                    runoutAt: entry.fiveHourProjectedRunoutAt,
+                    observedAt: entry.fiveHourProjectionObservedAt,
+                    now: clockNow
+                ) != nil
+            }
+        )
+    }
+
+    @AppStorage(PreferencesKey.claudeCloudSessionsEnabled)
+    private var claudeCloudSessionsEnabledForStatus: Bool = false
+
+    /// Why the cloud source is showing what it is showing.
+    ///
+    /// The spec requires every `ClaudeCloudSourceState` to reach a surface: a state
+    /// that is computed and drawn nowhere is indistinguishable from a hang, which is
+    /// exactly how the earlier "no rows and no explanation" behaved. Unit tests
+    /// asserted each state has distinct copy, but nothing asserted the copy was
+    /// rendered — so this line is the missing half of that guarantee.
+    ///
+    /// Silent in the two states that need no explanation: off, and working normally
+    /// with rows already on screen.
+    @ViewBuilder
+    private var cloudStatusLine: some View {
+        let model = ClaudeCloudLiveModel.shared
+        let state = model.state
+        // `@AppStorage`, not a bare UserDefaults read: the raw read does not
+        // invalidate the body, so after switching the feature off a stale error
+        // caption lingered until the next 30s poll happened to change `state`.
+        let enabled = claudeCloudSessionsEnabledForStatus
+        // This line explains PROBLEMS, not normalcy. "No cloud sessions running" is
+        // the ordinary steady state — local sessions do not announce their own
+        // absence either, and a permanent caption restating it is pure noise.
+        //
+        // Still spoken: every state where something is wrong or the numbers cannot
+        // be trusted (not connected, expired, rate limited, offline, contract drift,
+        // and rows retained past their freshness). Those are the cases where silence
+        // and "broken" would look identical, which is why this line exists.
+        let quiet: Bool = {
+            if !enabled || !providerShown(.claude) { return true }
+            switch state {
+            case .empty: return true          // nothing running — unremarkable
+            case .disabled: return true       // pre-first-poll; resolves within seconds
+            case .ok: return !state.isStale   // rows on screen and fresh
+            default: return false             // a real condition worth naming
+            }
+        }()
+        if !quiet {
+            let message = state.displayMessage
+            HStack(spacing: 6) {
+                Image(systemName: state.isStale ? "exclamationmark.triangle" : "cloud")
+                    .font(.caption2)
+                Text(message)
+                    .font(.caption2)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+        }
+    }
+
+    var body: some View {
+        let rows = entries
+        let layout = rowLayout(for: rows)
+        let presentation = RunwayPresentation.current(raw: runwayPresentationRaw)
+        let openCodeGroup = OpenCodeHUDGroup.make(
+            rows: activeRows,
+            detectionEnabled: detectionEnabled,
+            openCodeEnabled: openCodeAgentEnabled,
+            // Gated here as well as in the demand: a populated snapshot must not
+            // stay on screen once rates are switched off or the strip collapses.
+            rates: OpenCodeHUDGroup.displayedRates(snapshot: rateStore.snapshot,
+                                                   presentation: presentation,
+                                                   showsRates: showsOpenCodeRates),
+            rateUnit: showsOpenCodeRates ? OpenCodeSessionRate.unit(for: presentation) : nil
+        )
+        Group {
+            // OpenCode-only: the group renders alone. "Usage tracking is off" is about
+            // quota sections, which the OpenCode group does not need.
+            if rows.isEmpty && openCodeGroup == nil {
+                emptyRow
+            } else {
+                VStack(spacing: 0) {
+                    // Inside the measured region on purpose. This previously rendered
+                    // in `hudStack`, outside the GeometryReader that emits
+                    // `LimitsContentHeightKey`, so its ~26pt never reached
+                    // `limitsWindowHeight` — the pinned window is fixed-size
+                    // (minSize == maxSize) with clipped content, so every time the line
+                    // appeared it silently cut the last row off the bottom.
+                    cloudStatusLine
+                    ForEach(Array(rows.enumerated()), id: \.offset) { index, entry in
+                        if index > 0 {
+                            // Group separation: whitespace does the grouping, with a
+                            // stronger full-bleed rule on top. This is deliberately
+                            // heavier than the faint inset rule inside an agent block
+                            // (provider row ↔ its own runway).
+                            Color.clear.frame(height: 7)
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.18))
+                                .frame(height: 1)
+                        }
+                        row(entry: entry, layout: layout)
+                        if entry.source == .claude,
+                           showsChrome,
+                           rowShowsLiveMeter(entry),
+                           let scopedLine = claudeScopedWeekLine {
+                            HStack(spacing: 0) {
+                                Text(scopedLine)
+                                    .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: quotaMeterEnlarged), weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.top, 1)
+                            .transition(.opacity)
+                        }
+                        if entry.source == .codex,
+                           showsChrome,
+                           let creditsLine = CodexResetCredits.quotaMeterLine(codexUsageModel.resetCredits, now: clockNow) {
+                            HStack(spacing: 0) {
+                                Text(creditsLine)
+                                    .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: quotaMeterEnlarged), weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.top, 1)
+                            .transition(.opacity)
+                        }
+                        runwayBlock(for: entry.source)
+                    }
+                    // Last, and inside the measured region, so its height reaches
+                    // `limitsWindowHeight`.
+                    if let openCodeGroup {
+                        HUDOpenCodeSessionsGroup(model: openCodeGroup, showsGroupSeparator: !rows.isEmpty)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(key: LimitsContentHeightKey.self, value: proxy.size.height)
+            }
+        )
+        .onReceive(Self.clockTimer) { clockNow = $0 }
+        .task(id: runwayRefreshConfigurationID) {
+            await runRunwayRefreshLoop()
+        }
+        // Report what this surface shows; the shared sampler reads only while some
+        // surface asks. Same per-surface UUID pattern as QuotaMeterPollingRegistry.
+        .onChange(of: openCodeRateDemand, initial: true) { _, demand in
+            rateStore.setDemand(rateSurfaceID, demand)
+        }
+        .onDisappear { rateStore.setDemand(rateSurfaceID, nil) }
+    }
+
+    @ViewBuilder
+    private func row(entry: HUDLimitsProviderEntry, layout: RowLayout) -> some View {
+        HStack(spacing: 0) {
+            // Same shared-state degradation as the footer / menu bar / limits bar:
+            // never render a misleading "0% / no reset" meter for a provider whose
+            // data isn't trustworthy.
+            let probeState = probeCoordinator.displayState(for: entry.source, now: clockNow)
+            switch entry.presentationState {
+            case .needsAction(let auth):
+                // Chip variant: "Claude auth expired · claude auth login [Copy]" —
+                // matches the footer's FooterAuthCell language and fits the QM's
+                // content-hugging width (the full headline banner would clip).
+                HUDLimitsAuthCell(
+                    source: entry.source,
+                    status: auth,
+                    chip: true,
+                    onHide: auth.state == .accountUnavailable ? { hideProvider(entry.provider) } : nil
+                )
+            case _ where isProbeVisible(probeState):
+                HUDLimitsProbeCell(source: entry.source,
+                                   failed: isProbeFailed(probeState),
+                                   enlarged: quotaMeterEnlarged)
+            case .idle(let auth):
+                HUDLimitsIdleCell(source: entry.source, detail: auth.detail, enlarged: quotaMeterEnlarged)
+            case .reconnecting:
+                if entry.source == .codex, let issue = codexUsageModel.quotaFetchIssue {
+                    CodexQuotaFetchWarning(model: codexUsageModel, issue: issue)
+                } else if entry.isRateLimited {
+                    HUDLimitsRateLimitedCell(
+                        source: entry.source,
+                        enlarged: quotaMeterEnlarged,
+                        onHide: { hideProvider(entry.provider) }
+                    )
+                } else {
+                    HUDLimitsRetryCell(source: entry.source, enlarged: quotaMeterEnlarged, caption: entry.reconnectingCaption)
+                }
+            case .live:
+                HUDLimitsProviderText(
+                    entry: entry,
+                    mode: mode,
+                    showResets: true,
+                    onlyBottleneck: false,
+                    showProjection: true,
+                    alignColumns: layout.alignColumns,
+                    weeklyGrid: layout.weeklyGrid,
+                    reserveProjectionSlot: layout.reserveProjectionSlot,
+                    enlarged: quotaMeterEnlarged,
+                    now: clockNow
+                )
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .allowsTightening(true)
+                    // Spare row width goes to the flexible week-reset column, not the Spacer,
+                    // so the reset ends on the same edge as the runway bars.
+                    .layoutPriority(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: QuotaMeterTextMetrics.providerRowHeight(enlarged: quotaMeterEnlarged))
+    }
+
+    @ViewBuilder
+    private func runwayBlock(for source: UsageTrackingSource) -> some View {
+        // The runway panels draw their own faint top rule (the within-agent
+        // QM ↔ runway separator), so no extra divider is added here.
+        if let snapshot = visibleRunwaySnapshot(for: source) {
+            HUDRunwayPanel(snapshot: snapshot, now: clockNow, agentLabel: source == .claude ? "Claude" : "Codex")
+        } else if runwayVisibility == .alwaysOn {
+            HUDRunwayEmptyPanel(agentLabel: source == .claude ? "Claude" : "Codex")
+        }
+    }
+
+    private static let clockTimer = HUDSharedClock.fiveSecond
+
+    private var emptyRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "gauge")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text(QuotaMeterProvider.allCases.contains(where: providerConfigured)
+                 ? "No providers shown"
+                 : "Usage tracking is off")
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 30)
+    }
+
+    /// Refresh configuration only. Time-varying request fields are deliberately
+    /// excluded: using the five-second request bucket as the task identity cancels
+    /// every async scan before a slow one can publish.
+    private var runwayRefreshConfigurationID: String {
+        [
+            runwayPresentationRaw,
+            runwayVisibilityRaw,
+            projectedRunoutEnabled.description,
+            codexAgentEnabled.description,
+            codexUsageEnabled.description,
+            claudeAgentEnabled.description,
+            claudeUsageEnabled.description
+        ].joined(separator: "|")
+    }
+
+    private var codexRunwayRequest: CodexRunwaySnapshotRequest? {
+        // Feed the active limit window (5h when present, else weekly) — using
+        // fiveHourRemainingPercent here fails the `> 0` guard once the 5h window
+        // is dropped, which killed the runway entirely.
+        return Self.runwayRequest(
+            activeRows: activeRows,
+            projectedRunoutEnabled: projectedRunoutEnabled,
+            codexAgentEnabled: codexAgentEnabled,
+            codexUsageEnabled: codexUsageEnabled && providerShown(.codex),
+            fiveHourRemainingPercent: codexUsageModel.activeLimitRemainingPercent,
+            fiveHourResetText: codexUsageModel.activeLimitResetText,
+            fiveHourProjectedRunoutAt: codexUsageModel.fiveHourProjectedRunoutAt,
+            fiveHourProjectionObservedAt: codexUsageModel.fiveHourProjectionObservedAt,
+            windowMinutes: codexUsageModel.activeLimitWindowMinutes,
+            presentation: RunwayPresentation.current(raw: runwayPresentationRaw),
+            weekRemainingPercent: codexUsageModel.weekRemainingPercent,
+            weekResetText: codexUsageModel.weekResetText,
+            weeklyBurnRateEstimate: codexUsageModel.weeklyBurnRateEstimate,
+            now: clockNow,
+            maxRows: 4,
+            forceVisible: runwayVisibility == .alwaysOn
+        )
+    }
+
+    private var claudeRunwayRequest: CodexRunwaySnapshotRequest? {
+        return HUDRunwayRequestBuilder.claudeRequest(
+            activeRows: activeRows,
+            projectedRunoutEnabled: projectedRunoutEnabled,
+            claudeAgentEnabled: claudeAgentEnabled,
+            claudeUsageEnabled: claudeUsageEnabled && providerShown(.claude),
+            fiveHourRemainingPercent: claudeUsageModel.sessionRemainingPercent,
+            fiveHourResetText: claudeUsageModel.sessionResetText,
+            fiveHourProjectedRunoutAt: claudeUsageModel.fiveHourProjectedRunoutAt,
+            fiveHourProjectionObservedAt: claudeUsageModel.fiveHourProjectionObservedAt,
+            presentation: RunwayPresentation.current(raw: runwayPresentationRaw),
+            weekRemainingPercent: claudeUsageModel.weekAllModelsRemainingPercent,
+            weekResetText: claudeUsageModel.weekAllModelsResetText,
+            weeklyBurnRateEstimate: claudeUsageModel.weeklyBurnRateEstimate,
+            now: clockNow,
+            maxRows: 4,
+            forceVisible: runwayVisibility == .alwaysOn
+        )
+    }
+
+    private func refreshRunwaySnapshot() async {
+        let nextCodexRequest = codexRunwayRequest
+        let nextClaudeRequest = claudeRunwayRequest
+
+        // Stage both providers before either async log scan. Compare the effective
+        // request unit, not just the raw picker value: a selected 5h or Wk lens can
+        // fall back to tk/h automatically when that quota window disappears.
+        if let request = nextCodexRequest {
+            codexRunwaySnapshot = RunwaySnapshotAssembly.placeholderForUnitTransition(
+                current: codexRunwaySnapshot,
+                request: request
+            )
+        } else if codexAgentEnabled, codexUsageEnabled, providerShown(.codex) {
+            codexRunwaySnapshot = RunwaySnapshotAssembly.replacementWhenRequestUnavailable(
+                current: codexRunwaySnapshot,
+                activeIdentities: HUDRunwayIdentityReducer.identities(from: activeRows, source: .codex),
+                maxRows: 4
+            )
+        } else {
+            codexRunwaySnapshot = nil
+        }
+        if let request = nextClaudeRequest {
+            claudeRunwaySnapshot = RunwaySnapshotAssembly.placeholderForUnitTransition(
+                current: claudeRunwaySnapshot,
+                request: request
+            )
+        } else if claudeAgentEnabled, claudeUsageEnabled, providerShown(.claude) {
+            claudeRunwaySnapshot = RunwaySnapshotAssembly.replacementWhenRequestUnavailable(
+                current: claudeRunwaySnapshot,
+                activeIdentities: HUDRunwayIdentityReducer.identities(from: activeRows, source: .claude),
+                maxRows: 4
+            )
+        } else {
+            claudeRunwaySnapshot = nil
+        }
+
+        if let request = nextCodexRequest {
+            let snapshot = await CodexRunwaySnapshotLoader.snapshot(for: request)
+            guard !Task.isCancelled else { return }
+            codexRunwaySnapshot = RunwaySnapshotAssembly.replacementAfterRefresh(
+                current: codexRunwaySnapshot,
+                candidate: snapshot,
+                request: request
+            )
+        }
+        if let request = nextClaudeRequest {
+            let snapshot = await ClaudeRunwaySnapshotLoader.snapshot(for: request)
+            if !Task.isCancelled {
+                claudeRunwaySnapshot = RunwaySnapshotAssembly.replacementAfterRefresh(
+                    current: claudeRunwaySnapshot,
+                    candidate: snapshot,
+                    request: request
+                )
+            }
+        }
+    }
+
+    private func runRunwayRefreshLoop() async {
+        while !Task.isCancelled {
+            await refreshRunwaySnapshot()
+            do {
+                try await Task.sleep(for: .seconds(5))
+            } catch {
+                return
+            }
+        }
+    }
+}
+
+
+private struct HUDChromeVisibilityPopover: View {
+    @Binding var quotaMeterChromeRaw: String
+
+    private var selection: QuotaMeterChrome {
+        QuotaMeterChrome.current(raw: quotaMeterChromeRaw)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Toolbar")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .kerning(0.4)
+
+            Picker("", selection: Binding(
+                get: { quotaMeterChromeRaw },
+                set: { quotaMeterChromeRaw = $0 }
+            )) {
+                ForEach(QuotaMeterChrome.allCases) { chrome in
+                    Text(chrome.title).tag(chrome.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Text(selection.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(width: 236)
+    }
+}
+
+/// Per-click provider chooser for the manual hard probe. Each item is
+/// disabled while that provider is busy (coordinator OR model — an ordinary
+/// refresh also makes the model reject) or its probe would be suppressed
+/// (alarming auth); "Probe Both" is an atomic eligibility decision — disabled
+/// unless BOTH are individually eligible, never silently probing just one.
+private struct HUDProbePopover: View {
+    let claudeEligible: Bool
+    let codexEligible: Bool
+    let claudeShown: Bool
+    let codexShown: Bool
+    /// Why Claude is disabled right now; nil when eligible.
+    let claudeDisabledReason: String?
+    /// Why Codex is disabled right now; nil when eligible.
+    let codexDisabledReason: String?
+    let onProbe: (_ claude: Bool, _ codex: Bool) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if claudeShown {
+                Button("Probe Claude") { onProbe(true, false); dismiss() }
+                    .disabled(!claudeEligible)
+                    .help(claudeEligible ? "Force-refresh Claude usage via the CLI (may consume tokens)." : (claudeDisabledReason ?? ""))
+            }
+            if codexShown {
+                Button("Probe Codex") { onProbe(false, true); dismiss() }
+                    .disabled(!codexEligible)
+                    .help(codexEligible ? "Force-refresh Codex usage via the CLI (may consume tokens)." : (codexDisabledReason ?? ""))
+            }
+            if claudeShown && codexShown {
+                Divider()
+                Button("Probe Both") { onProbe(true, true); dismiss() }
+                    .disabled(!(claudeEligible && codexEligible))
+                    .help((claudeEligible && codexEligible) ? "Force-refresh both providers (may consume tokens)." : "Available when both providers are idle and signed in.")
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(10)
+    }
+}
+
+private struct QuotaMeterProviderOption: Identifiable {
+    let provider: QuotaMeterProvider
+    let configured: Bool
+    var id: QuotaMeterProvider { provider }
+}
+
+/// Mirrors the compact drawer style used by the runway controls while exposing
+/// independent checkboxes for every provider that owns a Quota Meter section.
+private struct HUDProviderVisibilityPopover: View {
+    @Binding var hiddenProvidersRaw: String
+    let options: [QuotaMeterProviderOption]
+
+    private func binding(for provider: QuotaMeterProvider) -> Binding<Bool> {
+        Binding(
+            get: {
+                QuotaMeterProviderVisibility.isVisible(
+                    provider,
+                    hiddenProvidersRaw: hiddenProvidersRaw
+                )
+            },
+            set: { visible in
+                hiddenProvidersRaw = QuotaMeterProviderVisibility.setting(
+                    provider,
+                    visible: visible,
+                    hiddenProvidersRaw: hiddenProvidersRaw
+                )
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Usage sections shown")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .kerning(0.4)
+
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(options) { option in
+                    Toggle(option.provider.displayName, isOn: binding(for: option.provider))
+                        .toggleStyle(.checkbox)
+                        .disabled(!option.configured)
+                        .help(option.configured
+                            ? "Show or hide the \(option.provider.displayName) section."
+                            : "Usage tracking is off for \(option.provider.displayName).")
+                }
+            }
+
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Text("Choose which usage sections appear here. Tracking continues while a section is hidden.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(width: 236)
+    }
+}
+
+private struct HUDRunwayPresentationPopover: View {
+    @Binding var runwayPresentationRaw: String
+
+    private var selection: RunwayPresentation {
+        RunwayPresentation.current(raw: runwayPresentationRaw)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Runway rate")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .kerning(0.4)
+
+            Picker("", selection: Binding(
+                get: { runwayPresentationRaw },
+                set: { runwayPresentationRaw = $0 }
+            )) {
+                ForEach(RunwayPresentation.allCases) { presentation in
+                    Text(presentation.shortLabel).tag(presentation.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Text(selection.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(width: 236)
+    }
+}
+
+
+/// Drives the runway load-bar shimmer with a real 0.8s timer that only runs
+/// while a burning row is on screen. Scheduling and invalidating a `Timer`
+/// (rather than gating an always-on publisher) means an idle runway wakes the
+/// main run loop zero times; the wave resumes cleanly the moment a burn returns.
+private final class RunwayShimmerTicker: ObservableObject {
+    @Published private(set) var tick: Int = 0
+    private var timer: Timer?
+
+    func setActive(_ active: Bool) {
+        if active {
+            guard timer == nil else { return }
+            let timer = Timer(timeInterval: 0.8, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.tick = (self.tick + 1) % 1024
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.timer = timer
+        } else {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+
+    deinit { timer?.invalidate() }
+}
+
+#if DEBUG
+/// Test-only host for the real (file-private) Quota Meter panel, so tests can
+/// mount it with the shared usage models and measure what it renders.
+enum HUDLimitsRowsPanelTestHost {
+    static func view(activeRows: [HUDRow], detectionEnabled: Bool) -> AnyView {
+        AnyView(
+            HUDLimitsRowsPanel(
+                activeRows: activeRows,
+                detectionEnabled: detectionEnabled,
+                showsChrome: false,
+                hiddenProvidersRaw: .constant(QuotaMeterProviderVisibility.defaultRawValue)
+            )
+            .environmentObject(CodexUsageModel.shared)
+            .environmentObject(ClaudeUsageModel.shared)
+        )
+    }
+
+    /// With an injected rate store and strip state (nil = a window surface).
+    static func view(activeRows: [HUDRow], detectionEnabled: Bool,
+                     rateStore: OpenCodeRateStore, stripExpanded: Bool?) -> AnyView {
+        AnyView(
+            HUDLimitsRowsPanel(
+                activeRows: activeRows,
+                detectionEnabled: detectionEnabled,
+                showsChrome: false,
+                hiddenProvidersRaw: .constant(QuotaMeterProviderVisibility.defaultRawValue),
+                rateStore: rateStore
+            )
+            .environment(\.quotaStripExpanded, stripExpanded)
+            .environmentObject(CodexUsageModel.shared)
+            .environmentObject(ClaudeUsageModel.shared)
+        )
+    }
+}
+#endif
+
+/// OpenCode running sessions under the quota sections. It reuses the provider-row
+/// and runway type, spacing and separators. Each row shows its own session's rate
+/// (tk/h, or $/h in the $ lens) when one is measured, else working/idle. There is
+/// no load bar: OpenCode has no quota to measure against.
+private struct HUDOpenCodeSessionsGroup: View {
+    let model: OpenCodeHUDGroupModel
+    /// The full-bleed rule between agent groups; off when nothing sits above.
+    let showsGroupSeparator: Bool
+    @AppStorage(PreferencesKey.quotaMeterEnlarged) private var quotaMeterEnlarged = false
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if showsGroupSeparator {
+                Color.clear.frame(height: 7)
+                Rectangle()
+                    .fill(Color.primary.opacity(0.18))
+                    .frame(height: 1)
+            }
+            header
+            sessions
+        }
+    }
+
+    private var header: some View {
+        // Logo in place of a name, like the Codex and Claude rows; the name stays
+        // for VoiceOver.
+        HStack(spacing: 8) {
+            HUDMonochromeAgentIcon(assetName: "FooterIconOpenCode")
+                .accessibilityLabel(Text(verbatim: HUDAgentType.opencode.label))
+            Text(OpenCodeHUDGroup.runningText(count: model.totalCount))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: quotaMeterEnlarged), weight: .medium, design: .monospaced))
+        .lineLimit(1)
+        .padding(.horizontal, 14)
+        .frame(height: QuotaMeterTextMetrics.providerRowHeight(enlarged: quotaMeterEnlarged))
+        .accessibilityElement(children: .combine)
+    }
+
+    /// The runway row layout: title, fixed-width rate column, load bar. An idle row
+    /// that keeps its last rate shows the idle label at the end of the title column.
+    private func rateRow(_ row: HUDRow, cell: OpenCodeRateCell?, value: OpenCodeRateValue?,
+                         unit: RunwayRateUnit, index: Int) -> some View {
+        let bar = OpenCodeHUDGroup.loadBar(for: value)
+        return GeometryReader { proxy in
+            HStack(spacing: HUDRunwayLayout.columnSpacing) {
+                HStack(spacing: HUDRunwayLayout.columnSpacing) {
+                    Text(verbatim: row.displayName)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    if cell?.isIdle == true {
+                        stateText(row)
+                    }
+                }
+                .frame(width: HUDRunwayLayout.titleWidth(for: proxy.size.width, unit: unit), alignment: .leading)
+                Group {
+                    if let cell {
+                        Text(verbatim: cell.text)
+                            .lineLimit(1)
+                            .foregroundStyle(cell.isPositive ? hudProjectionColor(colorScheme) : Color.secondary)
+                            .help(cell.help ?? "")
+                    } else {
+                        stateText(row)
+                    }
+                }
+                .frame(width: HUDRunwayLayout.rateWidth(for: unit), alignment: .trailing)
+                HUDRunwayLoadBar(displayRate: bar.displayRate, maxDisplayRate: model.maxBarRate,
+                                 confidence: bar.confidence, unit: unit, animationTick: 0, index: index)
+                    // The rate column already says it; the bar's own label would repeat it.
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func stateText(_ row: HUDRow) -> some View {
+        Text(OpenCodeHUDGroup.stateLabel(for: row))
+            .lineLimit(1)
+            .foregroundStyle(row.liveState == .active ? Color.primary : Color.secondary)
+    }
+
+    private var sessions: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(Array(model.visibleRows.enumerated()), id: \.element.id) { index, row in
+                let value = OpenCodeHUDGroup.sessionID(for: row).flatMap { model.rates[$0] }
+                let cell = OpenCodeHUDGroup.rateCell(for: value)
+                Group {
+                    if let unit = model.rateUnit {
+                        rateRow(row, cell: cell, value: value, unit: unit, index: index)
+                    } else {
+                        HStack(spacing: HUDRunwayLayout.columnSpacing) {
+                            Text(verbatim: row.displayName)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 0)
+                            stateText(row)
+                        }
+                    }
+                }
+                .frame(height: QuotaMeterTextMetrics.runwayRowHeight(enlarged: quotaMeterEnlarged))
+                .accessibilityElement(children: .combine)
+            }
+            if model.overflowCount > 0 {
+                Text(OpenCodeHUDGroup.overflowText(count: model.overflowCount))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(height: QuotaMeterTextMetrics.runwayRowHeight(enlarged: quotaMeterEnlarged))
+            }
+        }
+        .font(.system(size: QuotaMeterTextMetrics.runwayFontSize(enlarged: quotaMeterEnlarged), weight: .medium, design: .monospaced))
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 0.5)
+        }
+    }
+}
+
+private struct HUDRunwayPanel: View {
+    let snapshot: CodexRunwaySnapshot
+    let now: Date
+    var agentLabel: String = "Codex"
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(PreferencesKey.quotaMeterEnlarged) private var quotaMeterEnlarged = false
+    // The shimmer ticker runs a real 0.8s timer ONLY while a row is actively
+    // burning — an empty/idle/waiting bar ignores the tick, so a static runway
+    // now issues zero periodic wakeups instead of 75/min. Reduce Motion pauses it.
+    @StateObject private var shimmer = RunwayShimmerTicker()
+    @Environment(\.quotaStripExpanded) private var stripExpanded
+
+    /// Reduce Motion pauses the shimmer, and so does a collapsed (hidden) menu bar strip.
+    private var shimmerAllowed: Bool { !reduceMotion && stripExpanded != false }
+
+    /// A row whose load bar is actually filled and animated. Waiting/idle rows
+    /// keep an empty track, so they need no shimmer.
+    private var hasAnimatedBar: Bool {
+        snapshot.rows.contains { $0.confidence == .direct || $0.confidence == .mixed }
+            || (snapshot.burstSummary.map { $0.displayRate > 0 } ?? false)
+    }
+
+    private var runwayFontSize: CGFloat { QuotaMeterTextMetrics.runwayFontSize(enlarged: quotaMeterEnlarged) }
+    private var runwayRowHeight: CGFloat { QuotaMeterTextMetrics.runwayRowHeight(enlarged: quotaMeterEnlarged) }
+
+    /// The unit every row in this snapshot reports (m/h for the 5h yardstick, tk/h
+    /// when the 5h window is dropped, or weekly %/h). Rows carry their rate in the
+    /// same `displayRate` field regardless; this decides how it's read.
+    private var rateUnit: RunwayRateUnit { snapshot.baseline.rateUnit }
+
+    private var weeklyCalibrationHelp: String {
+        if snapshot.weeklyCalibrationState == .localEstimate {
+            return QuotaMeterWeeklyHeaderResolver.localEstimateHelp
+        }
+        return QuotaMeterWeeklyHeaderResolver.unavailableHelp(
+            calibrationState: snapshot.weeklyCalibrationState)
+            ?? String(localized: "Estimated weekly burn pace from the last five minutes of local activity.")
+    }
+
+    private var maxDisplayRate: Double {
+        let rowMax = snapshot.rows.map(\.displayRate).max() ?? 0
+        let summaryMax = snapshot.burstSummary?.displayRate ?? 0
+        return max(1, rowMax, summaryMax)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                if snapshot.hasRunwayContent {
+                    // The per-agent budget is 5 rows: up to 4 detail rows, then the
+                    // combined "+N sessions" row. Detail slots belong to consumption
+                    // first — RunwayOverflowRule already ranked the heaviest burns —
+                    // so cloud rows, which have no measurable rate at all (no local
+                    // transcript), take only whatever slots are left over and never
+                    // displace a burning session.
+                    let burnRows = snapshot.rows.filter { $0.confidence != .cloud }
+                    let cloudRows = snapshot.rows.filter { $0.confidence == .cloud }
+                    let freeSlots = max(0, HUDRunwayLayout.maxDetailRows - burnRows.count)
+                    let detailRows = burnRows + cloudRows.prefix(freeSlots)
+                    ForEach(Array(detailRows.enumerated()), id: \.element.id) { index, row in
+                        runwayRow(row, index: index)
+                    }
+                    if let summary = snapshot.burstSummary {
+                        summaryRow(summary)
+                    }
+                } else {
+                    Text("No active \(agentLabel) burn")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                        .frame(height: runwayRowHeight, alignment: .center)
+                }
+            }
+            .font(.system(size: runwayFontSize, weight: .medium, design: .monospaced))
+        }
+        .foregroundStyle(Color.primary)
+        // Match the provider row's 14pt inset so the runway hangs off the same
+        // left gridline instead of sitting further left than the agent icon.
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(rateUnit == .weeklyPercentPerHour
+              ? weeklyCalibrationHelp
+              : "")
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 0.5)
+        }
+        .onAppear { shimmer.setActive(hasAnimatedBar && shimmerAllowed) }
+        .onDisappear { shimmer.setActive(false) }
+        .onChange(of: hasAnimatedBar) { _, active in shimmer.setActive(active && shimmerAllowed) }
+        .onChange(of: reduceMotion) { _, _ in shimmer.setActive(hasAnimatedBar && shimmerAllowed) }
+        // In the collapsed menu bar strip the panel is loaded but hidden: no shimmer timer.
+        .onChange(of: stripExpanded) { _, _ in shimmer.setActive(hasAnimatedBar && shimmerAllowed) }
+    }
+
+    /// Burn-rate cell. A finished session shows a calm dash; everything else
+    /// shows the quota-rate text — which reads "0m/h" (dim) for a session that is
+    /// alive but not currently burning (e.g. awaiting a long tool/script), so it
+    /// stays informative instead of spinning.
+    @ViewBuilder
+    private func rateCell(quota: Double, confidence: RunwayAttributionConfidence) -> some View {
+        if confidence == .idle {
+            // Finished its turn, winding down — calm dash.
+            Text("—")
+                .foregroundStyle(.secondary)
+        } else if rateUnit == .weeklyPercentPerHour, confidence == .waiting {
+            // Weekly is an ESTIMATE, so before calibration there is no honest
+            // number at all — not even zero. A bounded clock says "a number is
+            // coming"; once it can't come, the loader sends `.unsupported` and the
+            // cell reads "n/a" instead, so this never spins indefinitely.
+            RunwayMeasuringClock(size: runwayFontSize, reduceMotion: reduceMotion)
+                .accessibilityLabel("Measuring weekly burn")
+        } else {
+            Text(RunwayTimeFormatting.rate(
+                quota, unit: rateUnit, confidence: confidence))
+                .foregroundStyle(quota > 0 ? hudProjectionColor(colorScheme) : Color.secondary)
+        }
+    }
+
+    private func runwayRow(_ row: RunwayPauseImpactRow, index: Int) -> some View {
+        GeometryReader { proxy in
+            let titleWidth = HUDRunwayLayout.titleWidth(for: proxy.size.width, unit: rateUnit)
+            HStack(spacing: HUDRunwayLayout.columnSpacing) {
+                Text(sessionLabel(row))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: titleWidth, alignment: .leading)
+                rateCell(quota: row.displayRate, confidence: row.confidence)
+                    .frame(width: HUDRunwayLayout.rateWidth(for: rateUnit), alignment: .trailing)
+                HUDRunwayLoadBar(
+                    displayRate: row.displayRate,
+                    maxDisplayRate: maxDisplayRate,
+                    confidence: row.confidence,
+                    unit: rateUnit,
+                    animationTick: shimmer.tick,
+                    index: index
+                )
+            }
+        }
+        .frame(height: runwayRowHeight)
+    }
+
+    private func summaryRow(_ summary: RunwayShortBurstSummary) -> some View {
+        let confidence: RunwayAttributionConfidence = summary.displayRate > 0 ? .mixed : .waiting
+        return GeometryReader { proxy in
+            let titleWidth = HUDRunwayLayout.titleWidth(for: proxy.size.width, unit: rateUnit)
+            HStack(spacing: HUDRunwayLayout.columnSpacing) {
+                Text(summaryLabel(summary))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: titleWidth, alignment: .leading)
+                rateCell(quota: summary.displayRate, confidence: confidence)
+                    .frame(width: HUDRunwayLayout.rateWidth(for: rateUnit), alignment: .trailing)
+                HUDRunwayLoadBar(
+                    displayRate: summary.displayRate,
+                    maxDisplayRate: maxDisplayRate,
+                    confidence: confidence,
+                    unit: rateUnit,
+                    animationTick: shimmer.tick,
+                    index: snapshot.rows.count
+                )
+            }
+        }
+        .frame(height: runwayRowHeight)
+    }
+
+    private func sessionLabel(_ row: RunwayPauseImpactRow) -> String {
+        row.isGoal ? "GOAL \(row.displayName)" : row.displayName
+    }
+
+    private func summaryLabel(_ summary: RunwayShortBurstSummary) -> String {
+        // Overflow rows aggregate the same "session" entities as the rows above,
+        // so the noun stays "sessions" regardless of burn state (the rate cell
+        // and load bar already convey whether they're actively burning).
+        "+\(summary.count) sessions"
+    }
+}
+
+/// Placeholder drawer shown when the runway is forced visible ("Always On")
+/// but there is no burn data to display for the agent.
+private struct HUDRunwayEmptyPanel: View {
+    var agentLabel: String = "Codex"
+    @AppStorage(PreferencesKey.quotaMeterEnlarged) private var quotaMeterEnlarged = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("No active \(agentLabel) burn")
+                .font(.system(size: QuotaMeterTextMetrics.runwayFontSize(enlarged: quotaMeterEnlarged), weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 0.5)
+        }
+    }
+}
+
+/// Whether the load bar draws any fill at all.
+///
+/// Lives outside the (file-private) view so tests exercise the real rule rather
+/// than a copy of it — a duplicated predicate passes happily while the shipped
+/// one regresses.
+enum RunwayLoadBarFill {
+    static func shouldFill(displayRate: Double,
+                           maxDisplayRate: Double,
+                           confidence: RunwayAttributionConfidence) -> Bool {
+        // Waiting (clock), idle ("—") and not-currently-burning ("quiet") rows
+        // keep an empty track; the rate cell carries the cue. `displayRate > 0` is
+        // load-bearing: `fillFraction` floors at 12% so a genuinely tiny rate stays
+        // visible, which meant a zero rate still drew a pulsing sliver saying the
+        // opposite of the word beside it.
+        guard confidence != .waiting, confidence != .idle else { return false }
+        guard displayRate.isFinite, displayRate > 0 else { return false }
+        return maxDisplayRate.isFinite && maxDisplayRate > 0
+    }
+}
+
+private struct HUDRunwayLoadBar: View {
+    let displayRate: Double
+    let maxDisplayRate: Double
+    let confidence: RunwayAttributionConfidence
+    var unit: RunwayRateUnit = .quotaMinutesPerHour
+    let animationTick: Int
+    let index: Int
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var fillFraction: CGFloat {
+        guard displayRate.isFinite,
+              displayRate >= 0,
+              maxDisplayRate.isFinite,
+              maxDisplayRate > 0 else {
+            return 0
+        }
+        let relative = displayRate / maxDisplayRate
+        // The absolute-pressure term (rate/45) is a 5h-m/h yardstick constant —
+        // meaningless for token/weekly units — so those fill relative-to-max only.
+        // m/h keeps the pressure anchor so a lone heavy burn still fills.
+        let base: Double
+        switch unit {
+        case .quotaMinutesPerHour:
+            let absolutePressure = min(1, displayRate / 45)
+            base = max(0.12, (relative * 0.60) + (absolutePressure * 0.30))
+        case .tokensPerHour, .weeklyPercentPerHour, .dollarsPerHour:
+            base = max(0.12, relative * 0.85)
+        }
+        let wave = 0.82 + 0.18 * sin(Double(animationTick + index * 3) * 0.9)
+        return CGFloat(min(1, max(0.04, base * wave)))
+    }
+
+    private var fillOpacity: Double {
+        switch confidence {
+        case .waiting, .idle:
+            return 0
+        case .unsupported:
+            return 0
+        case .cloud:
+            // No measurable burn exists, so an empty track is the honest bar.
+            return 0
+        case .direct, .mixed:
+            return 0.82
+        }
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.08))
+                if RunwayLoadBarFill.shouldFill(displayRate: displayRate,
+                                                maxDisplayRate: maxDisplayRate,
+                                                confidence: confidence) {
+                    Capsule()
+                        .fill(hudProjectionColor(colorScheme).opacity(fillOpacity))
+                        .frame(width: max(0, proxy.size.width * fillFraction))
+                        .animation(.easeInOut(duration: 0.28), value: animationTick)
+                }
+            }
+        }
+        .frame(minWidth: 62, maxWidth: .infinity)
+        .frame(height: 5)
+        .accessibilityLabel(RunwayTimeFormatting.rate(displayRate, unit: unit, confidence: confidence))
+    }
+}
+
+private enum HUDRunwayLayout {
+    static let minBarWidth: CGFloat = 62
+    static let columnSpacing: CGFloat = 8
+    static let rowHeight: CGFloat = 14
+
+    /// Detail rows per agent, before the combined "+N sessions" row — 5 total.
+    /// Must match the `maxRows:` passed to the runway request builder (the two
+    /// call sites in `refreshRunwaySnapshot`), which is what caps the ranked burn
+    /// rows; cloud rows are capped against the same budget so the two cannot sum
+    /// past it.
+    static let maxDetailRows = 4
+
+    /// Rate column width. "137m/h" fits 52; token rates like "56.5M tk/h" (and the
+    /// capped "999M"/"9.9B" forms) need more; weekly "%/h" is short.
+    static func rateWidth(for unit: RunwayRateUnit) -> CGFloat {
+        switch unit {
+        case .tokensPerHour: return 80
+        case .weeklyPercentPerHour: return 60
+        case .dollarsPerHour: return 72
+        case .quotaMinutesPerHour: return 52
+        }
+    }
+
+    /// Give the session title every point not needed by the fixed-width rate
+    /// and the minimum bar, so names only truncate when they genuinely overflow.
+    static func titleWidth(for totalWidth: CGFloat, unit: RunwayRateUnit) -> CGFloat {
+        let reservedWidth = rateWidth(for: unit) + minBarWidth + (columnSpacing * 2)
+        return max(64, totalWidth - reservedWidth)
+    }
+}
+
+/// The "still measuring" indicator for Weekly rows. Sized to the runway font so it
+/// sits inside the 14/15pt row (a `ProgressView` at `.small` is ~16pt and would
+/// clip at the Enlarged size); honours Reduce Motion by holding still.
+private struct RunwayMeasuringClock: View {
+    let size: CGFloat
+    let reduceMotion: Bool
+    @State private var spinning = false
+
+    var body: some View {
+        Image(systemName: "clock")
+            .font(.system(size: size, weight: .medium))
+            .foregroundStyle(.secondary)
+            .rotationEffect(.degrees(spinning ? 360 : 0))
+            .animation(
+                reduceMotion ? nil : .linear(duration: 2).repeatForever(autoreverses: false),
+                value: spinning
+            )
+            .onAppear { if !reduceMotion { spinning = true } }
+    }
+}
+
+enum RunwayTimeFormatting {
+    /// Unit-aware runway rate text. The 5h yardstick reads "137m/h"; when the 5h
+    /// window is dropped the runway reports raw token throughput ("412K tk/h")
+    /// instead, so "m/h" never means two things across providers.
+    /// "quiet" rather than "flat" for a live session spending nothing right now.
+    /// "flat" describes a curve, so it read as ambiguous next to real rates; the
+    /// state being named is a session that is alive and working but not consuming
+    /// tokens — waiting on a tool, a script, or a long read. Distinct from "—"
+    /// (finished its turn) and from the measuring clock (no calibration yet).
+    static func rate(_ value: Double,
+                     unit: RunwayRateUnit,
+                     confidence: RunwayAttributionConfidence = .mixed) -> String {
+        // Before the unit switch on purpose: a cloud session has no local transcript,
+        // so every unit below would otherwise invent a number ("quiet", "0m/h",
+        // "0 tk/h", "$0/h") for a rate that cannot be measured at all. One guard here
+        // covers the visible cell and the load bar's accessibility label.
+        if confidence == .cloud { return "Cloud" }
+        switch unit {
+        case .quotaMinutesPerHour:
+            return quotaRate(value, confidence: confidence)
+        case .tokensPerHour:
+            guard confidence != .waiting else { return "0 tk/h" }
+            guard confidence != .idle else { return "idle" }
+            guard value.isFinite, value >= 1 else { return "quiet" }
+            return formatTokenRatePerHour(value)
+        case .weeklyPercentPerHour:
+            // `.waiting` renders as a clock GLYPH in the cell, not text — an
+            // estimate genuinely has no number yet, and "0%/h" claimed a measured
+            // zero that was never measured. The text here is the accessibility
+            // fallback only.
+            guard confidence != .waiting else { return "measuring" }
+            guard confidence != .unsupported else { return "n/a" }
+            guard confidence != .idle else { return "idle" }
+            // One decimal below 10, integer at and above it. Weekly rates are
+            // inherently small — 3%/h already exhausts the week in ~33 hours — so
+            // integer-only formatting collapsed nearly every session to "quiet" or
+            // "1%/h" and the column stopped distinguishing sessions at all
+            // (measured: a real account calibrates to ~0.28pp per API-equivalent
+            // dollar, putting ordinary sessions at 0–3%/h). Larger values keep the
+            // decimal-free form.
+            guard value.isFinite, value >= 0.05 else { return "quiet" }
+            guard value <= WeeklyQuotaCalibrationTracker.maximumDisplayablePercentPerHour else { return "n/a" }
+            if value >= 10 {
+                // NOT String(format: "%.0f"): printf rounds half to EVEN, so a .5
+                // boundary could print a value one lower than the true one.
+                return "\(Int(value.rounded()))%/h"
+            }
+            // %.1f rounds half-to-even too, but only ever between two visible
+            // one-decimal values, so it cannot manufacture a false zero: the 0.05
+            // floor above already routes everything smaller to "quiet".
+            return String(format: "%.1f%%/h", value)
+        case .dollarsPerHour:
+            guard confidence != .waiting else { return "$0/h" }
+            guard confidence != .idle else { return "idle" }
+            guard value.isFinite, value >= 0.005 else { return "quiet" }
+            if value >= 1000 { return String(format: "$%.1fK/h", value / 1000) }
+            if value >= 100 { return String(format: "$%.0f/h", value) }
+            return String(format: "$%.2f/h", value)
+        }
+    }
+
+    static func quotaRate(_ minutesPerHour: Double, confidence: RunwayAttributionConfidence = .mixed) -> String {
+        // Alive but not currently burning (just appeared / awaiting a long tool):
+        // a calm, honest "0m/h" rather than a spinner.
+        guard confidence != .waiting else { return "0m/h" }
+        guard confidence != .idle else { return "idle" }
+        guard minutesPerHour.isFinite, minutesPerHour >= 0.5 else { return "quiet" }
+        let rounded = Int(ceil(minutesPerHour))
+        return "\(rounded)m/h"
+    }
+}
+
+#if DEBUG
+/// Test seam for the runway rate strings. `RunwayTimeFormatting` is file-private,
+/// so without this the display contract (integer %/h, "quiet" vs a false "0%/h",
+/// "n/a") could not be asserted anywhere.
+enum RunwayRateTextTestHook {
+    static func text(_ value: Double,
+                     unit: RunwayRateUnit,
+                     confidence: RunwayAttributionConfidence = .mixed) -> String {
+        RunwayTimeFormatting.rate(value, unit: unit, confidence: confidence)
+    }
+}
+#endif
+
+
+/// Shared percent color used by HUDLimitsDetailPanel and HUDLimitsProviderText.
+private func hudPctColor(_ left: Int) -> Color {
+    if left <= 10 { return .red }
+    if left < 30 { return .orange }
+    return .primary
+}
+
+private func hudProjectionColor(_ colorScheme: ColorScheme) -> Color {
+    colorScheme == .dark
+        ? Color(red: 1.0, green: 0.60, blue: 0.12)
+        : Color(red: 0.82, green: 0.30, blue: 0.00)
+}
+
+/// Compact token-throughput label, e.g. "30K tk/h" / "1.2M tk/h" / "1.5B tk/h".
+/// Used as the honest "burning" indicator on a limit line that has no run-out to
+/// show. Magnitudes ≥100M drop the decimal (and ≥1B use "B") so the string stays
+/// short enough for the fixed-width rate column even for heavy parallel bursts.
+private func formatTokenRatePerHour(_ perHour: Double) -> String {
+    let magnitude: String
+    if perHour >= 1_000_000_000 {
+        magnitude = String(format: "%.1fB", perHour / 1_000_000_000)
+    } else if perHour >= 100_000_000 {
+        magnitude = String(format: "%.0fM", perHour / 1_000_000)
+    } else if perHour >= 1_000_000 {
+        magnitude = String(format: "%.1fM", perHour / 1_000_000)
+    } else if perHour >= 1_000 {
+        magnitude = String(format: "%.0fK", perHour / 1_000)
+    } else {
+        magnitude = String(format: "%.0f", perHour)
+    }
+    return "\(magnitude) tk/h"
+}
+
+/// Quota Meter type scale. Standard keeps the established sizes; Enlarged raises
+/// every Quota Meter font by one point (provider rows and Session Runway alike),
+/// preserving the runway-one-below-provider relationship, and scales the compact
+/// limit columns by the same ratio so Standard stays tight while Enlarged grows the
+/// columns to match the larger text. The compact window then hugs whichever width
+/// results (see HUDLimitsColumnLayout.compactContentWidth).
+private enum QuotaMeterTextMetrics {
+    static func providerFontSize(enlarged: Bool) -> CGFloat { enlarged ? 13 : 12 }
+    static func runwayFontSize(enlarged: Bool) -> CGFloat { enlarged ? 12 : 11 }
+    static func providerRowHeight(enlarged: Bool) -> CGFloat { enlarged ? 32 : 30 }
+    static func runwayRowHeight(enlarged: Bool) -> CGFloat { enlarged ? 15 : 14 }
+    static func columnScale(enlarged: Bool) -> CGFloat { enlarged ? 13.0 / 12.0 : 1.0 }
+}
+
+/// Internal rather than file-private so the two header layouts' shared width
+/// budget is pinned by a test: the pinned Quota Meter is fixed-size
+/// (`minSize == maxSize`), so a column change that moved this number would
+/// silently resize the window.
+enum HUDLimitsColumnLayout {
+    // Keep adjacent quota values visually distinct. Three points made the weekly
+    // percentage and aggregate burn read as one token ("95%4.9%/h") at the
+    // standard type size; six points preserves the compact row while giving each
+    // fixed-width value a clear boundary.
+    static let compactSpacing: CGFloat = 6
+    // Base widths are sized for the Standard provider font (12pt) and scaled up for
+    // Enlarged via QuotaMeterTextMetrics.columnScale, so Standard stays compact and
+    // Enlarged grows ~8%. Each fits its worst-case normal content without shrinking:
+    //   • 5h%/Wk%: "Wk: 89%" (≈ 52pt) → 53 (transient "100%" shaves via minimumScaleFactor)
+    //   • run-out slot: " ▸4h 59m" (≈ 59pt) → 60   ·   5h reset: "↻ 4h 59m" (≈ 59pt) → 60
+    //   • weekly reset: "↻ Wed 12:00 PM" (2-digit hour, ≈ 104pt) → 104
+    // Long stale/unavailable reset copy still falls back to minimumScaleFactor.
+    static let compactFiveHourPercentWidth: CGFloat = 53
+    static let compactFiveHourProjectionWidth: CGFloat = 60
+    static let compactFiveHourResetWidth: CGFloat = 60
+    static let compactSeparatorWidth: CGFloat = 5
+    static let compactWeekPercentWidth: CGFloat = 53
+    static let compactWeekResetWidth: CGFloat = 104
+
+    /// Columns in the compact header, and the gaps between them. Both header
+    /// layouts spend this same column count, which is what keeps their widths
+    /// equal by construction rather than by coincidence.
+    static let compactColumnCount = 6
+    static let compactInterColumnGapCount = compactColumnCount - 1
+
+    /// Fixed chrome around the columns: the provider icon, the icon→columns
+    /// spacing, and the row's 14pt horizontal padding on both sides.
+    static let compactChromeWidth: CGFloat = 14 + 8 + (14 * 2)
+    /// Added to the computed width so the fixed-size window never compresses the
+    /// row against its rounded edge.
+    static let compactWidthEpsilon: CGFloat = 2
+
+    /// Sum of the compact header's fixed columns, before gaps and font scaling.
+    static var compactColumnsTotal: CGFloat {
+        compactFiveHourPercentWidth + compactFiveHourProjectionWidth
+            + compactFiveHourResetWidth + compactSeparatorWidth
+            + compactWeekPercentWidth + compactWeekResetWidth
+    }
+
+    /// Natural width of the compact limits row (icon + scaled columns + padding),
+    /// used to size the Quota Meter window so it hugs its content. The icon and
+    /// padding are fixed; only the columns and inter-column gaps scale with the font.
+    /// Chrome constants mirror HUDLimitsProviderText (14pt icon, 8pt icon→columns
+    /// spacing) and the row's 14pt horizontal padding.
+    static func compactContentWidth(enlarged: Bool) -> CGFloat {
+        contentWidth(columns: compactColumnsTotal, enlarged: enlarged)
+    }
+
+    private static func contentWidth(columns: CGFloat, enlarged: Bool) -> CGFloat {
+        let scale = QuotaMeterTextMetrics.columnScale(enlarged: enlarged)
+        let interColumnGaps = compactSpacing * CGFloat(compactInterColumnGapCount)
+        return (columns + interColumnGaps) * scale + compactChromeWidth + compactWidthEpsilon
+    }
+
+    /// Column mapping for the adaptive weekly header (the `Wk` lens is active and
+    /// the weekly snapshot's aggregate is complete).
+    ///
+    /// It spends the *same* total column budget as the 5h header, reallocated: the
+    /// 5h window keeps only its percent column, and the two columns that held the
+    /// 5h projection and reset now carry the weekly aggregate rate and its run-out.
+    /// Equal totals plus an equal column count means `weeklyLensContentWidth`
+    /// equals `compactContentWidth` at both type sizes — so the lens can change
+    /// without the pinned window moving.
+    enum WeeklyLens {
+        static let fiveHourWidth = HUDLimitsColumnLayout.compactFiveHourPercentWidth
+        static let separatorWidth = HUDLimitsColumnLayout.compactSeparatorWidth
+        static let weekPercentWidth = HUDLimitsColumnLayout.compactWeekPercentWidth
+        static let aggregateWidth = HUDLimitsColumnLayout.compactFiveHourProjectionWidth
+        static let runoutWidth = HUDLimitsColumnLayout.compactFiveHourResetWidth
+        static let weekResetWidth = HUDLimitsColumnLayout.compactWeekResetWidth
+
+        static var columnsTotal: CGFloat {
+            fiveHourWidth + separatorWidth + weekPercentWidth
+                + aggregateWidth + runoutWidth + weekResetWidth
+        }
+    }
+
+    /// Width the weekly header occupies. The contract a test pins: identical to
+    /// `compactContentWidth` for Standard and Enlarged alike.
+    static func weeklyLensContentWidth(enlarged: Bool) -> CGFloat {
+        contentWidth(columns: WeeklyLens.columnsTotal, enlarged: enlarged)
+    }
+
+    static let detailFiveHourPercentWidth: CGFloat = 58
+    // Parity with the compact column: fits hour-format "▸Xh Ym" (this row has no
+    // minimumScaleFactor, so an undersized width clips outright).
+    static let detailFiveHourProjectionWidth: CGFloat = 60
+    static let detailFiveHourResetWidth: CGFloat = 60
+    static let detailSeparatorWidth: CGFloat = 7
+    static let detailWeekPercentWidth: CGFloat = 58
+    static let detailWeekResetWidth: CGFloat = 106
+    /// Inter-column spacing of the detail-panel Grid. Used both to build the Grid
+    /// and to size the absent-5h cell that spans several columns (see detailRow).
+    static let detailGridSpacing: CGFloat = 6
+}
+
+private struct HUDLimitsProjectionToken: View {
+    let projection: String?
+    var reserve: Bool = false
+    /// Compact limits row: render a muted "·" centered in the slot when there is no
+    /// fresh projection, so the run-out column is never blank and the width never
+    /// reflows as burn starts/stops. The detail panel leaves this off (unchanged).
+    var idleMarker: Bool = false
+    /// When true (compact row only), the "no early run-out" state is an *earned*
+    /// on-track signal — a fresh burn that fits the 5h window — so we show a
+    /// smiling face instead of the idle dot, unless the quiet preference is set.
+    var onTrack: Bool = false
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(PreferencesKey.quotaMeterOnTrackGlyph) private var onTrackGlyphRaw = QuotaMeterOnTrackGlyph.smile.rawValue
+
+    private var showsSmile: Bool {
+        onTrack && QuotaMeterOnTrackGlyph.current(raw: onTrackGlyphRaw) == .smile
+    }
+
+    var body: some View {
+        Group {
+            if let projection {
+                Text(" \(projection)")
+                    .fontWeight(.bold)
+                    .foregroundStyle(hudProjectionColor(colorScheme))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if idleMarker && showsSmile {
+                HUDOnTrackSmile()
+                    .frame(maxWidth: .infinity, alignment: .center)
+            } else if idleMarker {
+                Text("·")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            } else if reserve {
+                Text(" ▸4h 59m")
+                    .fontWeight(.bold)
+                    .foregroundStyle(hudProjectionColor(colorScheme))
+                    .opacity(0)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+}
+
+/// The "on track" smile for the compact Quota Meter run-out column. Inherits the
+/// row's foreground color (white in dark mode, black in light) so it reads as a
+/// quiet "all good" rather than a colored badge. Every so often it does a quick
+/// playful trick — a flat spin or a turn-around — never on a constant loop, and
+/// never when Reduce Motion is on.
+private struct HUDOnTrackSmile: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var spin = 0.0
+    @State private var flip = 0.0
+
+    var body: some View {
+        Image(systemName: "face.smiling")
+            .rotationEffect(.degrees(spin))
+            .rotation3DEffect(.degrees(flip), axis: (x: 0, y: 1, z: 0))
+            .accessibilityLabel("On track")
+            .task {
+                await runTricks()
+            }
+    }
+
+    private func runTricks() async {
+        guard !reduceMotion else { return }
+        while !Task.isCancelled {
+            let delay = 6.0 + Double.random(in: 0...11)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { break }
+            if Bool.random() {
+                withAnimation(.easeInOut(duration: 0.7)) { spin += 360 }
+            } else {
+                withAnimation(.easeInOut(duration: 0.8)) { flip += 360 }
+            }
+        }
+    }
+}
+
+
+/// Compact auth-remediation cell for the HUD limits surfaces: the provider icon
+/// (matching HUDLimitsProviderText) followed by the AuthRemediationBanner.
+/// `chip: true` renders the banner's single-pill chip variant ("Claude auth
+/// expired · claude auth login [Copy]") for the width-constrained QM rows /
+/// detail panel; the default compact variant keeps the limits bar unchanged.
+private struct HUDLimitsAuthCell: View {
+    let source: UsageTrackingSource
+    let status: UsageAuthStatus
+    var chip: Bool = false
+    var onHide: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HUDLimitsProviderIcon(source: source)
+            AuthRemediationBanner(status: status, compact: !chip, chip: chip, embedded: true)
+            if let onHide {
+                Button("Hide", action: onHide)
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .help("Hide this provider from Quota Meter. Tracking continues.")
+            }
+        }
+    }
+}
+
+/// Calm "no active session" cell for the HUD limits surfaces: provider icon +
+/// moon glyph + quiet caption. The idle-token sibling of HUDLimitsRetryCell —
+/// no spinner (retrying alone never recovers a lapsed token) and no remediation
+/// chrome (nothing is broken; the next Claude session refreshes the token).
+/// The tooltip carries the full explanation.
+private struct HUDLimitsIdleCell: View {
+    let source: UsageTrackingSource
+    var detail: LocalizedStringResource = ""
+    var enlarged: Bool = false
+
+    private var resolvedDetail: String {
+        let localizedDetail = String(localized: detail)
+        return localizedDetail.isEmpty
+            ? String(localized: "Usage will update after the next session.", comment: "Tooltip for an idle usage meter.")
+            : localizedDetail
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HUDLimitsProviderIcon(source: source)
+            Image(systemName: "moon.zzz")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("no active session")
+                .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .help(resolvedDetail)
+    }
+}
+
+/// In-row probe feedback (spec 2026-07-18): swaps the provider's numbers for
+/// explicit status text inside the same fixed-height row — the QM's height
+/// never changes. "probing…" while running; "probe failed" until the
+/// coordinator's deadline passes; success is simply the fresh numbers.
+private struct HUDLimitsProbeCell: View {
+    let source: UsageTrackingSource
+    let failed: Bool
+    var enlarged: Bool = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HUDLimitsProviderIcon(source: source)
+            Text(failed ? "probe failed" : "probing…")
+                .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                .foregroundStyle(failed ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                .lineLimit(1)
+        }
+        .help(failed ? "The CLI probe did not return usage. Use the menu bar's Hard Refresh for diagnostics." : "Probing usage via the provider CLI…")
+    }
+}
+
+private func isProbeVisible(_ s: ProbeCoordinator.ProbeRowState) -> Bool {
+    if case .none = s { return false }
+    return true
+}
+
+private func isProbeFailed(_ s: ProbeCoordinator.ProbeRowState) -> Bool {
+    if case .failed = s { return true }
+    return false
+}
+
+/// Compact "reconnecting" cell for the HUD limits surfaces: provider icon +
+/// spinning arrows + a quiet caption — the QM sibling of the footer's
+/// FooterRetryChip, so a transiently-unavailable provider never renders a
+/// misleading "0% / no reset" meter. Escalates to HUDLimitsAuthCell once the
+/// auth classifier publishes an alarming verdict.
+private struct HUDLimitsRetryCell: View {
+    let source: UsageTrackingSource
+    var enlarged: Bool = false
+    var caption: LocalizedStringResource = "reconnecting…"
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HUDLimitsProviderIcon(source: source)
+            HUDLimitsLoadingSpinner()
+            Text(caption)
+                .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+}
+
+/// A 429 can carry a long Retry-After window, during which no reconnect is in
+/// progress. Keep the state calm and truthful, and let the user remove that
+/// provider from Quota Meter without changing tracking anywhere else.
+private struct HUDLimitsRateLimitedCell: View {
+    let source: UsageTrackingSource
+    var enlarged: Bool = false
+    let onHide: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            HUDLimitsProviderIcon(source: source)
+            Image(systemName: "clock.badge.exclamationmark")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text(source == .claude ? "rate limited · check plan" : "rate limited")
+                .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Button("Hide", action: onHide)
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .help("Hide this provider from Quota Meter. Tracking continues.")
+        }
+        .help(source == .claude
+              ? "Claude rejected usage requests. Your subscription may be inactive, or Claude may be temporarily rate limiting requests. Tracking will retry automatically; hiding affects only Quota Meter."
+              : "The provider asked Agent Sessions to pause usage requests. Tracking will retry automatically; hiding affects only Quota Meter.")
+    }
+}
+
+/// Provider icon shared by the HUD limits cells — matches HUDLimitsProviderText's
+/// icon chrome exactly (14pt, Claude full-color / Codex template).
+private struct HUDLimitsProviderIcon: View {
+    let source: UsageTrackingSource
+
+    var body: some View {
+        if source == .claude {
+            Image("FooterIconClaude")
+                .renderingMode(.original)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 14, height: 14)
+        } else {
+            HUDMonochromeAgentIcon(assetName: "FooterIconCodex")
+        }
+    }
+}
+
+/// A one-colour agent logo (Codex, OpenCode), drawn black or white to match the
+/// appearance, at the provider-row icon size.
+private struct HUDMonochromeAgentIcon: View {
+    let assetName: String
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Image(assetName)
+            .renderingMode(.template)
+            .resizable()
+            .scaledToFit()
+            .frame(width: 14, height: 14)
+            .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
+    }
+}
+
+/// Which quota window (if any) the Session Runway drawer is currently reporting,
+/// so the matching `5h`/`Wk` label in the agent row can be underlined. A picked-
+/// but-unmeasurable window (e.g. `5h:∞`, where the runway silently falls
+/// back to tokens) and the token/$ lenses resolve to `nil` — the underline only
+/// ever marks the lens the drawer is actually using.
+private enum RunwayLensWindow { case fiveHour, week }
+
+private func activeRunwayLensWindow(rawPresentation raw: String,
+                                    fiveAbsent: Bool,
+                                    weekAbsent: Bool) -> RunwayLensWindow? {
+    switch RunwayPresentation.current(raw: raw) {
+    case .fiveHour: return fiveAbsent ? nil : .fiveHour
+    case .weekly:   return weekAbsent ? nil : .week
+    case .token, .dollar: return nil
+    }
+}
+
+/// A `5h`/`Wk` label token. When it is the active runway lens, a short, subtle
+/// grey rounded bar sits centered under the window symbol ("5h"/"Wk") — the
+/// "selected tab" idiom, so it reads as a deliberate marker rather than stray
+/// dust. Short and centered so it clears the neighbouring "|" separator (a full-
+/// width underline butted against it). Drawn as a bottom overlay so it never
+/// alters row layout.
+@ViewBuilder
+private func runwayLensLabel(_ text: String, active: Bool) -> some View {
+    let symbol = text.prefix { $0 != ":" }        // "5h" / "Wk" from "5h: "
+    let separator = text.dropFirst(symbol.count)  // ": "
+    HStack(spacing: 0) {
+        Text(String(symbol))
+            .overlay(alignment: .bottom) {
+                if active {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.6))
+                        .frame(width: 9, height: 2)
+                        .offset(y: 2.5)
+                }
+            }
+        Text(String(separator))
+    }
+}
+
+private struct HUDLimitsProviderText: View {
+    let entry: HUDLimitsProviderEntry
+    /// Inside the menu bar strip: healthy percents use the wings' green, so the number you
+    /// hovered keeps its colour when the panel opens. nil (floating window) changes nothing.
+    @Environment(\.quotaStripExpanded) private var stripExpanded
+    let mode: UsageDisplayMode
+    var showResets: Bool = true
+    var onlyBottleneck: Bool = false
+    var showProjection: Bool = true
+    var alignColumns: Bool = false
+    /// Another row in the panel draws the weekly header. A row without its own
+    /// weekly header (a Codex local estimate) then uses the weekly columns too, so
+    /// "|" and "Wk" line up across rows instead of sitting ~130 pt apart.
+    var weeklyGrid: Bool = false
+    var reserveProjectionSlot: Bool = false
+    var enlarged: Bool = false
+    var now: Date = Date()
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(PreferencesKey.usageLimitCockpitProjectionEnabled) private var projectedRunoutEnabled = true
+    @AppStorage(PreferencesKey.quotaMeterRunwayPresentation) private var runwayPresentationRaw = RunwayPresentation.fiveHour.rawValue
+
+    // 5h wins ties (<=): it's the shorter window, so equally constrained favours showing the tighter limit.
+    private var bottleneckIs5h: Bool {
+        // A dropped window is never the bottleneck: if the 5h window is gone the
+        // weekly window is; if the weekly window is gone the 5h window is.
+        guard entry.hasFiveHourRateLimit else { return false }
+        guard entry.hasWeekRateLimit else { return true }
+        return entry.fiveHourLeft <= entry.weekLeft
+    }
+    // Three distinct states per window: present, a dropped window → calm "∞"
+    // ("can't verify" when suspect), and a present-but-stale reset → "--"/unavailable.
+    // A dropped window is excluded from the bottleneck (see `bottleneckIs5h`).
+    private var suspect: Bool { entry.usageFormatSuspect }
+    private var fiveAbsent: Bool { !entry.hasFiveHourRateLimit }
+    private var weekAbsent: Bool { !entry.hasWeekRateLimit }
+    private var fiveStale: Bool { !fiveAbsent && isResetInfoUnavailable(raw: entry.fiveHourResetText) }
+    private var weekStale: Bool { !weekAbsent && isResetInfoUnavailable(raw: entry.weekResetText) }
+
+    /// A verified missing 5h window always uses the same compact infinity mark,
+    /// regardless of which runway lens is selected. Suspect format data remains
+    /// explicit rather than being promoted to a confident infinity state.
+    @ViewBuilder
+    private var fiveHourAbsentLabel: some View {
+        if suspect {
+            Text("5h: \(UsageLimitAbsenceCopy.localizedLabel(suspect: true))")
+        } else {
+            Text(verbatim: "5h:∞")
+                .accessibilityLabel(Text(verbatim: "5h: \(UsageLimitAbsenceCopy.localizedLabel(suspect: false))"))
+        }
+    }
+
+    private func pct(_ left: Int) -> Int { mode.numericPercent(fromLeft: left) }
+    private func percentText(left: Int, absent: Bool, stale: Bool) -> String {
+        if absent { return "—" }
+        return stale ? "--" : "\(pct(left))%"
+    }
+    private func percentColor(left: Int, absent: Bool, stale: Bool) -> Color {
+        if absent || stale { return .secondary }
+        if stripExpanded != nil, left >= 30 { return QuotaStripPalette.healthy }
+        return hudPctColor(left)
+    }
+
+    private var activeLensWindow: RunwayLensWindow? {
+        activeRunwayLensWindow(rawPresentation: runwayPresentationRaw, fiveAbsent: fiveAbsent, weekAbsent: weekAbsent)
+    }
+
+    private var fiveHourProjectionLabel: String? {
+        guard showProjection else { return nil }
+        guard projectedRunoutEnabled else { return nil }
+        // No 5h limit → no run-out to project (a "▶Xh" here is a lie); the burn chip
+        // takes its place instead.
+        guard !fiveAbsent else { return nil }
+        return formatUsageProjectionLabel(
+            runoutAt: entry.fiveHourProjectedRunoutAt,
+            observedAt: entry.fiveHourProjectionObservedAt,
+            now: now
+        )
+    }
+
+    /// The selected unit's current burn, with no invented run-out time.
+    private var fiveHourBurnChip: String? {
+        guard fiveAbsent else { return nil }
+        return entry.fiveHourBurnChip
+    }
+
+    // A fresh measured burn that projects run-out at/after reset: working, but
+    // fitting the 5h window. The tracker only sets this timestamp in that state,
+    // so no early-runout check is needed here.
+    private var fiveHourOnTrack: Bool {
+        guard projectedRunoutEnabled else { return false }
+        return usageOnTrackIsFresh(observedAt: entry.fiveHourOnTrackObservedAt, now: now)
+    }
+
+    // Reset labels carry their own "↻ " prefix so the calm absent states can
+    // drop it ("∞" / "can't verify" read wrong with a reset glyph).
+    private func fiveHourResetLabel() -> String? {
+        if fiveAbsent { return UsageLimitAbsenceCopy.localizedLabel(suspect: suspect) }
+        if isResetInfoUnavailable(raw: entry.fiveHourResetText) { return "↻ \(UsageStaleThresholds.localizedUnavailableCopy)" }
+        let raw = entry.fiveHourResetText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return "↻ —" }
+        let date = UsageResetText.resetDate(kind: "5h", source: entry.source, raw: entry.fiveHourResetText, now: now)
+        if let relative = formatRelativeTimeUntil(date, now: now) { return "↻ \(relative)" }
+        let fallback = UsageResetText.displayText(kind: "5h", source: entry.source, raw: entry.fiveHourResetText, now: now)
+        return "↻ \(fallback.isEmpty ? "—" : fallback)"
+    }
+
+    private func weekResetLabel() -> String? {
+        if weekAbsent { return UsageLimitAbsenceCopy.localizedLabel(suspect: suspect) }
+        if isResetInfoUnavailable(raw: entry.weekResetText) { return "↻ \(UsageStaleThresholds.localizedUnavailableCopy)" }
+        let raw = entry.weekResetText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return "↻ —" }
+        let date = UsageResetText.resetDate(kind: "Wk", source: entry.source, raw: entry.weekResetText, now: now)
+        if let weekly = formatWeeklyReset(date, now: now) { return "↻ \(weekly)" }
+        let fallback = UsageResetText.displayText(kind: "Wk", source: entry.source, raw: entry.weekResetText, now: now)
+        return "↻ \(fallback.isEmpty ? "—" : fallback)"
+    }
+
+    // Matches CockpitFooterView.QuotaWidget.formatRelativeTimeUntil exactly
+    private func formatRelativeTimeUntil(_ date: Date?, now: Date = Date()) -> String? {
+        formatUsageRelativeTimeLabel(date, now: now)
+    }
+
+    // Matches CockpitFooterView.QuotaWidget.formatWeeklyReset exactly
+    private func formatWeeklyReset(_ date: Date?, now: Date = Date()) -> String? {
+        formatUsageWeeklyResetLabel(date, now: now)
+    }
+
+    @ViewBuilder
+    private var alignedContent: some View {
+        // Per-mode column widths: base sizes (Standard) scaled up for Enlarged so the
+        // Standard layout stays compact. The run-out slot is always rendered (it shows
+        // a muted "·" when there is no fresh projection) so the row width never reflows
+        // as burn starts/stops. minimumScaleFactor (applied by the caller) remains the
+        // fallback for rare over-long content (transient "100%", stale copy).
+        let scale = QuotaMeterTextMetrics.columnScale(enlarged: enlarged)
+        // Combined width of the three 5h columns (+ their inter-column gaps) so the
+        // dropped-5h span can occupy the same footprint and keep "|" / the Wk
+        // columns aligned with a normal row.
+        let fiveHourRegionWidth: CGFloat = showResets
+            ? HUDLimitsColumnLayout.compactFiveHourPercentWidth
+                + HUDLimitsColumnLayout.compactFiveHourProjectionWidth
+                + HUDLimitsColumnLayout.compactFiveHourResetWidth
+                + HUDLimitsColumnLayout.compactSpacing * 2
+            : HUDLimitsColumnLayout.compactFiveHourPercentWidth
+                + HUDLimitsColumnLayout.compactFiveHourProjectionWidth
+                + HUDLimitsColumnLayout.compactSpacing
+        HStack(spacing: HUDLimitsColumnLayout.compactSpacing * scale) {
+            if fiveAbsent {
+                // Dropped 5h window: one spanning unit "5h:∞  30K tk/h"
+                // (state first), sized to the combined 5h region so the variable-
+                // width burn chip has room instead of colliding with "∞".
+                HStack(spacing: 6 * scale) {
+                    fiveHourAbsentLabel
+                        .foregroundStyle(.secondary)
+                    if let chip = fiveHourBurnChip {
+                        Text(chip).foregroundStyle(hudProjectionColor(colorScheme))
+                    }
+                }
+                .frame(width: fiveHourRegionWidth * scale, alignment: .leading)
+            } else {
+                HStack(spacing: 0) {
+                    runwayLensLabel("5h: ", active: activeLensWindow == .fiveHour)
+                    Text(percentText(left: entry.fiveHourLeft, absent: fiveAbsent, stale: fiveStale))
+                        .foregroundStyle(percentColor(left: entry.fiveHourLeft, absent: fiveAbsent, stale: fiveStale))
+                }
+                .frame(width: HUDLimitsColumnLayout.compactFiveHourPercentWidth * scale, alignment: .leading)
+
+                HUDLimitsProjectionToken(projection: fiveHourProjectionLabel, idleMarker: true, onTrack: fiveHourOnTrack)
+                    .frame(width: HUDLimitsColumnLayout.compactFiveHourProjectionWidth * scale, alignment: .leading)
+
+                if showResets {
+                    // Kept even without a label, so "|" and "Wk" never shift left.
+                    Text(fiveHourResetLabel() ?? "")
+                        .frame(width: HUDLimitsColumnLayout.compactFiveHourResetWidth * scale, alignment: .leading)
+                }
+            }
+
+            Text("|")
+                .foregroundStyle(Color.primary.opacity(0.25))
+                .frame(width: HUDLimitsColumnLayout.compactSeparatorWidth * scale, alignment: .center)
+
+            HStack(spacing: 0) {
+                runwayLensLabel("Wk: ", active: activeLensWindow == .week)
+                Text(percentText(left: entry.weekLeft, absent: weekAbsent, stale: weekStale))
+                    .foregroundStyle(percentColor(left: entry.weekLeft, absent: weekAbsent, stale: weekStale))
+            }
+            .frame(width: HUDLimitsColumnLayout.compactWeekPercentWidth * scale, alignment: .leading)
+
+            if showResets, let r = weekResetLabel() {
+                weekResetColumn(r, width: HUDLimitsColumnLayout.compactWeekResetWidth * scale)
+            }
+        }
+    }
+
+    /// The last column ends on the row's right inset, the same edge the runway
+    /// bars below end on: it takes any spare row width and right-aligns its text.
+    /// Its ideal width stays `width`, so the content-hugging window never grows.
+    private func weekResetColumn(_ text: String, width: CGFloat) -> some View {
+        Text(text)
+            .frame(minWidth: width, maxWidth: .infinity, alignment: .trailing)
+    }
+
+    /// The adaptive weekly header: `5h:89%` — or `5h:∞` when the provider dropped
+    /// that window — then `| Wk:89%  4.4%/h ▸14m ↻ Wed 12:00 PM`.
+    ///
+    /// Rendered whenever the `Wk` lens is effective. A complete aggregate shows
+    /// its rate and ETA; incomplete active states remain in this same layout
+    /// with an explicit measuring, unavailable, or exhausted label. With no
+    /// active session, those columns stay empty.
+    ///
+    /// The columns are the same six the 5h header uses, reallocated (see
+    /// `HUDLimitsColumnLayout.WeeklyLens`), so this row occupies the identical
+    /// width and the pinned window never moves when the lens changes.
+    private func weeklyStatusHelp(_ status: QuotaMeterWeeklyHeaderStatus) -> String {
+        switch status {
+        case .estimate:
+            if entry.weeklyCalibrationState == .localEstimate {
+                return QuotaMeterWeeklyHeaderResolver.localEstimateHelp
+            }
+            return "Combined weekly burn across every measurable active session, with time left at that pace."
+        case .measuring:
+            return "Measuring an active session before the combined weekly burn and ETA can be calculated."
+        case .unavailable:
+            return QuotaMeterWeeklyHeaderResolver.unavailableHelp(
+                calibrationState: entry.weeklyCalibrationState)
+                ?? "Combined weekly burn is unavailable while an active session has no measurable local rate."
+        case .quiet:
+            return "No measurable weekly burn is active right now."
+        case .exhausted:
+            return "The weekly quota has no remaining capacity to project."
+        }
+    }
+
+    /// `status` is nil for a row that has no weekly header of its own but shares
+    /// the panel with one (see `weeklyGrid`). The rate and run-out columns then
+    /// stay empty, or carry the burn chip when the 5h window is dropped, exactly
+    /// as the row's 5h layout would.
+    private func weeklyLensContent(_ status: QuotaMeterWeeklyHeaderStatus?) -> some View {
+        let scale = QuotaMeterTextMetrics.columnScale(enlarged: enlarged)
+        return HStack(spacing: HUDLimitsColumnLayout.compactSpacing * scale) {
+            if fiveAbsent {
+                // The 5h window is gone, so a percent would be a lie. "∞" is the
+                // honest read and takes the column the percent would have used.
+                //
+                // `verbatim`: both strings are deliberate non-catalog keys, because
+                // adding a localizable key means editing the reviewed catalog and
+                // the validator's pinned key count/SHA (see
+                // `scripts/validate_localization_catalogs.py`).
+                fiveHourAbsentLabel
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.fiveHourWidth * scale, alignment: .leading)
+            } else {
+                HStack(spacing: 0) {
+                    runwayLensLabel("5h: ", active: false)
+                    Text(percentText(left: entry.fiveHourLeft, absent: fiveAbsent, stale: fiveStale))
+                        .foregroundStyle(percentColor(left: entry.fiveHourLeft, absent: fiveAbsent, stale: fiveStale))
+                }
+                .frame(width: HUDLimitsColumnLayout.WeeklyLens.fiveHourWidth * scale, alignment: .leading)
+            }
+
+            Text("|")
+                .foregroundStyle(Color.primary.opacity(0.25))
+                .frame(width: HUDLimitsColumnLayout.WeeklyLens.separatorWidth * scale, alignment: .center)
+
+            HStack(spacing: 0) {
+                runwayLensLabel("Wk: ", active: true)
+                Text(percentText(left: entry.weekLeft, absent: weekAbsent, stale: weekStale))
+                    .foregroundStyle(percentColor(left: entry.weekLeft, absent: weekAbsent, stale: weekStale))
+            }
+            .frame(width: HUDLimitsColumnLayout.WeeklyLens.weekPercentWidth * scale, alignment: .leading)
+
+            switch status {
+            case nil:
+                Group {
+                    if fiveAbsent, let chip = fiveHourBurnChip {
+                        Text(chip).foregroundStyle(hudProjectionColor(colorScheme))
+                    } else {
+                        Color.clear.frame(height: 1)
+                    }
+                }
+                .frame(width: (HUDLimitsColumnLayout.WeeklyLens.aggregateWidth
+                               + HUDLimitsColumnLayout.compactSpacing
+                               + HUDLimitsColumnLayout.WeeklyLens.runoutWidth) * scale,
+                       alignment: .leading)
+            case .estimate(let header):
+                // The drawer's own total, in the same unit, so the header answers
+                // "how fast is the week going" with one number instead of four rows.
+                Text(header.aggregateText)
+                    .foregroundStyle(entry.weeklyCalibrationState == .localEstimate
+                                     ? Color.secondary : hudProjectionColor(colorScheme))
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.aggregateWidth * scale, alignment: .leading)
+
+                // Nil when the aggregate outlasts the reset; the token then draws
+                // the existing on-track signal in this same slot.
+                if !QuotaMeterWeeklyHeaderResolver.canProjectETA(
+                    calibrationState: entry.weeklyCalibrationState) {
+                    Text(verbatim: "ETA n/a")
+                        .foregroundStyle(.secondary)
+                        .frame(width: HUDLimitsColumnLayout.WeeklyLens.runoutWidth * scale, alignment: .leading)
+                } else {
+                    HUDLimitsProjectionToken(projection: header.runoutText(now: now), idleMarker: true, onTrack: true)
+                        .frame(width: HUDLimitsColumnLayout.WeeklyLens.runoutWidth * scale, alignment: .leading)
+                }
+            case .measuring:
+                Text(verbatim: "measuring")
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.aggregateWidth * scale, alignment: .leading)
+                Text(verbatim: "ETA …")
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.runoutWidth * scale, alignment: .leading)
+            case .unavailable:
+                Text(verbatim: "rate n/a")
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.aggregateWidth * scale, alignment: .leading)
+                Text(verbatim: "ETA n/a")
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.runoutWidth * scale, alignment: .leading)
+            case .quiet:
+                Color.clear
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.aggregateWidth * scale, height: 1)
+                Color.clear
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.runoutWidth * scale, height: 1)
+            case .exhausted:
+                Text(verbatim: "0 left")
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.aggregateWidth * scale, alignment: .leading)
+                Text(verbatim: "exhausted")
+                    .foregroundStyle(.secondary)
+                    .frame(width: HUDLimitsColumnLayout.WeeklyLens.runoutWidth * scale, alignment: .leading)
+            }
+
+            if showResets, let r = weekResetLabel() {
+                weekResetColumn(r, width: HUDLimitsColumnLayout.WeeklyLens.weekResetWidth * scale)
+            }
+        }
+        .help(status.map(weeklyStatusHelp) ?? "")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Provider icon — matches CockpitFooterView ProviderIcon exactly
+            if entry.source == .claude {
+                Image("FooterIconClaude")
+                    .renderingMode(.original)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 14, height: 14)
+            } else {
+                Image("FooterIconCodex")
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 14, height: 14)
+                    .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
+            }
+
+            if entry.isInitialLoading {
+                HUDLimitsLoadingSpinner()
+                    .transition(.opacity)
+            } else {
+                if entry.weeklyHeader != nil
+                    || (weeklyGrid && alignColumns && !onlyBottleneck) {
+                    weeklyLensContent(entry.weeklyHeader)
+                        .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.primary)
+                        .transition(.opacity)
+                } else if alignColumns && !onlyBottleneck {
+                    alignedContent
+                        .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.primary)
+                        .transition(.opacity)
+                } else {
+                    HStack(spacing: 6) {
+                        if !onlyBottleneck || bottleneckIs5h {
+                            HStack(spacing: 4) {
+                                if fiveAbsent {
+                                    // Dropped 5h window: state first, then the burn
+                                    // chip — "5h:∞  30K tk/h" — never the
+                                    // jumbled "— 30K tk/h no limit" ordering.
+                                    fiveHourAbsentLabel
+                                        .foregroundStyle(.secondary)
+                                    if let chip = fiveHourBurnChip {
+                                        Text(chip)
+                                            .foregroundStyle(hudProjectionColor(colorScheme))
+                                    }
+                                } else {
+                                    HStack(spacing: 0) {
+                                        runwayLensLabel("5h: ", active: activeLensWindow == .fiveHour)
+                                        Text(percentText(left: entry.fiveHourLeft, absent: fiveAbsent, stale: fiveStale))
+                                            .foregroundStyle(percentColor(left: entry.fiveHourLeft, absent: fiveAbsent, stale: fiveStale))
+                                        if let projection = fiveHourProjectionLabel {
+                                            Text(" \(projection)")
+                                                .fontWeight(.bold)
+                                                .foregroundStyle(hudProjectionColor(colorScheme))
+                                        }
+                                    }
+                                    if showResets, let r = fiveHourResetLabel() {
+                                        Text(r)
+                                    }
+                                }
+                            }
+                        }
+                        if !onlyBottleneck {
+                            Text("|").foregroundStyle(Color.primary.opacity(0.25))
+                        }
+                        if !onlyBottleneck || !bottleneckIs5h {
+                            HStack(spacing: 4) {
+                                HStack(spacing: 0) {
+                                    runwayLensLabel("Wk: ", active: activeLensWindow == .week)
+                                    Text(percentText(left: entry.weekLeft, absent: weekAbsent, stale: weekStale))
+                                        .foregroundStyle(percentColor(left: entry.weekLeft, absent: weekAbsent, stale: weekStale))
+                                }
+                                if showResets, let r = weekResetLabel() {
+                                    Text(r)
+                                }
+                            }
+                        }
+                    }
+                    .font(.system(size: QuotaMeterTextMetrics.providerFontSize(enlarged: enlarged), weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.primary)
+                    .transition(.opacity)
+                }
+            }
+        }
+        .animation(.easeIn(duration: 0.2), value: entry.isInitialLoading)
+    }
+}
+
+private struct HUDLimitsLoadingSpinner: View {
+    @State private var rotate: Bool = false
+    var body: some View {
+        Image(systemName: "arrow.triangle.2.circlepath")
+            .foregroundStyle(Color.primary.opacity(0.5))
+            .font(.system(size: 11, weight: .semibold))
+            .rotationEffect(.degrees(rotate ? 360 : 0))
+            .animation(.linear(duration: 1.0).repeatForever(autoreverses: false), value: rotate)
+            .drawingGroup()
+            .onAppear { rotate = true }
+    }
+}
+
+private let hudWeeklyResetFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = .current
+    f.timeZone = .autoupdatingCurrent
+    f.timeStyle = .short
+    f.dateStyle = .none
+    return f
+}()
+
+// MARK: - HUD button style
+
+/// Toolbar button chrome. Highlight invariant: `isOn` means "this control is
+/// off its default" (non-5h rate, enlarged text) — never merely
+/// "this control exists". Pin is the one exception, tinting orange to report
+/// window state rather than a setting.
+private struct HUDIconButtonStyle: ButtonStyle {
+    let isOn: Bool
+    let tint: Color?
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 9)
+            .frame(height: 24)
+            .background(background.opacity(configuration.isPressed ? 0.85 : 1.0))
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(border, lineWidth: 0.5))
+    }
+
+    private var shape: UnevenRoundedRectangle {
+        let r = AgentCockpitHUDTheme.toolbarButtonCornerRadius
+        return UnevenRoundedRectangle(topLeadingRadius: r, bottomLeadingRadius: r, bottomTrailingRadius: r, topTrailingRadius: r, style: .continuous)
+    }
+
+    private var foreground: Color {
+        if let tint, isOn {
+            return tint
+        }
+        return isOn ? .accentColor : .secondary
+    }
+
+    private var background: Color {
+        if let tint, isOn {
+            return tint.opacity(0.12)
+        }
+        return isOn ? Color.accentColor.opacity(0.10) : Color.primary.opacity(0.04)
+    }
+
+    private var border: Color {
+        if let tint, isOn {
+            return tint.opacity(0.30)
+        }
+        return isOn ? Color.accentColor.opacity(0.30) : Color.primary.opacity(0.08)
+    }
+}
+
+
+
+
+
+#Preview("Quota Meter") {
+    AgentCockpitHUDView(
+        codexIndexer: SessionIndexer(),
+        claudeIndexer: ClaudeSessionIndexer(),
+        opencodeIndexer: OpenCodeSessionIndexer()
+    )
+    .environment(CodexActiveSessionsModel())
+    .environmentObject(CodexUsageModel.shared)
+    .environmentObject(ClaudeUsageModel.shared)
+    .frame(width: 760, height: 420)
+}

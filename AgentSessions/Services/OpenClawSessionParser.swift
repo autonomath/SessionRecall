@@ -1,0 +1,859 @@
+import Foundation
+import CryptoKit
+
+/// Parser for OpenClaw (and legacy Clawdbot) JSONL session transcripts.
+///
+/// Observed format (v3):
+/// - Header: { "type":"session", "version":3, "id": "...", "timestamp":"ISO8601", "cwd":"..." }
+/// - Messages: { "type":"message", "id":"...", "parentId":"...", "timestamp":"ISO8601", "message":{ "role": "...", "content":[...] } }
+/// - Tool calls inside assistant content: { "type":"toolCall", "id":"...", "name":"...", "arguments":{...} }
+/// - Tool results as separate messages: role == "toolResult" with toolCallId + toolName + content[]
+/// - Meta records: model_change, thinking_level_change, compaction, etc.
+final class OpenClawSessionParser {
+    private static let previewScanLimit = 2_000
+    private static let systemOriginLabel = "system"
+    private static let testingHookLock = NSLock()
+    private static var lightParseBeforeOpenStatHookForTesting: (() -> Void)?
+    private static var lightParseBeforeEndStatHookForTesting: (() -> Void)?
+    private static var fullParseBeforeEndStatHookForTesting: (() -> Void)?
+
+    enum TitleStrategy: String {
+        case promptOnly
+        case originOnly
+        case originThenPrompt
+        case promptThenOrigin
+    }
+
+    static func setFullParseBeforeEndStatHookForTesting(_ hook: (() -> Void)?) {
+        testingHookLock.lock()
+        fullParseBeforeEndStatHookForTesting = hook
+        testingHookLock.unlock()
+    }
+
+    static func setLightParseBeforeOpenStatHookForTesting(_ hook: (() -> Void)?) {
+        testingHookLock.lock()
+        lightParseBeforeOpenStatHookForTesting = hook
+        testingHookLock.unlock()
+    }
+
+    static func setLightParseBeforeEndStatHookForTesting(_ hook: (() -> Void)?) {
+        testingHookLock.lock()
+        lightParseBeforeEndStatHookForTesting = hook
+        testingHookLock.unlock()
+    }
+
+    private static func lightParseBeforeOpenStatHook() -> (() -> Void)? {
+        testingHookLock.lock()
+        defer { testingHookLock.unlock() }
+        return lightParseBeforeOpenStatHookForTesting
+    }
+
+    private static func lightParseBeforeEndStatHook() -> (() -> Void)? {
+        testingHookLock.lock()
+        defer { testingHookLock.unlock() }
+        return lightParseBeforeEndStatHookForTesting
+    }
+
+    private static func fullParseBeforeEndStatHook() -> (() -> Void)? {
+        testingHookLock.lock()
+        defer { testingHookLock.unlock() }
+        return fullParseBeforeEndStatHookForTesting
+    }
+
+    static func parseFile(at url: URL, forcedID: String? = nil) -> Session? {
+        Self.lightParseBeforeOpenStatHook()?()
+        guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        let descriptor = fileHandle.fileDescriptor
+        guard let parseStartStat = SessionFileStat.precise(fromFileDescriptor: descriptor) else {
+            try? fileHandle.close()
+            return nil
+        }
+        defer { try? fileHandle.close() }
+        let reader = JSONLReader(url: url)
+
+        var scan = LightweightScan()
+        do {
+            try reader.forEachLineWhile(using: fileHandle) { rawLine in
+                scan.consume(rawLine)
+            }
+        } catch {
+            return nil
+        }
+
+        Self.lightParseBeforeEndStatHook()?()
+        guard let parseEndStat = SessionFileStat.precise(fromFileDescriptor: descriptor),
+              parseStartStat == parseEndStat else {
+            return nil
+        }
+
+        let meta = deletedFileMetadata(for: url)
+        let agentID = agentIDFromPath(url)
+        let pathBaseID = meta.baseName
+        let baseID = forcedID
+            ?? scan.sessionID
+            ?? (pathBaseID.isEmpty ? sha256(path: url.path) : pathBaseID)
+        let id: String = {
+            if let forcedID, forcedID.hasPrefix("openclaw:") { return forcedID }
+            return "openclaw:\(agentID):\(baseID)"
+        }()
+
+        var session = Session(
+            id: id,
+            source: .openclaw,
+            startTime: scan.tmin ?? Date(timeIntervalSince1970: Double(parseStartStat.mtime) / 1_000_000_000),
+            endTime: scan.tmax ?? Date(timeIntervalSince1970: Double(parseStartStat.mtime) / 1_000_000_000),
+            model: scan.model,
+            filePath: url.path,
+            fileSizeBytes: Int(clamping: parseStartStat.size),
+            eventCount: max(0, scan.estimatedEvents),
+            events: [],
+            cwd: scan.cwd,
+            repoName: scan.repoName,
+            lightweightTitle: scan.title,
+            lightweightCommands: scan.estimatedCommands,
+            isHousekeeping: scan.isHousekeeping,
+            deletedAt: meta.deletedAt
+        )
+        session.sourceFileStat = parseStartStat
+        return session
+    }
+
+    /// The list-preview scan over a transcript's first `previewScanLimit` records.
+    /// The JSONL lightweight parse feeds it file lines; the SQLite reader feeds it
+    /// `transcript_events` rows in memory, so both stores title, count and classify
+    /// a session the same way.
+    struct LightweightScan {
+        private(set) var sessionID: String?
+        private(set) var cwd: String?
+        private(set) var model: String?
+        private(set) var origin: String?
+        private(set) var tmin: Date?
+        private(set) var tmax: Date?
+        private var promptTitle: String?
+        private var firstToolName: String?
+        private(set) var estimatedEvents = 0
+        private(set) var estimatedCommands = 0
+        private var index = 0
+        // Housekeeping heuristics
+        private var sawNonHousekeepingUser = false
+        private var sawHeartbeatPrompt = false
+
+        /// Title fallback: first tool call name if no useful user prompt exists.
+        var title: String? {
+            if let promptTitle { return promptTitle }
+            if let firstToolName, !firstToolName.isEmpty { return firstToolName }
+            return nil
+        }
+
+        var repoName: String { origin ?? OpenClawSessionParser.systemOriginLabel }
+
+        /// If we only saw housekeeping scaffolding, mark as housekeeping so default filters hide it.
+        var isHousekeeping: Bool { !sawNonHousekeepingUser && sawHeartbeatPrompt }
+
+        /// Consumes one record. false means the preview limit is reached.
+        @discardableResult
+        mutating func consume(_ rawLine: String) -> Bool {
+            index += 1
+            guard index <= OpenClawSessionParser.previewScanLimit else { return false }
+            guard let obj = OpenClawSessionParser.decodeObject(rawLine) else { return true }
+            consume(object: obj)
+            return true
+        }
+
+        mutating func consume(object obj: [String: Any]) {
+            let type = OpenClawSessionParser.normalizedType(obj["type"])
+            if type.isEmpty { return }
+
+            if let ts = OpenClawSessionParser.parseTimestamp(
+                obj["timestamp"] ?? (obj["message"] as? [String: Any])?["timestamp"]) {
+                if tmin == nil || ts < tmin! { tmin = ts }
+                if tmax == nil || ts > tmax! { tmax = ts }
+            }
+
+            switch type {
+            case "session":
+                if sessionID == nil, let id = obj["id"] as? String, !id.isEmpty { sessionID = id }
+                if cwd == nil, let c = obj["cwd"] as? String, !c.isEmpty { cwd = c }
+
+            case "modelchange":
+                if let m = obj["modelId"] as? String, !m.isEmpty { model = m }
+
+            case "message":
+                guard let msg = obj["message"] as? [String: Any] else { return }
+                let role = OpenClawSessionParser.normalizedRole(msg["role"])
+                if role == "user" {
+                    if let userText = OpenClawSessionParser.extractText(fromContent: msg["content"]) {
+                        let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if OpenClawSessionParser.isHeartbeatPrompt(trimmed) {
+                            sawHeartbeatPrompt = true
+                            return
+                        }
+                        if OpenClawSessionParser.isNewSessionScaffold(trimmed) {
+                            return
+                        }
+                        sawNonHousekeepingUser = true
+                        if origin == nil {
+                            origin = OpenClawSessionParser.deriveOrigin(fromUserText: trimmed)
+                        }
+                        if promptTitle == nil {
+                            promptTitle = OpenClawSessionParser.deriveTitle(fromUserText: trimmed)
+                        }
+                    }
+                    estimatedEvents += 1
+                } else if role == "assistant" {
+                    // Count assistant text and toolCalls as events (approx).
+                    if let content = msg["content"] as? [Any] {
+                        for block in content {
+                            guard let b = block as? [String: Any], let btype = b["type"] as? String else { continue }
+                            switch OpenClawSessionParser.canonicalBlockType(btype) {
+                            case "toolcall":
+                                estimatedEvents += 1
+                                estimatedCommands += 1
+                                if firstToolName == nil {
+                                    firstToolName = OpenClawSessionParser.stringValue(from: b, keys: ["name", "tool_name"])
+                                }
+                            case "text":
+                                if let t = b["text"] as? String, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    estimatedEvents += 1
+                                }
+                            default:
+                                break
+                            }
+                        }
+                    }
+                    if model == nil, let m = msg["model"] as? String, !m.isEmpty { model = m }
+                } else if role == "toolresult" {
+                    estimatedEvents += 1
+                    estimatedCommands += 1
+                    if firstToolName == nil {
+                        firstToolName = OpenClawSessionParser.stringValue(from: msg, keys: ["toolName", "tool_name"])
+                    }
+                } else {
+                    // Other roles -> meta; ignore for preview counts.
+                }
+
+            default:
+                break
+            }
+        }
+    }
+
+    static func parseFileFull(at url: URL, forcedID: String? = nil) -> Session? {
+        guard let fileHandle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        let descriptor = fileHandle.fileDescriptor
+        guard let parseStartStat = SessionFileStat.precise(fromFileDescriptor: descriptor) else {
+            try? fileHandle.close()
+            return nil
+        }
+        defer { try? fileHandle.close() }
+        let reader = JSONLReader(url: url)
+
+        var events: [SessionEvent] = []
+        var sessionID: String? = nil
+        var cwd: String? = nil
+        var model: String? = nil
+        var origin: String? = nil
+        var title: String? = nil
+        var firstToolName: String? = nil
+        var tmin: Date? = nil
+        var tmax: Date? = nil
+
+        var sawNonHousekeepingUser = false
+        var sawHeartbeatPrompt = false
+        var idx = 0
+
+            do {
+            try reader.forEachLine(using: fileHandle) { rawLine in
+                idx += 1
+                guard let obj = decodeObject(rawLine) else { return }
+                let type = normalizedType(obj["type"])
+                if type.isEmpty { return }
+
+                let baseID = eventID(for: url, index: idx)
+                let ts = parseTimestamp(obj["timestamp"] ?? (obj["message"] as? [String: Any])?["timestamp"])
+
+                if let ts {
+                    if tmin == nil || ts < tmin! { tmin = ts }
+                    if tmax == nil || ts > tmax! { tmax = ts }
+                }
+
+                switch type {
+                case "session":
+                    if sessionID == nil, let id = obj["id"] as? String, !id.isEmpty { sessionID = id }
+                    if cwd == nil, let c = obj["cwd"] as? String, !c.isEmpty { cwd = c }
+                    // Keep as meta for raw view parity.
+                    events.append(SessionEvent(
+                        id: baseID,
+                        timestamp: ts,
+                        kind: .meta,
+                        role: "meta",
+                        text: "[session]",
+                        toolName: nil,
+                        toolInput: nil,
+                        toolOutput: nil,
+                        messageID: obj["id"] as? String,
+                        parentID: nil,
+                        isDelta: false,
+                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                    ))
+
+                case "modelchange":
+                    if let m = obj["modelId"] as? String, !m.isEmpty { model = m }
+                    let provider = obj["provider"] as? String
+                    let mid = obj["modelId"] as? String
+                    let text = "[model_change] " + [provider, mid].compactMap { $0 }.joined(separator: " ")
+                    events.append(SessionEvent(
+                        id: baseID,
+                        timestamp: ts,
+                        kind: .meta,
+                        role: "meta",
+                        text: text.isEmpty ? "[model_change]" : text,
+                        toolName: nil,
+                        toolInput: nil,
+                        toolOutput: nil,
+                        messageID: obj["id"] as? String,
+                        parentID: obj["parentId"] as? String,
+                        isDelta: false,
+                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                    ))
+
+                case "thinkinglevelchange":
+                    let level = obj["thinkingLevel"] as? String
+                    events.append(SessionEvent(
+                        id: baseID,
+                        timestamp: ts,
+                        kind: .meta,
+                        role: "meta",
+                        text: level != nil ? "[thinking_level] \(level!)" : "[thinking_level]",
+                        toolName: nil,
+                        toolInput: nil,
+                        toolOutput: nil,
+                        messageID: obj["id"] as? String,
+                        parentID: obj["parentId"] as? String,
+                        isDelta: false,
+                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                    ))
+
+                case "message":
+                    guard let msg = obj["message"] as? [String: Any] else { return }
+                    let role = normalizedRole(msg["role"])
+                    let messageID = obj["id"] as? String
+                    let parentID = obj["parentId"] as? String
+
+                    if role == "user" {
+                        if let userText = extractText(fromContent: msg["content"]) {
+                            let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if isHeartbeatPrompt(trimmed) { sawHeartbeatPrompt = true }
+                            if !isHeartbeatPrompt(trimmed) && !isNewSessionScaffold(trimmed) {
+                                sawNonHousekeepingUser = true
+                                if origin == nil {
+                                    origin = deriveOrigin(fromUserText: trimmed)
+                                }
+                                if title == nil {
+                                    title = deriveTitle(fromUserText: trimmed)
+                                }
+                            }
+                        }
+                        let text = extractText(fromContent: msg["content"])
+                        if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            events.append(SessionEvent(
+                                id: baseID,
+                                timestamp: ts,
+                                kind: .user,
+                                role: "user",
+                                text: text,
+                                toolName: nil,
+                                toolInput: nil,
+                                toolOutput: nil,
+                                messageID: messageID,
+                                parentID: parentID,
+                                isDelta: false,
+                                rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                            ))
+                        }
+
+                    } else if role == "assistant" {
+                        if model == nil, let m = msg["model"] as? String, !m.isEmpty { model = m }
+                        if let content = msg["content"] as? [Any] {
+                            var blockIndex = 0
+                            for anyBlock in content {
+                                blockIndex += 1
+                                guard let block = anyBlock as? [String: Any], let btype = block["type"] as? String else { continue }
+                                switch canonicalBlockType(btype) {
+                                case "text":
+                                    guard let t = block["text"] as? String else { continue }
+                                    let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    if trimmed.isEmpty { continue }
+                                    events.append(SessionEvent(
+                                        id: baseID + String(format: "-b%02d", blockIndex),
+                                        timestamp: ts,
+                                        kind: .assistant,
+                                        role: "assistant",
+                                        text: t,
+                                        toolName: nil,
+                                        toolInput: nil,
+                                        toolOutput: nil,
+                                        messageID: messageID,
+                                        parentID: parentID,
+                                        isDelta: false,
+                                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                                    ))
+                                case "toolcall":
+                                    let toolCallId = stringValue(from: block, keys: ["id", "toolCallId", "tool_call_id", "toolCallID"])
+                                    let toolName = stringValue(from: block, keys: ["name", "tool_name"])
+                                    if firstToolName == nil, let toolName, !toolName.isEmpty {
+                                        firstToolName = toolName
+                                    }
+                                    let args = block["arguments"] ?? block["input"]
+                                    events.append(SessionEvent(
+                                        id: baseID + String(format: "-t%02d", blockIndex),
+                                        timestamp: ts,
+                                        kind: .tool_call,
+                                        role: "assistant",
+                                        text: nil,
+                                        toolName: toolName,
+                                        toolInput: stringifyJSONBounded(args),
+                                        toolOutput: nil,
+                                        toolCallID: ToolCallID.from(toolCallId),
+                                        messageID: toolCallId,
+                                        parentID: messageID,
+                                        isDelta: false,
+                                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                                    ))
+                                default:
+                                    // Keep unknown blocks as meta so the raw stream isn't lost.
+                                    events.append(SessionEvent(
+                                        id: baseID + String(format: "-u%02d", blockIndex),
+                                        timestamp: ts,
+                                        kind: .meta,
+                                        role: "meta",
+                                        text: "[assistant/\(btype)]",
+                                        toolName: nil,
+                                        toolInput: nil,
+                                        toolOutput: nil,
+                                        messageID: messageID,
+                                        parentID: parentID,
+                                        isDelta: false,
+                                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: block))
+                                    ))
+                                }
+                            }
+                        }
+
+                    } else if role == "toolresult" {
+                        let toolCallId = stringValue(from: msg, keys: ["toolCallId", "tool_call_id", "toolCallID"])
+                        let toolName = stringValue(from: msg, keys: ["toolName", "tool_name"])
+                        if firstToolName == nil, let toolName, !toolName.isEmpty {
+                            firstToolName = toolName
+                        }
+                        let output = extractText(fromContent: msg["content"])
+                        let isError = ((msg["isError"] as? Bool) ?? (msg["is_error"] as? Bool) ?? false)
+                        events.append(SessionEvent(
+                            id: baseID,
+                            timestamp: ts,
+                            kind: isError ? .error : .tool_result,
+                            role: "tool",
+                            text: nil,
+                            toolName: toolName,
+                            toolInput: nil,
+                            toolOutput: output,
+                            toolCallID: ToolCallID.from(toolCallId),
+                            messageID: toolCallId,
+                            parentID: toolCallId,
+                            isDelta: false,
+                            rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                        ))
+                    } else {
+                        // Preserve unusual roles as meta.
+                        let text = extractText(fromContent: msg["content"])
+                        events.append(SessionEvent(
+                            id: baseID,
+                            timestamp: ts,
+                            kind: .meta,
+                            role: role,
+                            text: text,
+                            toolName: msg["toolName"] as? String,
+                            toolInput: nil,
+                            toolOutput: nil,
+                            messageID: messageID,
+                            parentID: parentID,
+                            isDelta: false,
+                            rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                        ))
+                    }
+
+                default:
+                    // Preserve unknown record types as meta for raw view/debugging.
+                    events.append(SessionEvent(
+                        id: baseID,
+                        timestamp: ts,
+                        kind: .meta,
+                        role: "meta",
+                        text: "[\(type)]",
+                        toolName: nil,
+                        toolInput: nil,
+                        toolOutput: nil,
+                        messageID: obj["id"] as? String,
+                        parentID: obj["parentId"] as? String,
+                        isDelta: false,
+                        rawJSON: rawJSONBase64(sanitizeLargeStrings(in: obj))
+                    ))
+                }
+            }
+        } catch {
+            return nil
+        }
+
+        Self.fullParseBeforeEndStatHook()?()
+
+        // A parser-carried proof must describe the bytes that were actually read.
+        // Reject a result if the JSONL changed while the reader was consuming it;
+        // a later stat sample must never be allowed to bless an older transcript.
+        guard let parseEndStat = SessionFileStat.precise(fromFileDescriptor: descriptor),
+              parseStartStat == parseEndStat else {
+            return nil
+        }
+
+        let meta = deletedFileMetadata(for: url)
+        let agentID = agentIDFromPath(url)
+        let pathBaseID = meta.baseName
+        let baseID = forcedID
+            ?? sessionID
+            ?? (pathBaseID.isEmpty ? sha256(path: url.path) : pathBaseID)
+        let id: String = {
+            if let forcedID, forcedID.hasPrefix("openclaw:") { return forcedID }
+            return "openclaw:\(agentID):\(baseID)"
+        }()
+
+        let mtime = Date(timeIntervalSince1970: Double(parseStartStat.mtime) / 1_000_000_000)
+        let start = tmin ?? mtime
+        let end = tmax ?? mtime
+        let isHousekeeping = !sawNonHousekeepingUser && sawHeartbeatPrompt
+        if title == nil, let firstToolName, !firstToolName.isEmpty {
+            title = firstToolName
+        }
+
+        var session = Session(
+            id: id,
+            source: .openclaw,
+            startTime: start,
+            endTime: end,
+            model: model,
+            filePath: url.path,
+            fileSizeBytes: Int(clamping: parseStartStat.size),
+            eventCount: max(events.filter { $0.kind != .meta }.count, 0),
+            events: events,
+            cwd: cwd,
+            repoName: origin ?? systemOriginLabel,
+            lightweightTitle: title,
+            lightweightCommands: nil,
+            isHousekeeping: isHousekeeping,
+            deletedAt: meta.deletedAt
+        )
+        session.sourceFileStat = parseStartStat
+        return session
+    }
+
+    // MARK: - Title helpers
+
+    private static func deriveOrigin(fromUserText text: String) -> String {
+        let lower = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lower.hasPrefix("conversation info (untrusted metadata):")
+            && lower.contains("\"sender_id\"")
+            && lower.contains("sender (untrusted metadata):") {
+            return "telegram"
+        }
+        if lower.hasPrefix("[telegram ") || lower.contains("\n[telegram ") {
+            return "telegram"
+        }
+        if lower.hasPrefix("[cron:") || lower.hasPrefix("[cron ") || lower.contains("\n[cron:") || lower.contains("\n[cron ") {
+            return "cron"
+        }
+        if lower.hasPrefix("[whatsapp ") || lower.contains("\n[whatsapp ") {
+            return "whatsapp"
+        }
+        if lower.hasPrefix("[discord ") || lower.contains("\n[discord ") {
+            return "discord"
+        }
+        if lower.hasPrefix("[imessage ") || lower.contains("\n[imessage ") {
+            return "imessage"
+        }
+        if lower.hasPrefix("[webchat ") || lower.contains("\n[webchat ") {
+            return "webchat"
+        }
+        return "tui"
+    }
+
+    private static func deriveTitle(fromUserText text: String) -> String {
+        let strategy = currentTitleStrategy()
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("[Telegram ") else {
+            return trimmed
+        }
+
+        let parsed = parseTelegramPrefix(trimmed)
+        let origin = parsed.origin
+        let msg = parsed.message
+
+        switch strategy {
+        case .promptOnly:
+            return msg ?? trimmed
+        case .originOnly:
+            return origin ?? trimmed
+        case .originThenPrompt:
+            if let origin, let msg { return "\(origin) — \(msg)" }
+            return origin ?? msg ?? trimmed
+        case .promptThenOrigin:
+            if let origin, let msg { return "\(msg) — \(origin)" }
+            return msg ?? origin ?? trimmed
+        }
+    }
+
+    private static func currentTitleStrategy() -> TitleStrategy {
+        let raw = UserDefaults.standard.string(forKey: "OpenClawTitleStrategy") ?? ""
+        return TitleStrategy(rawValue: raw) ?? .originThenPrompt
+    }
+
+    private static func parseTelegramPrefix(_ text: String) -> (origin: String?, message: String?) {
+        guard let close = text.firstIndex(of: "]") else {
+            return (origin: nil, message: nil)
+        }
+        let inside = text[text.index(after: text.startIndex)..<close]
+        var origin = String(inside)
+        origin = origin.replacingOccurrences(of: "Telegram ", with: "")
+        if let idRange = origin.range(of: " id:") {
+            origin = String(origin[..<idRange.lowerBound])
+        }
+        origin = origin.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var msg = String(text[text.index(after: close)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Common suffix: [message_id: ...]
+        if let r = msg.range(of: "\n[message_id:", options: [.caseInsensitive]) {
+            msg = String(msg[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if msg.hasSuffix("]"), let r = msg.range(of: "[message_id:", options: [.caseInsensitive]) {
+            // If the message_id is inline at the end, drop it.
+            msg = String(msg[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if msg.isEmpty { return (origin: origin.isEmpty ? nil : origin, message: nil) }
+        return (origin: origin.isEmpty ? nil : origin, message: msg)
+    }
+
+    private static func isHeartbeatPrompt(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        if !lower.contains("heartbeat.md") { return false }
+        if lower.contains("read heartbeat.md") { return true }
+        if lower.contains("consider outstanding tasks") { return true }
+        return false
+    }
+
+    private static func isNewSessionScaffold(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("a new session was started via /new") || lower.contains("via /new or /reset")
+    }
+
+    private static func normalizedRole(_ value: Any?) -> String {
+        guard let raw = value as? String else { return "" }
+        return raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
+    }
+
+    private static func normalizedType(_ value: Any?) -> String {
+        guard let raw = value as? String else { return "" }
+        return raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
+    }
+
+    private static func canonicalBlockType(_ value: Any?) -> String {
+        guard let raw = value as? String else { return "" }
+        let lowered = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowered.replacingOccurrences(of: "_", with: "")
+    }
+
+    private static func stringValue(from object: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] as? String, !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Content extraction
+
+    private static func extractText(fromContent any: Any?) -> String? {
+        if let s = any as? String {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : s
+        }
+        guard let arr = any as? [Any] else { return nil }
+
+        let hasImage: Bool = arr.contains { item in
+            guard let d = item as? [String: Any] else { return false }
+            return (d["type"] as? String) == "image"
+        }
+
+        var texts: [String] = []
+        texts.reserveCapacity(min(arr.count, 8))
+        for item in arr {
+            guard let d = item as? [String: Any] else { continue }
+            let blockType = canonicalBlockType(d["type"])
+            let blockText: String?
+            if blockType == "text" {
+                blockText = d["text"] as? String
+            } else if blockType == "toolresult" {
+                blockText = (d["text"] as? String) ?? (d["content"] as? String)
+            } else {
+                blockText = nil
+            }
+            if let t = blockText {
+                let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                // Telegram attachments: Clawdbot injects a verbose "[media attached: ...]" hint string.
+                // Hide it when an actual inline image block is present.
+                if hasImage, isRedundantMediaAttachmentText(trimmed) { continue }
+                texts.append(t)
+            }
+        }
+        if texts.isEmpty {
+            return hasImage ? "Image attached" : nil
+        }
+        return texts.joined(separator: "\n")
+    }
+
+    private static func isRedundantMediaAttachmentText(_ trimmed: String) -> Bool {
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("[media attached:") { return true }
+        if lower.contains("to send an image back") && lower.contains("media:") { return true }
+        return false
+    }
+
+    // MARK: - JSON helpers
+
+    private static func decodeObject(_ rawLine: String) -> [String: Any]? {
+        guard let data = rawLine.data(using: .utf8) else { return nil }
+        guard let any = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return any as? [String: Any]
+    }
+
+    private static func parseTimestamp(_ any: Any?) -> Date? {
+        if let s = any as? String {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let d = iso.date(from: s) { return d }
+            iso.formatOptions = [.withInternetDateTime]
+            return iso.date(from: s)
+        }
+        if let n = any as? Double { return Date(timeIntervalSince1970: normalizeEpochSeconds(n)) }
+        if let n = any as? Int { return Date(timeIntervalSince1970: normalizeEpochSeconds(Double(n))) }
+        return nil
+    }
+
+    private static func normalizeEpochSeconds(_ value: Double) -> Double {
+        if value > 1e14 { return value / 1_000_000 }  // microseconds
+        if value > 1e11 { return value / 1_000 }       // milliseconds
+        return value
+    }
+
+    private static func sanitizeLargeStrings(in any: Any) -> Any {
+        // Keep in sync with other parsers: cap huge raw JSON fields so DB and raw views stay responsive.
+        let maxBytes = 256 * 1024
+        if let s = any as? String {
+            if s.utf8.count > maxBytes {
+                return "[OMITTED bytes=\(s.utf8.count)]"
+            }
+            return s
+        }
+        if let arr = any as? [Any] {
+            return arr.map { sanitizeLargeStrings(in: $0) }
+        }
+        if let dict = any as? [String: Any] {
+            var out: [String: Any] = [:]
+            out.reserveCapacity(dict.count)
+            for (k, v) in dict {
+                out[k] = sanitizeLargeStrings(in: v)
+            }
+            return out
+        }
+        return any
+    }
+
+    private static func rawJSONBase64(_ any: Any) -> String {
+        guard JSONSerialization.isValidJSONObject(any),
+              let data = try? JSONSerialization.data(withJSONObject: any, options: []) else {
+            return ""
+        }
+        return data.base64EncodedString()
+    }
+
+    private static func stringifyJSONBounded(_ any: Any?) -> String? {
+        guard let any else { return nil }
+        if let s = any as? String { return s }
+        guard JSONSerialization.isValidJSONObject(any) else { return String(describing: any) }
+        guard let text = ToolJSON.string(from: any, pretty: false) else {
+            return String(describing: any)
+        }
+        let byteCount = text.utf8.count
+        if byteCount > 32_768 {
+            return "[OMITTED large JSON payload bytes=\(byteCount)]"
+        }
+        return text
+    }
+
+    private static func eventID(for url: URL, index: Int) -> String {
+        let base = sha256(path: url.path)
+        return base + String(format: "-%06d", index)
+    }
+
+    private static func sha256(path: String) -> String {
+        let data = Data(path.utf8)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func agentIDFromPath(_ url: URL) -> String {
+        let comps = url.pathComponents
+        guard let i = comps.lastIndex(of: "agents"), i + 1 < comps.count else { return "main" }
+        let agent = comps[i + 1]
+        return agent.isEmpty ? "main" : agent
+    }
+
+    private static func deletedFileMetadata(for url: URL) -> (baseName: String, deletedAt: Date?) {
+        let name = url.lastPathComponent
+        if let range = name.range(of: ".jsonl.deleted.") {
+            let base = String(name[..<range.lowerBound])
+            let tsString = String(name[range.upperBound...])
+            let deletedAt: Date? = {
+                // Unix epoch (numeric)
+                if let ts = Double(tsString) { return Date(timeIntervalSince1970: ts) }
+                // ISO 8601 with dashes replacing colons (e.g. 2026-03-16T21-20-30.062Z)
+                let iso = ISO8601DateFormatter()
+                iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                // OpenClaw uses dashes instead of colons in the time portion
+                let colonized = tsString.replacingOccurrences(
+                    of: #"T(\d{2})-(\d{2})-(\d{2})"#,
+                    with: "T$1:$2:$3",
+                    options: .regularExpression)
+                if let d = iso.date(from: colonized) { return d }
+                iso.formatOptions = [.withInternetDateTime]
+                return iso.date(from: colonized)
+            }()
+            return (base, deletedAt)
+        }
+        let base = url.deletingPathExtension().lastPathComponent
+        return (base, nil)
+    }
+}

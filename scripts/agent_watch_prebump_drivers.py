@@ -1,0 +1,1778 @@
+"""Per-agent prebump drivers for scripts/agent_watch.py --mode prebump.
+
+Each driver knows how to:
+  1. build a sandbox directory the agent will treat as HOME,
+  2. forward or copy credentials per the hybrid auth policy (§4.4),
+  3. run the agent's headless command once,
+  4. point back at the session file the agent wrote under the sandbox.
+
+Drivers do not fingerprint or diff — that is done by agent_watch.py
+reusing the weekly helpers.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import tempfile
+import time
+import uuid as _uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol, runtime_checkable
+
+
+@dataclass
+class DriverResult:
+    ok: bool
+    session_path: Path | None
+    stdout_file: Path
+    stderr_file: Path
+    exit_code: int
+    error: str | None
+    # Set when `session_path` is a store shared by many sessions (OpenClaw's
+    # per-agent SQLite database), naming the one session this run wrote.
+    session_id: str | None = None
+
+
+@runtime_checkable
+class PrebumpDriver(Protocol):
+    name: str
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult: ...
+
+
+DRIVERS: dict[str, PrebumpDriver] = {}
+
+
+def _newest_matching(root: Path, patterns: tuple[str, ...]) -> Path | None:
+    newest: Path | None = None
+    newest_m = -1.0
+    if not root.exists():
+        return None
+    for pattern in patterns:
+        for p in root.rglob(pattern):
+            if not p.is_file():
+                continue
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m > newest_m:
+                newest = p
+                newest_m = m
+    return newest
+
+
+def _newest_matching_after(root: Path, patterns: tuple[str, ...], min_mtime: float) -> Path | None:
+    newest: Path | None = None
+    newest_m = -1.0
+    if not root.exists():
+        return None
+    for pattern in patterns:
+        for p in root.rglob(pattern):
+            if not p.is_file():
+                continue
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m < min_mtime:
+                continue
+            if m > newest_m:
+                newest = p
+                newest_m = m
+    return newest
+
+
+def _newest_matching_after_with_text(root: Path, patterns: tuple[str, ...], min_mtime: float, needle: str) -> Path | None:
+    matches: list[tuple[float, Path]] = []
+    if not root.exists():
+        return None
+    for pattern in patterns:
+        for p in root.rglob(pattern):
+            if not p.is_file():
+                continue
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m < min_mtime:
+                continue
+            matches.append((m, p))
+    for _, p in sorted(matches, key=lambda item: item[0], reverse=True):
+        if _file_contains(p, needle):
+            return p
+    return None
+
+
+def _write_completed_output(sandbox: Path, label: str, proc: subprocess.CompletedProcess[str]) -> tuple[Path, Path]:
+    stdout_file = sandbox / f"{label}.stdout.txt"
+    stderr_file = sandbox / f"{label}.stderr.txt"
+    stdout_file.write_text(proc.stdout or "")
+    stderr_file.write_text(proc.stderr or "")
+    return stdout_file, stderr_file
+
+
+def _timeout_result(sandbox: Path, label: str, timeout: int, exc: subprocess.TimeoutExpired) -> DriverResult:
+    stdout_file = sandbox / f"{label}.stdout.txt"
+    stderr_file = sandbox / f"{label}.stderr.txt"
+    stdout_file.write_text("")
+    stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+    return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+
+
+def _not_found_result(sandbox: Path, label: str, binary: str, exc: FileNotFoundError) -> DriverResult:
+    stdout_file = sandbox / f"{label}.stdout.txt"
+    stderr_file = sandbox / f"{label}.stderr.txt"
+    stdout_file.write_text("")
+    stderr_file.write_text(f"{binary} not found: {exc}")
+    return DriverResult(False, None, stdout_file, stderr_file, 127, f"{binary}_not_found")
+
+
+def _file_contains(path: Path, needle: str) -> bool:
+    try:
+        return needle in path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def _hermes_state_db_contains_recent_marker(path: Path, needle: str, min_started: float) -> bool:
+    try:
+        conn = sqlite3.connect(str(path))
+    except Exception:
+        return False
+    try:
+        message_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(messages);").fetchall()
+            if len(row) > 1
+        }
+        marker_columns = [
+            col
+            for col in ("content", "tool_calls", "codex_message_items", "codex_reasoning_items", "reasoning", "reasoning_content")
+            if col in message_columns
+        ]
+        if not marker_columns:
+            return False
+        marker_clause = " OR ".join(f"COALESCE(m.{col}, '') LIKE ?" for col in marker_columns)
+        row = conn.execute(
+            f"""
+            SELECT 1
+            FROM sessions s
+            JOIN messages m ON m.session_id = s.id
+            WHERE s.started_at >= ?
+              AND m.timestamp >= ?
+              AND ({marker_clause})
+            LIMIT 1;
+            """,
+            (min_started, min_started, *([f"%{needle}%"] * len(marker_columns))),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def make_sandbox(*, parent: Path, label: str) -> Path:
+    """Create a fresh temp directory inside *parent* to use as $HOME."""
+    parent.mkdir(parents=True, exist_ok=True)
+    sb = Path(tempfile.mkdtemp(prefix=f"agent-watch-prebump-{label}-", dir=str(parent)))
+    return sb
+
+
+def teardown_sandbox(sandbox: Path, *, keep: bool) -> None:
+    if keep:
+        return
+    shutil.rmtree(sandbox, ignore_errors=True)
+
+
+MAX_CREDENTIAL_BYTES = 64 * 1024
+MAX_CREDENTIAL_AGE_SECONDS = 90 * 86400
+
+
+class HygieneError(Exception):
+    """Raised when a credential file fails a hard hygiene gate."""
+
+
+def check_credential_hygiene(path: Path) -> list[str]:
+    """Run the three §4.4 gates on *path*.
+
+    Returns a list of non-fatal warnings. Raises HygieneError on any
+    hard failure (oversize, world/group readable).
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise HygieneError(f"cannot stat credential {path}: {exc}") from exc
+    if st.st_size > MAX_CREDENTIAL_BYTES:
+        raise HygieneError(
+            f"credential {path} is {st.st_size} bytes (> 64 KiB limit); "
+            f"refusing to copy a likely log/history file into sandbox"
+        )
+    mode_bits = stat.S_IMODE(st.st_mode)
+    if mode_bits & 0o077:
+        raise HygieneError(
+            f"credential {path} has mode {oct(mode_bits)}; require 0600 "
+            f"or stricter — run: chmod 600 {path}"
+        )
+    warnings: list[str] = []
+    age = time.time() - st.st_mtime
+    if age > MAX_CREDENTIAL_AGE_SECONDS:
+        warnings.append(
+            f"WARNING: credential {path} is older than 90 days; "
+            f"it may have expired — run re-auth if the driver reports auth errors"
+        )
+    return warnings
+
+
+def prepare_auth(
+    *,
+    prebump_cfg: dict,
+    sandbox: Path,
+    real_home: Path,
+) -> tuple[dict[str, str], list[str]]:
+    """Spec §4.4 env-var-first auth — the **single** auth path for all drivers.
+
+    Drivers MUST NOT build their own env from os.environ.copy(); they
+    receive the env dict produced here via _run_prebump.
+
+    Behavior:
+    1. Start from os.environ.copy() and pin HOME=str(sandbox).
+    2. If prebump_cfg["opencode_api_key"] names a provider, export that
+       provider's API key as the named env var. A value the caller already
+       exported wins. Otherwise the key comes from the provider's *active*
+       OpenCode 2.x credential (the `credential` table of the owner's
+       opencode.db, located by OPENCODE_DB, then XDG_DATA_HOME, then the
+       default path), chosen the way OpenCode chooses it. In this mode no
+       credential file is copied (step 4 is skipped): OpenCode 2.x would import
+       a legacy auth.json into the sandbox, and its saved accounts would win
+       over the env key. If the active credential is OAuth, or the
+       DB cannot be read, raise HygieneError: the probe must not run with no
+       key or under another account. SQLite extracts the key, so only the
+       selected `{"type": "key"}` value reaches this process and no OAuth
+       token is ever exported. This step runs before step 3 so an unrelated
+       provider env var cannot skip it.
+    3. If any env var listed under prebump_cfg["env_vars"] is set in
+       os.environ, forward it into the env dict and skip credential
+       copies entirely. (Env-var-first.)
+    4. Otherwise, for each path in prebump_cfg["credential_files"]:
+       expand ~ against real_home, run check_credential_hygiene
+       (raises HygieneError on hard failure → caller maps to exit 4),
+       and copy the file into the sandbox under its path relative to
+       real_home, clamping to mode 0600.
+    5. Copy non-secret support files listed under
+       prebump_cfg["support_files"] into the sandbox. These files provide
+       auth selection/account metadata and are size-limited, but do not use
+       strict credential mode gates because CLI settings are commonly 0644.
+
+    Returns (env, warnings). Raises HygieneError on hard failure.
+    """
+    env = os.environ.copy()
+    drop_names = set(prebump_cfg.get("drop_env") or [])
+    drop_prefixes = tuple(prebump_cfg.get("drop_env_prefixes") or [])
+    for key in list(env):
+        if key in drop_names or (drop_prefixes and key.startswith(drop_prefixes)):
+            del env[key]
+    env["HOME"] = str(sandbox)
+    warnings: list[str] = []
+
+    key_spec = prebump_cfg.get("opencode_api_key")
+    if isinstance(key_spec, dict):
+        provider = str(key_spec.get("provider") or "")
+        env_var = str(key_spec.get("env_var") or "")
+        if not provider or not env_var:
+            raise HygieneError("opencode_api_key needs both provider and env_var")
+        if not os.environ.get(env_var):
+            env[env_var] = _opencode_active_api_key(_opencode_source_db(real_home), provider)
+
+    env_vars = list(prebump_cfg.get("env_vars") or [])
+    for var in env_vars:
+        val = os.environ.get(var)
+        if val:
+            env[var] = val
+            return env, warnings
+
+    # In API-key mode the key above is the probe's only credential. OpenCode 2.x
+    # imports a legacy auth.json into its fresh sandbox database, and a saved
+    # account there would win over the env key (and could be OAuth).
+    cred_specs = [] if isinstance(key_spec, dict) else list(prebump_cfg.get("credential_files") or [])
+    for spec in cred_specs:
+        # Expand ~ against real_home so the call site does not have to.
+        if isinstance(spec, str) and spec.startswith("~/"):
+            cred = real_home / spec[2:]
+        else:
+            cred = Path(spec)
+        if not cred.exists():
+            continue
+        warnings.extend(check_credential_hygiene(cred))  # raises HygieneError
+        try:
+            rel = cred.relative_to(real_home)
+        except ValueError:
+            rel = Path(cred.name)
+        dst = sandbox / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cred, dst)
+        os.chmod(dst, 0o600)
+
+    support_specs = list(prebump_cfg.get("support_files") or [])
+    for spec in support_specs:
+        if isinstance(spec, str) and spec.startswith("~/"):
+            src = real_home / spec[2:]
+        else:
+            src = Path(spec)
+        if not src.exists() or not src.is_file():
+            continue
+        try:
+            if src.stat().st_size > 64 * 1024:
+                raise HygieneError(f"support file {src} is > 64 KiB")
+            rel = src.relative_to(real_home)
+        except ValueError:
+            rel = Path(src.name)
+        dst = sandbox / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o600)
+
+    return env, warnings
+
+
+# OpenCode 2.x resolves an integration's active credential as the first row in
+# this order (Credential.activate / Credential.create). Rows written before the
+# `active` column carry NULL, which sorts last, so the newest one wins.
+_OPENCODE_ACTIVE_CREDENTIAL_SQL = (
+    "SELECT CASE WHEN json_valid(value) THEN json_extract(value, '$.type') END,"
+    " CASE WHEN json_valid(value) AND json_extract(value, '$.type') = 'key'"
+    " THEN json_extract(value, '$.key') END"
+    " FROM credential WHERE integration_id = ?"
+    " ORDER BY active DESC, time_created DESC, id DESC LIMIT 1"
+)
+
+
+def _opencode_source_db(real_home: Path) -> Path:
+    """The owner's OpenCode database, found as OpenCode finds it: OPENCODE_DB,
+    then $XDG_DATA_HOME/opencode/opencode.db, then the default under real_home."""
+    explicit = os.environ.get("OPENCODE_DB")
+    if explicit:
+        return Path(explicit).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "opencode" / "opencode.db"
+    return real_home / ".local/share/opencode/opencode.db"
+
+
+def _opencode_active_api_key(db: Path, provider: str) -> str:
+    """The API key of the provider's active OpenCode 2.x credential.
+
+    Raises HygieneError when the DB is missing or unreadable, when the provider
+    has no credential, or when its active credential is not an API key.
+    """
+    if not db.is_file():
+        raise HygieneError(f"opencode_api_key: {db} not found")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(_OPENCODE_ACTIVE_CREDENTIAL_SQL, (provider,)).fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise HygieneError(f"opencode_api_key: cannot read {db}: {exc}") from exc
+    if row is None:
+        raise HygieneError(f"opencode_api_key: no credential for {provider!r}")
+    cred_type, key = row
+    if cred_type != "key":
+        raise HygieneError(
+            f"opencode_api_key: active {provider!r} credential is {cred_type or 'unparseable'}, not an API key"
+        )
+    if not isinstance(key, str) or not key:
+        raise HygieneError(f"opencode_api_key: active {provider!r} API key is empty")
+    return key
+
+
+class CodexExecDriver:
+    name = "codex_exec"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        codex_home = sandbox / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        # F2: env is built by prepare_auth in _run_prebump. The driver
+        # only adds CLI-specific HOME-relative pins; it never calls
+        # os.environ.copy().
+        env = dict(env)
+        env["CODEX_HOME"] = str(codex_home)
+        stdout_file = sandbox / "codex.stdout.txt"
+        stderr_file = sandbox / "codex.stderr.txt"
+        try:
+            proc = subprocess.run(
+                ["codex", "exec", "--sandbox", "read-only", prompt],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"codex not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "codex_not_found")
+
+        # Discover the newest rollout file under the sandboxed CODEX_HOME.
+        sessions_root = codex_home / "sessions"
+        newest: Path | None = None
+        newest_m = -1.0
+        if sessions_root.exists():
+            for p in sessions_root.rglob("rollout-*.jsonl"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_m:
+                    newest = p
+                    newest_m = m
+
+        if rc != 0 or newest is None:
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, f"codex_exec_failed rc={rc}")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["codex_exec"] = CodexExecDriver()
+
+
+class ClaudePrintDriver:
+    name = "claude_print"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        session_home = Path(env.get("AGENT_WATCH_SESSION_HOME", str(sandbox)))
+        claude_home = session_home / ".claude"
+        claude_home.mkdir(parents=True, exist_ok=True)
+        # F2: env comes from prepare_auth; do not call os.environ.copy().
+        env = dict(env)
+        session_id = str(_uuid.uuid4())
+        stdout_file = sandbox / "claude.stdout.txt"
+        stderr_file = sandbox / "claude.stderr.txt"
+        cmd = [
+            "claude", "-p",
+            "--verbose",
+            "--output-format", "stream-json",
+            "--session-id", session_id,
+        ]
+        model = env.get("AGENT_WATCH_MODEL")
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                env=env,
+                cwd=str(sandbox),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"claude not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "claude_not_found")
+
+        projects_root = claude_home / "projects"
+        newest: Path | None = None
+        newest_m = -1.0
+        if projects_root.exists():
+            for p in projects_root.rglob(f"{session_id}.jsonl"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_m:
+                    newest = p
+                    newest_m = m
+        if newest is not None:
+            try:
+                if newest.stat().st_mtime < run_started:
+                    newest = None
+            except OSError:
+                newest = None
+
+        if rc != 0 or newest is None:
+            err = f"claude_print_failed rc={rc}" if rc != 0 else "claude_no_run_session"
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, err)
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["claude_print"] = ClaudePrintDriver()
+
+
+class AntigravityPrintDriver:
+    name = "antigravity_print"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        session_home = Path(env.get("AGENT_WATCH_SESSION_HOME") or env.get("HOME") or str(sandbox))
+        brain_root = session_home / ".gemini" / "antigravity-cli" / "brain"
+        brain_root.mkdir(parents=True, exist_ok=True)
+        # F2: env comes from prepare_auth.
+        env = dict(env)
+        stdout_file = sandbox / "antigravity.stdout.txt"
+        stderr_file = sandbox / "antigravity.stderr.txt"
+        marker = f"AGENT_WATCH_PREBUMP_{_uuid.uuid4().hex}"
+        probe_prompt = f"{prompt}\n\nInclude this exact marker in your final answer: {marker}"
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                # Print mode cannot answer a permission prompt, so without this flag
+                # the tool call is denied and the session holds three records with
+                # no tool turn (2026-10-12: permanent blocked_thin_sample).
+                ["agy", "-p", probe_prompt, "--dangerously-skip-permissions"],
+                # Its tools act on the working directory with no permission prompt,
+                # so run it in the sandbox, never in the caller's checkout.
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"agy not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "agy_not_found")
+
+        newest = _newest_matching_after_with_text(
+            brain_root, ("*/.system_generated/logs/transcript.jsonl",), run_started, marker
+        )
+
+        if rc != 0 or newest is None:
+            if rc == 0 and marker in (proc.stdout or ""):
+                return DriverResult(False, newest, stdout_file, stderr_file, rc, "antigravity_no_transcript_artifact")
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, f"antigravity_print_failed rc={rc}")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["antigravity_print"] = AntigravityPrintDriver()
+
+
+class DroidExecDriver:
+    name = "droid_exec"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        factory_home = sandbox / ".factory"
+        factory_home.mkdir(parents=True, exist_ok=True)
+        # F2: env comes from prepare_auth.
+        env = dict(env)
+        stdout_file = sandbox / "droid.stdout.txt"
+        stderr_file = sandbox / "droid.stderr.txt"
+        try:
+            proc = subprocess.run(
+                ["droid", "exec", "--auto", "low", "--cwd", str(sandbox), prompt],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"droid not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "droid_not_found")
+
+        sessions_root = factory_home / "sessions"
+        newest: Path | None = None
+        newest_m = -1.0
+        if sessions_root.exists():
+            for p in sessions_root.rglob("*.jsonl"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_m:
+                    newest = p
+                    newest_m = m
+
+        if rc != 0 or newest is None:
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, f"droid_exec_failed rc={rc}")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["droid_exec"] = DroidExecDriver()
+
+
+class CopilotPromptDriver:
+    name = "copilot_prompt"
+
+    def _snapshot_real_home_copilot(self, real_home: Path) -> dict[str, float]:
+        root = real_home / ".copilot"
+        snap: dict[str, float] = {}
+        if not root.exists():
+            return snap
+        for p in root.rglob("*"):
+            try:
+                snap[str(p)] = p.stat().st_mtime
+            except OSError:
+                continue
+        return snap
+
+    def _find_leaks(self, real_home: Path, before: dict[str, float]) -> list[str]:
+        root = real_home / ".copilot"
+        leaks: list[str] = []
+        if not root.exists():
+            return leaks
+        for p in root.rglob("*"):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            prev = before.get(str(p))
+            if prev is None or m > prev:
+                leaks.append(str(p))
+        # Check for deleted files: paths in the pre-snapshot that no longer exist.
+        for path_str in before:
+            p = Path(path_str)
+            if not p.exists():
+                leaks.append(path_str)
+        return leaks
+
+    @staticmethod
+    def _gh_auth_token(sandbox: Path) -> str | None:
+        """Token from the locally authenticated gh CLI, or None.
+
+        Never logged or written to the report — it is only placed in the child env.
+        """
+        try:
+            proc = subprocess.run(
+                ["gh", "auth", "token"],
+                # Explicit env, matching every other subprocess call in this module.
+                # gh reads its own config/keyring, so the real environment is required.
+                cwd=str(sandbox),
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        token = (proc.stdout or "").strip()
+        return token or None
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        session_home = Path(env.get("AGENT_WATCH_SESSION_HOME", str(sandbox)))
+        using_real_session_home = session_home != sandbox
+        copilot_home = session_home / ".copilot"
+        copilot_home.mkdir(parents=True, exist_ok=True)
+        env = dict(env)
+        env["COPILOT_ALLOW_ALL"] = "1"
+        if not using_real_session_home:
+            # `--config-dir` is deprecated in favour of COPILOT_HOME (copilot warns on
+            # every invocation and the flag is slated to go away).
+            env["COPILOT_HOME"] = str(copilot_home)
+        # Env-var-first auth per the prebump policy. When none of the declared vars is
+        # set, fall back to the locally authenticated gh CLI — that is one of the three
+        # methods copilot's own "No authentication information found" error lists, and
+        # the previously declared credential file (~/.copilot/hosts.json) no longer
+        # exists, so without this the driver could never authenticate on a machine that
+        # signs in through gh.
+        if not any(env.get(v) for v in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
+            token = self._gh_auth_token(sandbox)
+            if token:
+                env["COPILOT_GITHUB_TOKEN"] = token
+        real_home = Path(os.environ.get("HOME", str(Path.home())))
+        pre = {} if using_real_session_home else self._snapshot_real_home_copilot(real_home)
+
+        stdout_file = sandbox / "copilot.stdout.txt"
+        stderr_file = sandbox / "copilot.stderr.txt"
+        marker = f"AGENT_WATCH_PREBUMP_{_uuid.uuid4().hex}"
+        probe_prompt = f"{prompt}\n\nInclude this exact marker in your final answer: {marker}"
+        cmd = ["copilot", "-p", probe_prompt, "--allow-all-tools"]
+        model = env.get("AGENT_WATCH_MODEL")
+        if model:
+            cmd.extend(["--model", model])
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"copilot not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "copilot_not_found")
+
+        leaks = [] if using_real_session_home else self._find_leaks(real_home, pre)
+        if leaks:
+            msg = "sandbox_breach: real ~/.copilot was modified during the run: " + ", ".join(leaks[:5])
+            stderr_file.write_text((stderr_file.read_text() if stderr_file.exists() else "") + "\n" + msg)
+            return DriverResult(False, None, stdout_file, stderr_file, rc, msg)
+
+        sessions_root = copilot_home / "session-state"
+        newest = _newest_matching_after_with_text(
+            sessions_root,
+            ("events.jsonl", "*.jsonl"),
+            run_started,
+            marker,
+        )
+
+        if rc != 0 or newest is None:
+            err = f"copilot_prompt_failed rc={rc}" if rc != 0 else "copilot_marker_missing"
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, err)
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["copilot_prompt"] = CopilotPromptDriver()
+
+
+def _opencode_major_version(env: dict[str, str]) -> int:
+    """Major version of the installed `opencode` (`opencode v2.1.1` -> 2); 1 when unknown."""
+    try:
+        proc = subprocess.run(
+            ["opencode", "--version"],
+            cwd=env.get("HOME"),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+    match = re.search(r"(\d+)\.\d+\.\d+", proc.stdout or "")
+    return int(match.group(1)) if match else 1
+
+
+class OpenCodeRunDriver:
+    name = "opencode_run"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        data_home = sandbox / ".local" / "share"
+        config_home = sandbox / ".config"
+        state_home = sandbox / ".local" / "state"
+        for root in (data_home, config_home, state_home):
+            root.mkdir(parents=True, exist_ok=True)
+        env = dict(env)
+        env["XDG_DATA_HOME"] = str(data_home)
+        env["XDG_CONFIG_HOME"] = str(config_home)
+        env["XDG_STATE_HOME"] = str(state_home)
+        # An inherited OPENCODE_* variable can point OpenCode outside the
+        # sandbox (OPENCODE_DB wins over XDG_DATA_HOME), so drop them all and
+        # pin the database inside the sandbox. This also covers `--version`.
+        for key in [k for k in env if k.startswith("OPENCODE_")]:
+            del env[key]
+        env["OPENCODE_DB"] = str(data_home / "opencode" / "opencode.db")
+        # Config `prebump.model` picks a provider whose sign-in works.
+        model_args = ["--model", env["AGENT_WATCH_MODEL"]] if env.get("AGENT_WATCH_MODEL") else []
+        if _opencode_major_version(env) >= 2:
+            # OpenCode 2.x removed --pure and --dir. Its default `run` connects
+            # to a per-user background service on a fixed port, which collides
+            # with the owner's live service and would outlive the sandbox;
+            # --standalone runs a private server for this one invocation.
+            # --auto approves the tool call that keeps the sample from being thin.
+            argv = ["opencode", "run", "--standalone", "--auto", "--format", "json", *model_args, prompt]
+        else:
+            argv = ["opencode", "run", "--pure", "--format", "json", "--dir", str(sandbox), *model_args, prompt]
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "opencode", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(sandbox, "opencode", "opencode", exc)
+
+        stdout_file, stderr_file = _write_completed_output(sandbox, "opencode", proc)
+        opencode_root = data_home / "opencode"
+        storage_root = opencode_root / "storage" / "session"
+        newest = _newest_matching_after(storage_root, ("ses_*.json",), run_started)
+        if newest is None:
+            db = opencode_root / "opencode.db"
+            try:
+                if db.is_file() and db.stat().st_mtime >= run_started:
+                    newest = db
+            except OSError:
+                pass
+        if proc.returncode != 0:
+            return DriverResult(False, newest, stdout_file, stderr_file, proc.returncode, f"opencode_run_failed rc={proc.returncode}")
+        if newest is None:
+            return DriverResult(False, None, stdout_file, stderr_file, proc.returncode, "opencode_no_session_store")
+        return DriverResult(True, newest, stdout_file, stderr_file, proc.returncode, None)
+
+
+DRIVERS["opencode_run"] = OpenCodeRunDriver()
+
+
+class OpenClawLocalAgentDriver:
+    name = "openclaw_local_agent"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        session_home = Path(env.get("AGENT_WATCH_SESSION_HOME", str(sandbox)))
+        state_dir = session_home / ".openclaw"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(env)
+        env["OPENCLAW_STATE_DIR"] = str(state_dir)
+        session_key = f"agent:main:prebump-{_uuid.uuid4()}"
+        marker = f"AGENT_WATCH_PREBUMP_{_uuid.uuid4().hex}"
+        probe_prompt = f"{prompt}\n\nInclude this exact marker in your final answer: {marker}"
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                [
+                    "openclaw",
+                    "agent",
+                    "--local",
+                    "--json",
+                    "--session-key",
+                    session_key,
+                    "--message",
+                    probe_prompt,
+                    "--timeout",
+                    str(timeout),
+                ],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout + 5,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "openclaw", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(sandbox, "openclaw", "openclaw", exc)
+
+        stdout_file, stderr_file = _write_completed_output(sandbox, "openclaw", proc)
+        agents_root = state_dir / "agents"
+        newest: Path | None = None
+        session_id: str | None = None
+        # 2026.10.5+ writes the transcript to the per-agent SQLite store, keyed by
+        # the --session-key this run passed.
+        found = _openclaw_sqlite_session_for_key(agents_root, session_key, marker)
+        if found is not None:
+            newest, session_id = found
+        elif agents_root.exists():
+            # Legacy JSONL store: only agents/<id>/sessions/*.jsonl. Never search
+            # deeper — agents/<id>/agent/codex-home/sessions/ holds the embedded
+            # Codex harness's rollouts, which carry the same prompt and marker.
+            candidates: list[tuple[float, Path]] = []
+            for p in agents_root.glob("*/sessions/*.jsonl"):
+                if p.name.endswith(".jsonl.lock") or p.name.endswith(".trajectory.jsonl"):
+                    continue
+                if ".jsonl.deleted." in p.name or ".jsonl.reset." in p.name:
+                    continue
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m < run_started:
+                    continue
+                candidates.append((m, p))
+            for _, p in sorted(candidates, key=lambda item: item[0], reverse=True):
+                if _openclaw_marker_in_reply(_openclaw_jsonl_lines(p), marker):
+                    newest = p
+                    break
+        if proc.returncode != 0:
+            return DriverResult(False, newest, stdout_file, stderr_file, proc.returncode, f"openclaw_local_agent_failed rc={proc.returncode}", session_id)
+        if newest is None:
+            return DriverResult(False, None, stdout_file, stderr_file, proc.returncode, "openclaw_marker_missing")
+        return DriverResult(True, newest, stdout_file, stderr_file, proc.returncode, None, session_id)
+
+
+def _openclaw_marker_in_reply(record_texts, marker: str) -> bool:
+    """True when the marker is in an assistant or tool-result record.
+
+    The prompt itself carries the marker, so finding it in the user record only
+    proves the prompt was stored, not that the agent ran a turn.
+    """
+    for text in record_texts:
+        if marker not in text:
+            continue
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        message = obj.get("message") if isinstance(obj, dict) else None
+        role = message.get("role") if isinstance(message, dict) else None
+        if isinstance(role, str) and role.lower() in ("assistant", "toolresult", "tool_result", "tool"):
+            return True
+    return False
+
+
+def _openclaw_jsonl_lines(path: Path):
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                yield line
+    except OSError:
+        return
+
+
+def _openclaw_event_text(event_json: object, event_zstd: object) -> str:
+    """One transcript_events record as text; a zstd row is decoded, a bad one is ''."""
+    if isinstance(event_json, str):
+        return event_json
+    if isinstance(event_zstd, (bytes, bytearray)) and event_zstd:
+        try:
+            from compression import zstd as _zstd  # Python 3.14+
+
+            return _zstd.decompress(bytes(event_zstd)).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    return ""
+
+
+def _openclaw_sqlite_session_for_key(
+    agents_root: Path, session_key: str, marker: str
+) -> tuple[Path, str] | None:
+    """The (store, session_id) a `--session-key` run wrote, if its transcript has the marker."""
+    if not agents_root.is_dir():
+        return None
+    for db in sorted(agents_root.glob("*/agent/openclaw-agent.sqlite")):
+        try:
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+        except sqlite3.Error:
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT session_id FROM session_windows WHERE session_key = ? "
+                "ORDER BY updated_at DESC;",
+                (session_key,),
+            ).fetchall()
+            columns = {str(r[1]) for r in conn.execute('PRAGMA table_info("transcript_events");')}
+            payload = "event_json, event_zstd" if "event_zstd" in columns else "event_json, NULL"
+            for (session_id,) in rows:
+                events = conn.execute(
+                    f"SELECT {payload} FROM transcript_events WHERE session_id = ? ORDER BY seq;",
+                    (session_id,),
+                )
+                if _openclaw_marker_in_reply((_openclaw_event_text(ej, ez) for ej, ez in events), marker):
+                    return db, str(session_id)
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.close()
+    return None
+
+
+DRIVERS["openclaw_local_agent"] = OpenClawLocalAgentDriver()
+
+
+class CursorAgentPrintDriver:
+    name = "cursor_agent_print"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        session_home = Path(env.get("AGENT_WATCH_SESSION_HOME", str(sandbox)))
+        cursor_home = session_home / ".cursor"
+        cursor_home.mkdir(parents=True, exist_ok=True)
+        env = dict(env)
+        marker = f"AGENT_WATCH_PREBUMP_{_uuid.uuid4().hex}"
+        probe_prompt = f"{prompt}\n\nInclude this exact marker in your final answer: {marker}"
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                [
+                    "cursor-agent",
+                    "--print",
+                    "--output-format",
+                    "stream-json",
+                    "--mode",
+                    "ask",
+                    "--trust",
+                    "--sandbox",
+                    "enabled",
+                    "--workspace",
+                    str(sandbox),
+                    probe_prompt,
+                ],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "cursor", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(sandbox, "cursor", "cursor-agent", exc)
+
+        stdout_file, stderr_file = _write_completed_output(sandbox, "cursor", proc)
+        newest = _newest_matching_after_with_text(cursor_home / "projects", ("*.jsonl",), run_started, marker)
+        if proc.returncode != 0:
+            return DriverResult(False, newest, stdout_file, stderr_file, proc.returncode, f"cursor_agent_print_failed rc={proc.returncode}")
+        if newest is None:
+            return DriverResult(False, None, stdout_file, stderr_file, proc.returncode, "cursor_marker_missing")
+        return DriverResult(True, newest, stdout_file, stderr_file, proc.returncode, None)
+
+
+DRIVERS["cursor_agent_print"] = CursorAgentPrintDriver()
+
+
+class HermesOneshotDriver:
+    name = "hermes_oneshot"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        session_home = Path(env.get("AGENT_WATCH_SESSION_HOME", str(sandbox)))
+        hermes_home = session_home / ".hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        marker = f"AGENT_WATCH_PREBUMP_{_uuid.uuid4().hex}"
+        marked_prompt = f"{prompt}\n\nInclude this exact marker in your final answer: {marker}"
+        env = dict(env)
+        env["HERMES_HOME"] = str(hermes_home)
+        env["HERMES_ACCEPT_HOOKS"] = "1"
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                [
+                    "hermes",
+                    "--oneshot",
+                    marked_prompt,
+                    "--accept-hooks",
+                    "--ignore-rules",
+                ],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "hermes", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(sandbox, "hermes", "hermes", exc)
+
+        stdout_file, stderr_file = _write_completed_output(sandbox, "hermes", proc)
+        newest = _newest_matching_after_with_text(hermes_home / "sessions", ("session_*.json",), run_started, marker)
+        db = hermes_home / "state.db"
+        if db.is_file():
+            db_fresh = False
+            for candidate in (db, hermes_home / "state.db-wal", hermes_home / "state.db-shm"):
+                try:
+                    if candidate.is_file() and candidate.stat().st_mtime >= run_started:
+                        db_fresh = True
+                        break
+                except OSError:
+                    continue
+            if db_fresh and _hermes_state_db_contains_recent_marker(db, marker, run_started):
+                try:
+                    os.utime(db, None)
+                except OSError:
+                    pass
+                if newest is None:
+                    newest = db
+                else:
+                    try:
+                        if db.stat().st_mtime > newest.stat().st_mtime:
+                            newest = db
+                    except OSError:
+                        newest = db
+        if proc.returncode != 0:
+            return DriverResult(False, newest, stdout_file, stderr_file, proc.returncode, f"hermes_oneshot_failed rc={proc.returncode}")
+        if newest is None:
+            return DriverResult(False, None, stdout_file, stderr_file, proc.returncode, "hermes_no_session_store")
+        return DriverResult(True, newest, stdout_file, stderr_file, proc.returncode, None)
+
+
+DRIVERS["hermes_oneshot"] = HermesOneshotDriver()
+
+
+class PiPromptDriver:
+    name = "pi_prompt"
+
+    @staticmethod
+    def _session_contains_tool_call(session_path: Path) -> bool:
+        """Require the fresh Pi transcript to contain a real assistant tool call."""
+        def normalized_block_type(value) -> str:
+            if not isinstance(value, str):
+                return ""
+            return value.strip().lower().replace("_", "").replace("-", "")
+
+        try:
+            with session_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for index, raw in enumerate(handle):
+                    if index >= 5000:
+                        break
+                    if len(raw) > 4 * 1024 * 1024:
+                        continue
+                    try:
+                        record = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict) or record.get("type") != "message":
+                        continue
+                    message = record.get("message")
+                    if not isinstance(message, dict) or message.get("role") != "assistant":
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, list) and any(
+                        isinstance(block, dict)
+                        and normalized_block_type(block.get("type")) == "toolcall"
+                        for block in content
+                    ):
+                        return True
+        except OSError:
+            return False
+        return False
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        pi_home = sandbox / ".pi" / "agent"
+        sessions_root = pi_home / "sessions"
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        env = dict(env)
+        env["PI_CODING_AGENT_DIR"] = str(pi_home)
+        env["PI_CODING_AGENT_SESSION_DIR"] = str(sessions_root)
+        stdout_file = sandbox / "pi.stdout.txt"
+        stderr_file = sandbox / "pi.stderr.txt"
+        session_id = str(_uuid.uuid4())
+        try:
+            proc = subprocess.run(
+                [
+                    "pi",
+                    "--print",
+                    "--mode", "json",
+                    "--session-dir", str(sessions_root),
+                    "--session-id", session_id,
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-themes",
+                    "--no-context-files",
+                    "--tools", "ls",
+                    # Config `prebump.model` picks a provider whose sign-in works.
+                    *(["--model", env["AGENT_WATCH_MODEL"]] if env.get("AGENT_WATCH_MODEL") else []),
+                    prompt,
+                ],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"pi not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "pi_not_found")
+
+        newest: Path | None = None
+        newest_m = -1.0
+        if sessions_root.exists():
+            for p in sessions_root.rglob("*.jsonl"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_m:
+                    newest = p
+                    newest_m = m
+
+        if rc != 0 or newest is None:
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, f"pi_prompt_failed rc={rc}")
+        if not self._session_contains_tool_call(newest):
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, "pi_tool_turn_missing")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["pi_prompt"] = PiPromptDriver()
+
+
+class KimiPromptDriver:
+    name = "kimi_prompt"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        kimi_home = sandbox / ".kimi-code"
+        sessions_root = kimi_home / "sessions"
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        # F2: env is built by prepare_auth in _run_prebump. The driver only
+        # adds CLI-specific HOME-relative pins; it never calls os.environ.copy().
+        env = dict(env)
+        env["KIMI_CODE_HOME"] = str(kimi_home)
+
+        # Kimi's own moonshot-ai/"kimi" provider gates every call on
+        # providerConfig.apiKey being present in the *loaded config*
+        # (packages/agent-core-v2/src/app/auth/auth.ts: AuthTokenMissingError
+        # otherwise) -- confirmed by reading dist/main.mjs. A bare KIMI_API_KEY
+        # env var with no config.toml on disk still fails with "provider
+        # moonshot-ai has no credential configured", so forwarding that var
+        # alone is not sufficient. kimi-code ships a purpose-built escape
+        # hatch for exactly this: KIMI_MODEL_NAME + KIMI_MODEL_API_KEY
+        # (applyEnvModelConfig) synthesize an in-memory-only provider+model
+        # that the CLI itself guarantees is never persisted back to
+        # config.toml (stripEnvModelConfig guards the getConfig->setConfig
+        # round-trip). Normalize whichever credential prepare_auth forwarded
+        # (env_vars-first: KIMI_API_KEY or KIMI_MODEL_API_KEY) into that
+        # shape. When prepare_auth instead copied a real
+        # ~/.kimi-code/config.toml via credential_files, neither var is set
+        # here and this block is a no-op -- the copied file's own
+        # default_model/providers already carry a real api_key.
+        # Endpoint and provider type come from the agent's prebump config
+        # (model_base_url / model_provider_type, forwarded as AGENT_WATCH_*),
+        # never baked in here: a user whose moonshot provider points at another
+        # region, a gateway, or a self-hosted proxy would otherwise have the
+        # sandbox authenticate against a backend they do not use — reported as a
+        # driver failure when nothing is wrong with the session format.
+        api_key = env.get("KIMI_MODEL_API_KEY") or env.get("KIMI_API_KEY")
+        if api_key:
+            env["KIMI_MODEL_API_KEY"] = api_key
+            env["KIMI_MODEL_NAME"] = env.get("AGENT_WATCH_MODEL") or "kimi-k2.7-code"
+            env.setdefault(
+                "KIMI_MODEL_PROVIDER_TYPE",
+                env.get("AGENT_WATCH_MODEL_PROVIDER_TYPE") or "kimi",
+            )
+            env.setdefault(
+                "KIMI_MODEL_BASE_URL",
+                env.get("AGENT_WATCH_MODEL_BASE_URL") or "https://api.moonshot.ai/v1",
+            )
+
+        stdout_file = sandbox / "kimi.stdout.txt"
+        stderr_file = sandbox / "kimi.stderr.txt"
+        try:
+            proc = subprocess.run(
+                ["kimi", "-p", prompt, "--output-format", "text"],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout_file.write_text("")
+            stderr_file.write_text(f"timeout after {timeout}s: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 124, f"timeout:{timeout}")
+        except FileNotFoundError as exc:
+            stderr_file.write_text(f"kimi not found: {exc}")
+            return DriverResult(False, None, stdout_file, stderr_file, 127, "kimi_not_found")
+
+        # Discover the newest main-agent wire.jsonl under the sandboxed
+        # KIMI_CODE_HOME. Restricted to agents/main/ (not agents/<subagent>/)
+        # to match the weekly local_schema glob
+        # (sessions/**/agents/main/wire.jsonl). A stray
+        # agents/agent-0/wire.jsonl must never win.
+        newest: Path | None = None
+        newest_m = -1.0
+        if sessions_root.exists():
+            for p in sessions_root.rglob("agents/main/wire.jsonl"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_m:
+                    newest = p
+                    newest_m = m
+
+        if rc != 0 or newest is None:
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, f"kimi_prompt_failed rc={rc}")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["kimi_prompt"] = KimiPromptDriver()
+
+
+class GrokSingleDriver:
+    """Grok Build headless single-turn run.
+
+    Grok was the last actively-monitored agent with no prebump driver, which capped it
+    at `supports_installed_only` permanently: without a fresh session from the installed
+    build, `supports_latest` is structurally unclaimable no matter how clean the weekly
+    scan looks.
+
+    Two things make this driver different from the others:
+
+    1. A Grok session is a DIRECTORY, not a file. `chat_history.jsonl` is only half of
+       it — the sibling `summary.json` carries everything discovery depends on, and
+       `GrokSessionDiscovery` skips any session directory that lacks it. The driver
+       therefore returns the transcript path but VERIFIES the sidecar exists first;
+       returning a transcript whose sidecar never landed would hand the fingerprinter a
+       half-written session and report the resulting gap as schema drift.
+    2. Grok has no API-key env var (its only documented one is GROK_SANDBOX), so the
+       env-var-first branch of prepare_auth can never fire. Auth is always the
+       credential-file copy of ~/.grok/auth.json into the sandbox HOME.
+
+    The run is hermetic: HOME is the sandbox, so ~/.grok/sessions lands inside it, and
+    `--cwd` pins the working directory to a sandbox subdirectory so the percent-encoded
+    workdir bucket is predictable and no real repository is ever the session's cwd.
+    """
+
+    name = "grok_single"
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        sessions_root = sandbox / ".grok" / "sessions"
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        workdir = sandbox / "workspace"
+        workdir.mkdir(parents=True, exist_ok=True)
+        # A file to look at, so a tool-using prompt has something real to do. A prompt
+        # that completes without calling a tool yields the four most basic event types
+        # and a genuinely thin sample.
+        (workdir / "README.md").write_text("agent-watch prebump probe\n", encoding="utf-8")
+
+        stdout_file = sandbox / "grok.stdout.txt"
+        stderr_file = sandbox / "grok.stderr.txt"
+        session_id = str(_uuid.uuid4())
+        try:
+            proc = subprocess.run(
+                [
+                    "grok",
+                    "-p", prompt,
+                    "--session-id", session_id,
+                    "--cwd", str(workdir),
+                    "--always-approve",
+                    "--disable-web-search",
+                    "--output-format", "plain",
+                ],
+                cwd=str(sandbox),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "grok", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(sandbox, "grok", "grok", exc)
+
+        # Prefer the session we named; fall back to newest so a Grok that ignores
+        # --session-id still produces evidence rather than a confusing "not found".
+        pinned = list(sessions_root.glob(f"*/{session_id}/chat_history.jsonl"))
+        newest: Path | None = pinned[0] if pinned else None
+        if newest is None:
+            newest_m = -1.0
+            for p in sessions_root.glob("*/*/chat_history.jsonl"):
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_m:
+                    newest = p
+                    newest_m = m
+
+        if rc != 0 or newest is None:
+            return DriverResult(False, newest, stdout_file, stderr_file, rc,
+                                f"grok_single_failed rc={rc}")
+        if not (newest.parent / "summary.json").exists():
+            # Half a session. See the class docstring: the sidecar is a discovery
+            # precondition, so a missing one is a driver failure, not clean evidence.
+            return DriverResult(False, newest, stdout_file, stderr_file, rc,
+                                "grok_summary_json_missing")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["grok_single"] = GrokSingleDriver()
+
+
+class DeepSeekHarnessHeadlessDriver:
+    """Run one bounded, tool-bearing DeepSeek Harness task in the real store.
+
+    DSH profiles, credentials, and durable sessions all live below DSH_HOME. Copying
+    selected files into a synthetic HOME would create a configuration that the user
+    does not actually run, so this driver deliberately requires the framework's
+    explicit ``--allow-real-home`` opt-in. The output logs remain in the disposable
+    prebump sandbox; only DSH's own session artifact is written to the real store.
+    """
+
+    name = "deepseek_harness_headless"
+    _MAX_DISCOVERY_ENTRIES = 10_000
+    _STORED_CREDENTIALS_OVERLAY = (
+        "- id: credentials\n  disabled: false\n"
+        "- id: authorization\n  disabled: false\n"
+        "- id: deepseek-account\n  disabled: false\n"
+    )
+
+    @staticmethod
+    def _sessions_root(env: dict[str, str]) -> Path:
+        configured = str(env.get("DSH_HOME") or "").strip()
+        if configured:
+            home = Path(configured).expanduser()
+        else:
+            session_home = Path(
+                env.get("AGENT_WATCH_SESSION_HOME")
+                or env.get("HOME")
+                or ""
+            )
+            home = session_home / ".dsh"
+        return home if home.name == "sessions" else home / "sessions"
+
+    @staticmethod
+    def _project_key(cwd: Path) -> str:
+        safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+        units = str(cwd).encode("utf-16-le", errors="surrogatepass")
+        pieces: list[str] = []
+        separator_run = False
+        for index in range(0, len(units), 2):
+            unit = units[index] | units[index + 1] << 8
+            if unit in (0x2F, 0x5C, 0x3A):
+                if not separator_run:
+                    pieces.append("-")
+                separator_run = True
+            elif unit < 128 and chr(unit) in safe:
+                pieces.append(chr(unit))
+                separator_run = False
+            else:
+                pieces.append(f"~{unit:04X}")
+                separator_run = False
+        slug = "".join(pieces).lstrip("-")[:251]
+        return "--" + (slug or "root") + "--"
+
+    @classmethod
+    def _snapshot_project(
+        cls, project_root: Path
+    ) -> tuple[dict[Path, tuple[int, int]], bool]:
+        snapshot: dict[Path, tuple[int, int]] = {}
+        if not project_root.exists():
+            return snapshot, False
+        entries = 0
+        try:
+            session_entries = os.scandir(project_root)
+        except OSError:
+            return snapshot, False
+        with session_entries:
+            for session_entry in session_entries:
+                entries += 1
+                if entries > cls._MAX_DISCOVERY_ENTRIES:
+                    return snapshot, True
+                try:
+                    if not session_entry.is_dir(follow_symlinks=False):
+                        continue
+                    artifact_entries = os.scandir(session_entry.path)
+                except OSError:
+                    continue
+                with artifact_entries:
+                    for artifact_entry in artifact_entries:
+                        entries += 1
+                        if entries > cls._MAX_DISCOVERY_ENTRIES:
+                            return snapshot, True
+                        if not re.fullmatch(
+                            r"session\.v[1-9][0-9]*\.jsonl(?:\.zstd)?",
+                            artifact_entry.name,
+                        ):
+                            continue
+                        try:
+                            if not artifact_entry.is_file(follow_symlinks=False):
+                                continue
+                            stat_result = artifact_entry.stat(follow_symlinks=False)
+                            path = Path(artifact_entry.path).resolve()
+                        except OSError:
+                            continue
+                        snapshot[path] = (
+                            stat_result.st_mtime_ns,
+                            stat_result.st_size,
+                        )
+        return snapshot, False
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        stdout_file = sandbox / "deepseek-harness.stdout.txt"
+        stderr_file = sandbox / "deepseek-harness.stderr.txt"
+        session_home = env.get("AGENT_WATCH_SESSION_HOME")
+        if not session_home:
+            stdout_file.write_text("")
+            stderr_file.write_text(
+                "DeepSeek Harness prebump requires --allow-real-home so the installed "
+                "profile, credentials, and durable session store stay authoritative."
+            )
+            return DriverResult(
+                False,
+                None,
+                stdout_file,
+                stderr_file,
+                4,
+                "sandbox_breach:dsh_requires_real_home",
+            )
+
+        workspace = sandbox / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "PREBUMP.txt").write_text(
+            "DeepSeek Harness agent-watch prebump probe\n", encoding="utf-8"
+        )
+        # DSH 0.2.1-rc.2's headless bundle disables the managed credential store,
+        # so the key saved through DSH's own Models page no longer resolves.
+        # Restore it for this invocation only with the upstream-documented
+        # overlay (packages/bundle/headless/README.md "Credentials"); the user's
+        # profile files are never edited.
+        overlay = sandbox / "dsh-stored-credentials.patch.yml"
+        overlay.write_text(self._STORED_CREDENTIALS_OVERLAY, encoding="utf-8")
+        sessions_root = self._sessions_root(env)
+        project_root = sessions_root / self._project_key(workspace.resolve())
+        before, scan_exhausted = self._snapshot_project(project_root)
+        if scan_exhausted:
+            stdout_file.write_text("")
+            stderr_file.write_text("DSH prebump project scan exceeded its entry limit")
+            return DriverResult(
+                False, None, stdout_file, stderr_file, 3, "dsh_session_scan_limit"
+            )
+        run_started_ns = time.time_ns()
+        try:
+            proc = subprocess.run(
+                ["dsh", "headless", "--patch", str(overlay), prompt],
+                cwd=workspace,
+                env=dict(env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "deepseek-harness", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(
+                sandbox, "deepseek-harness", "dsh", exc
+            )
+
+        after, scan_exhausted = self._snapshot_project(project_root)
+        if scan_exhausted:
+            return DriverResult(
+                False, None, stdout_file, stderr_file, rc, "dsh_session_scan_limit"
+            )
+        candidates: list[tuple[int, Path]] = []
+        for resolved, identity in after.items():
+            if identity == before.get(resolved):
+                continue
+            # Allow coarse filesystems a one-second timestamp margin while still
+            # requiring a new or changed artifact from this invocation and cwd.
+            if identity[0] + 1_000_000_000 < run_started_ns:
+                continue
+            candidates.append((identity[0], resolved))
+        newest = max(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+        if rc != 0 or newest is None:
+            error = (
+                f"deepseek_harness_headless_failed rc={rc}"
+                if rc != 0
+                else "deepseek_harness_no_fresh_session"
+            )
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, error)
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["deepseek_harness_headless"] = DeepSeekHarnessHeadlessDriver()
+
+
+class ClineHeadlessDriver:
+    """Cline CLI headless act-mode run that lands in the real session store.
+
+    Cline signs in with an OAuth account whose access token lives one hour and is
+    refreshed through the refresh token in ``settings/providers.json``. Copying that
+    file into a sandbox would let a sandboxed refresh rotate the owner's real refresh
+    token and sign the real CLI out, so this driver deliberately requires the
+    framework's ``--allow-real-home`` opt-in (config ``real_home_session: true``).
+
+    A session is a directory ``<epochms>_<id>/`` holding ``<id>.json`` (manifest) and
+    ``<id>.messages.json`` (transcript). The driver returns the manifest, which is what
+    the fingerprinter and the discovery contract both key on. It picks the session by
+    its working directory (a sandbox subdirectory seeded with ``a.txt``) and a manifest
+    mtime newer than the start of the run, so a concurrent Cline run in another
+    directory can never be mistaken for this one. It then requires a real tool call
+    and tool result in the transcript: a text-only reply is a thin sample, not evidence.
+    """
+
+    name = "cline_headless"
+    _AUTH_CUES = (
+        "not logged in", "not authenticated", "unauthorized", "sign in",
+        "re-authenticate", "authentication failed",
+    )
+
+    @staticmethod
+    def _sessions_root(env: dict[str, str]) -> Path:
+        configured = str(env.get("CLINE_DATA_DIR") or "").strip()
+        if configured:
+            data_dir = Path(os.path.expanduser(os.path.expandvars(configured)))
+        else:
+            session_home = Path(env.get("AGENT_WATCH_SESSION_HOME") or env.get("HOME") or "")
+            data_dir = session_home / ".cline" / "data"
+        return data_dir / "sessions"
+
+    @staticmethod
+    def _read_object(path: Path) -> dict | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @classmethod
+    def _transcript_has_tool_turn(cls, manifest: Path) -> bool:
+        """True when an assistant tool_use is answered by a tool_result block."""
+        transcript = cls._read_object(manifest.with_name(f"{manifest.stem}.messages.json"))
+        messages = transcript.get("messages") if transcript else None
+        if not isinstance(messages, list):
+            return False
+        saw_call = saw_result = False
+        for message in messages:
+            if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+                continue
+            for block in message["content"]:
+                if not isinstance(block, dict):
+                    continue
+                if message.get("role") == "assistant" and block.get("type") == "tool_use":
+                    saw_call = True
+                elif block.get("type") == "tool_result":
+                    saw_result = True
+        return saw_call and saw_result
+
+    @classmethod
+    def _find_session(cls, sessions_root: Path, workdir: Path, min_mtime: float) -> Path | None:
+        wanted = workdir.resolve()
+        newest: Path | None = None
+        newest_m = -1.0
+        if not sessions_root.is_dir():
+            return None
+        for session_dir in sessions_root.iterdir():
+            manifest = session_dir / f"{session_dir.name}.json"
+            try:
+                m = manifest.stat().st_mtime
+            except OSError:
+                continue
+            if m < min_mtime or m <= newest_m:
+                continue
+            data = cls._read_object(manifest)
+            cwd = data.get("cwd") if data else None
+            if not isinstance(cwd, str) or not cwd:
+                continue
+            try:
+                if Path(cwd).resolve() != wanted:
+                    continue
+            except OSError:
+                continue
+            newest, newest_m = manifest, m
+        return newest
+
+    def run(self, sandbox: Path, env: dict[str, str], prompt: str, timeout: int) -> DriverResult:
+        stdout_file = sandbox / "cline.stdout.txt"
+        stderr_file = sandbox / "cline.stderr.txt"
+        if not env.get("AGENT_WATCH_SESSION_HOME"):
+            stdout_file.write_text("")
+            stderr_file.write_text(
+                "Cline prebump requires --allow-real-home: the OAuth refresh token "
+                "must stay in the real ~/.cline store, never in a sandbox copy."
+            )
+            return DriverResult(
+                False, None, stdout_file, stderr_file, 4,
+                "sandbox_breach:cline_requires_real_home",
+            )
+
+        workdir = sandbox / "workspace"
+        workdir.mkdir(parents=True, exist_ok=True)
+        # A file to list and read, so the tool-using prompt has real work to do.
+        (workdir / "a.txt").write_text("agent-watch prebump probe\n", encoding="utf-8")
+        sessions_root = self._sessions_root(env)
+        run_started = time.time()
+        try:
+            proc = subprocess.run(
+                [
+                    "cline",
+                    # Let Cline stop itself before the harness timeout kills it mid-write.
+                    "-t", str(max(30, timeout - 20)),
+                    "--json",
+                    "-c", str(workdir),
+                    # Config `prebump.model` pins a free route; the owner's default may lose its promotion.
+                    *(["-m", env["AGENT_WATCH_MODEL"]] if env.get("AGENT_WATCH_MODEL") else []),
+                    prompt,
+                ],
+                cwd=workdir,
+                env=dict(env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            stdout_file.write_text(proc.stdout or "")
+            stderr_file.write_text(proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            return _timeout_result(sandbox, "cline", timeout, exc)
+        except FileNotFoundError as exc:
+            return _not_found_result(sandbox, "cline", "cline", exc)
+
+        newest = self._find_session(sessions_root, workdir, run_started - 2.0)
+        if rc != 0 or newest is None:
+            error = f"cline_headless_failed rc={rc}" if rc != 0 else "cline_no_fresh_session"
+            output = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+            if any(cue in output for cue in self._AUTH_CUES):
+                error += " authentication_failed"
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, error)
+        if not self._transcript_has_tool_turn(newest):
+            return DriverResult(False, newest, stdout_file, stderr_file, rc, "cline_tool_turn_missing")
+        return DriverResult(True, newest, stdout_file, stderr_file, rc, None)
+
+
+DRIVERS["cline_headless"] = ClineHeadlessDriver()

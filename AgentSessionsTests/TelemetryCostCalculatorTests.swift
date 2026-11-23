@@ -1,0 +1,534 @@
+import XCTest
+@testable import AgentSessions
+
+/// Pricing fails closed on purpose: a session's dollar figure exists to be compared
+/// against other sessions, and a partial sum corrupts that comparison invisibly.
+/// "Unavailable, because model X has no price" is honest and actionable; an
+/// understated number is neither.
+final class TelemetryCostCalculatorTests: XCTestCase {
+
+    /// The bundled table, with no cached manifest overlaid, so expectations here are
+    /// stable and hand-computable.
+    private func table() -> RunwayPriceTable {
+        RunwayPriceTable(loadBundled: true, readCache: false)
+    }
+
+    private let oneMillion = 1_000_000
+
+    private func slice(_ model: String?, speed: String = "standard",
+                       fresh: Int = 0, cacheRead: Int = 0, write5m: Int = 0,
+                       write1h: Int = 0, output: Int = 0) -> TelemetryUsageSlice {
+        TelemetryUsageSlice(model: model, reasoningEffort: nil, speed: speed,
+                            freshInputTokens: fresh, cacheReadTokens: cacheRead,
+                            cacheWrite5mTokens: write5m, cacheWrite1hTokens: write1h,
+                            outputTokens: output)
+    }
+
+    private func event(_ model: String, input: Int, context: Int?,
+                       speed: String = "standard",
+                       ownership: TelemetryUsageOwnership = .session,
+                       cacheRead: Int = 0, cacheWrite5m: Int = 0, cacheWrite1h: Int = 0,
+                       output: Int = 0, observedAt: Date? = Date()) -> TelemetryUsageEvent {
+        TelemetryUsageEvent(recordID: UUID().uuidString, observedAt: observedAt, anchorLine: 0,
+                            usageFamily: "token_count", ownership: ownership,
+                            model: model, reasoningEffort: "high", speed: speed,
+                            freshInputTokens: input, cacheReadTokens: cacheRead,
+                            cacheWrite5mTokens: cacheWrite5m, cacheWrite1hTokens: cacheWrite1h,
+                            outputTokens: output, contextInputTokens: context)
+    }
+
+    // MARK: - Priced
+
+    func testMixedModelSessionSumsPerSlice() {
+        // opus-5 standard: 1M fresh @ $5 + 1M output @ $25 = $30
+        // sonnet-5:        1M cache read @ $0.2 + 1M 1h write @ $4 = $4.20
+        let result = TelemetryCostCalculator.estimate(slices: [
+            slice("claude-opus-5", fresh: oneMillion, output: oneMillion),
+            slice("claude-sonnet-5", cacheRead: oneMillion, write1h: oneMillion)
+        ], priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.apiEquivalentUSD), 34.2, accuracy: 0.0001)
+        XCTAssertTrue(result.unpricedModels.isEmpty)
+        XCTAssertTrue(result.missingPriceComponents.isEmpty)
+    }
+
+    /// Fast mode is billed from its own rate set, not by scaling the standard one.
+    func testFastTierPricedFromFastRateSet() {
+        let fast = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-opus-5", speed: "fast", fresh: oneMillion, output: oneMillion)],
+            priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(fast.apiEquivalentUSD), 60.0, accuracy: 0.0001)
+
+        let standard = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-opus-5", fresh: oneMillion, output: oneMillion)],
+            priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(standard.apiEquivalentUSD), 30.0, accuracy: 0.0001)
+    }
+
+    func testStandardNormalizedTierUsesStandardRates() throws {
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-opus-5", speed: "standard-normalized",
+                           fresh: oneMillion, output: oneMillion)],
+            priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.apiEquivalentUSD), 30.0, accuracy: 0.0001)
+    }
+
+    func testUnknownSpeedIsUnpriceable() {
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-opus-5", speed: "future-tier", fresh: oneMillion)],
+            priceTable: table())
+        XCTAssertNil(result.apiEquivalentUSD)
+        XCTAssertEqual(result.missingPriceComponents, ["claude-opus-5:future-tier"])
+    }
+
+    func testUnknownEventSpeedIsUnpriceable() {
+        let result = TelemetryCostCalculator.price(
+            events: [event("claude-opus-5", input: oneMillion, context: oneMillion,
+                           speed: "future-tier")],
+            fallbackSlices: [], priceTable: table())
+        XCTAssertNil(result.estimate.apiEquivalentUSD)
+        XCTAssertEqual(result.estimate.missingPriceComponents, ["claude-opus-5:future-tier"])
+    }
+
+    func testLongestPrefixMatchPricesDatedSlug() {
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-sonnet-5-20260101", output: oneMillion)],
+            priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.apiEquivalentUSD), 10.0, accuracy: 0.0001)
+    }
+
+    func testPriceTableUpdatedIsStamped() {
+        let t = table()
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-opus-5", fresh: 10)], priceTable: t)
+        XCTAssertEqual(result.priceTableUpdated, t.updatedDate)
+        XCTAssertFalse(result.priceTableUpdated.isEmpty)
+        XCTAssertEqual(result.priceTableRevision, t.revision)
+        XCTAssertEqual(result.priceManifestFingerprint, t.manifestFingerprint)
+    }
+
+    func testRequestLevelPricingAppliesLongContextPerRequest() throws {
+        let t = table()
+        let result = TelemetryCostCalculator.price(
+            events: [
+                event("gpt-5.6-sol", input: 200_000, context: 200_000),
+                event("gpt-5.6-sol", input: 300_000, context: 300_000)
+            ],
+            fallbackSlices: [],
+            priceTable: t)
+        // $0.80 at the base $4/MTok + $2.40 at the long-context $8/MTok.
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 3.2, accuracy: 0.000001)
+        XCTAssertEqual(result.events.map(\.priceTableRevision), [t.revision, t.revision])
+        XCTAssertEqual(result.events.map(\.priceManifestFingerprint),
+                       [t.manifestFingerprint, t.manifestFingerprint])
+        XCTAssertEqual(result.events.compactMap(\.apiEquivalentUSD).reduce(0, +), 3.2, accuracy: 0.000001)
+    }
+
+    // MARK: - Rollups and long-context tiers
+    //
+    // An event with no request context (`contextInputTokens == nil`) may sum many
+    // requests. Every request's prompt is inside the event's input total, so when
+    // that total is at or below the threshold no request in it crossed the threshold.
+
+    /// gpt-6-luna base: $0.10 input, $0.01 cached input, $0.50 output per MTok.
+    func testRollupBelowLongContextThresholdIsPricedAtBaseRate() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [event("gpt-6-luna", input: 200_000, context: nil,
+                           cacheRead: 50_000, output: 10_000)],
+            fallbackSlices: [], priceTable: table())
+        // 200k × $0.10 + 50k × $0.01 + 10k × $0.50 = $0.0255 (the long rate would be $0.0475).
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 0.0255, accuracy: 1e-12)
+        XCTAssertEqual(result.estimate.missingPriceComponents, [])
+        XCTAssertEqual(try XCTUnwrap(result.events.first?.apiEquivalentUSD), 0.0255, accuracy: 1e-12)
+    }
+
+    func testRollupAboveLongContextThresholdIsRefusedWithReason() {
+        let result = TelemetryCostCalculator.price(
+            events: [event("gpt-6-luna", input: 200_000, context: nil,
+                           cacheRead: 72_001, output: 10_000)],
+            fallbackSlices: [], priceTable: table())
+        XCTAssertNil(result.estimate.apiEquivalentUSD)
+        XCTAssertEqual(result.estimate.missingPriceComponents, ["gpt-6-luna:contextInputTokens"])
+        XCTAssertNil(result.events.first?.apiEquivalentUSD)
+    }
+
+    /// The tier applies strictly above `thresholdInputTokens`, the same comparison
+    /// `RunwayModelPrice.rates(for:contextInputTokens:)` uses for one request.
+    func testRollupExactlyAtLongContextThresholdIsPricedAtBaseRate() throws {
+        let atThreshold = TelemetryCostCalculator.price(
+            events: [event("gpt-6-luna", input: 272_000, context: nil)],
+            fallbackSlices: [], priceTable: table())
+        // 272k × $0.10 = $0.0272.
+        XCTAssertEqual(try XCTUnwrap(atThreshold.estimate.apiEquivalentUSD), 0.0272, accuracy: 1e-12)
+
+        let oneOver = TelemetryCostCalculator.price(
+            events: [event("gpt-6-luna", input: 272_001, context: nil)],
+            fallbackSlices: [], priceTable: table())
+        XCTAssertNil(oneOver.estimate.apiEquivalentUSD)
+        XCTAssertEqual(oneOver.estimate.missingPriceComponents, ["gpt-6-luna:contextInputTokens"])
+    }
+
+    /// grok-4.6's tier starts when the prompt REACHES 200k, so the row stores the
+    /// exclusive threshold 199,999. A 199,999-token rollup is base; 200,000 is not.
+    func testRollupHonorsExclusiveThresholdEncoding() throws {
+        let below = TelemetryCostCalculator.price(
+            events: [event("grok-4.6", input: 199_999, context: nil)],
+            fallbackSlices: [], priceTable: table())
+        // 199,999 × $2.00 per MTok.
+        XCTAssertEqual(try XCTUnwrap(below.estimate.apiEquivalentUSD), 0.399998, accuracy: 1e-12)
+
+        let reaches = TelemetryCostCalculator.price(
+            events: [event("grok-4.6", input: 200_000, context: nil)],
+            fallbackSlices: [], priceTable: table())
+        XCTAssertNil(reaches.estimate.apiEquivalentUSD)
+        XCTAssertEqual(reaches.estimate.missingPriceComponents, ["grok-4.6:contextInputTokens"])
+    }
+
+    /// Cache reads and both cache-write kinds count toward the threshold.
+    func testRollupThresholdCountsCacheReadsAndWrites() {
+        for overflowing in [
+            event("gpt-6-luna", input: 270_000, context: nil, cacheRead: 2_001),
+            event("gpt-6-luna", input: 270_000, context: nil, cacheWrite5m: 2_001),
+            event("gpt-6-luna", input: 270_000, context: nil, cacheWrite1h: 2_001)
+        ] {
+            let result = TelemetryCostCalculator.price(events: [overflowing], fallbackSlices: [],
+                                                       priceTable: table())
+            XCTAssertNil(result.estimate.apiEquivalentUSD)
+            XCTAssertEqual(result.estimate.missingPriceComponents, ["gpt-6-luna:contextInputTokens"])
+        }
+    }
+
+    /// A negative component cannot bound anything; refuse instead of trusting it.
+    func testRollupWithNegativeComponentIsRefused() {
+        let result = TelemetryCostCalculator.price(
+            events: [event("gpt-6-luna", input: 300_000, context: nil, cacheRead: -100_000)],
+            fallbackSlices: [], priceTable: table())
+        XCTAssertNil(result.estimate.apiEquivalentUSD)
+        XCTAssertEqual(result.estimate.missingPriceComponents, ["gpt-6-luna:contextInputTokens"])
+    }
+
+    /// A recorded request context still selects the tier, even when the event's own
+    /// token counts are small: the rollup bound never replaces real evidence.
+    func testPerRequestContextAboveThresholdStillUsesLongRate() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [event("gpt-6-luna", input: 100_000, context: 300_000)],
+            fallbackSlices: [], priceTable: table())
+        // 100k × $0.20 (2x long-context input) = $0.02.
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 0.02, accuracy: 1e-12)
+    }
+
+    /// Slices are per-model sums, so the same bound applies on the fallback path.
+    func testSliceRollupBelowThresholdIsPricedAndAboveIsRefused() throws {
+        let below = TelemetryCostCalculator.estimate(
+            slices: [slice("gpt-6-luna", fresh: 200_000, cacheRead: 72_000, output: 10_000)],
+            priceTable: table())
+        // 200k × $0.10 + 72k × $0.01 + 10k × $0.50 = $0.02572.
+        XCTAssertEqual(try XCTUnwrap(below.apiEquivalentUSD), 0.02572, accuracy: 1e-12)
+
+        let above = TelemetryCostCalculator.estimate(
+            slices: [slice("gpt-6-luna", fresh: 200_000, cacheRead: 72_001, output: 10_000)],
+            priceTable: table())
+        XCTAssertNil(above.apiEquivalentUSD)
+        XCTAssertEqual(above.missingPriceComponents, ["gpt-6-luna:contextInputTokens"])
+    }
+
+    func testCodexStyleAsymmetricComponentsDoNotDoubleCountInput() throws {
+        // A raw Codex input total of 100k with 25k cached reads normalizes to
+        // 75k fresh input + 25k cache write + 10k output. At gpt-5.6's $4/$5/$20
+        // rates that is (75k*4 + 25k*5 + 10k*20) / 1M = $0.625.
+        let result = TelemetryCostCalculator.price(
+            events: [event("gpt-5.6", input: 75_000, context: 100_000,
+                           cacheWrite5m: 25_000, output: 10_000)],
+            fallbackSlices: [], priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 0.625, accuracy: 0.000000001)
+    }
+
+    func testDescendantEvidenceIsPricedButExcludedFromSessionTotal() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [
+                event("gpt-5.6-sol", input: 100_000, context: 100_000),
+                event("gpt-5.6-sol", input: 200_000, context: 200_000, ownership: .descendant)
+            ],
+            fallbackSlices: [],
+            priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 0.4, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(result.events[1].apiEquivalentUSD), 0.8, accuracy: 0.000001)
+    }
+
+    func testUnpricedDescendantDoesNotPoisonSessionTotal() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [
+                event("gpt-5.6-sol", input: 100_000, context: 100_000),
+                event("mystery-model-9", input: 100_000, context: 100_000, ownership: .descendant)
+            ],
+            fallbackSlices: [],
+            priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 0.4, accuracy: 0.000001)
+        XCTAssertTrue(result.estimate.unpricedModels.isEmpty)
+        XCTAssertNil(result.events[1].apiEquivalentUSD)
+    }
+
+    // MARK: - Fail closed
+
+    func testUnknownModelMakesWholeSessionUnavailable() {
+        let result = TelemetryCostCalculator.estimate(slices: [
+            slice("claude-opus-5", fresh: oneMillion, output: oneMillion),
+            slice("mystery-model-9", fresh: oneMillion)
+        ], priceTable: table())
+        XCTAssertNil(result.apiEquivalentUSD, "a partial total would understate, silently")
+        XCTAssertEqual(result.unpricedModels, ["mystery-model-9"])
+    }
+
+    func testNilModelWithTokensIsUnpriced() {
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice(nil, fresh: oneMillion)], priceTable: table())
+        XCTAssertNil(result.apiEquivalentUSD)
+        XCTAssertEqual(result.unpricedModels, ["(unknown)"])
+    }
+
+    /// A model with no fast rate set must NOT be billed at standard: silently
+    /// halving a fast session is the exact failure the tier split prevents.
+    func testFastRecordOnModelWithoutFastRatesIsUnavailable() {
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-sonnet-5", speed: "fast", fresh: oneMillion)],
+            priceTable: table())
+        XCTAssertNil(result.apiEquivalentUSD)
+        XCTAssertEqual(result.missingPriceComponents, ["claude-sonnet-5:fast"])
+    }
+
+    func testPositiveCacheWriteWithNoWriteRateIsUnavailable() {
+        // gpt-5.5 ships cacheWritePerMTok: null.
+        let result = TelemetryCostCalculator.price(
+            events: [event("gpt-5.5", input: 0, context: 0, cacheWrite5m: oneMillion)],
+            fallbackSlices: [], priceTable: table()).estimate
+        XCTAssertNil(result.apiEquivalentUSD)
+        XCTAssertEqual(result.missingPriceComponents, ["gpt-5.5:cacheWrite5m"])
+    }
+
+    func testPositiveOneHourWriteWithNoOneHourRateIsUnavailable() {
+        let usage = TelemetryUsageEvent(
+            recordID: "write-1h", observedAt: Date(), anchorLine: 0,
+            usageFamily: "message.usage", ownership: .session,
+            model: "gpt-5.5", reasoningEffort: nil, speed: "standard",
+            freshInputTokens: 0, cacheReadTokens: 0, cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: oneMillion, outputTokens: 0, contextInputTokens: 0)
+        let result = TelemetryCostCalculator.price(
+            events: [usage], fallbackSlices: [], priceTable: table()).estimate
+        XCTAssertNil(result.apiEquivalentUSD)
+        XCTAssertEqual(result.missingPriceComponents, ["gpt-5.5:cacheWrite1h"])
+    }
+
+    // MARK: - Escapes
+
+    /// A slice that never actually ran cannot make a real session unpriceable.
+    func testZeroTokenUnknownModelDoesNotPoisonResult() {
+        let result = TelemetryCostCalculator.estimate(slices: [
+            slice("claude-opus-5", fresh: oneMillion, output: oneMillion),
+            slice("mystery-model-9")
+        ], priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.apiEquivalentUSD), 30.0, accuracy: 0.0001)
+        XCTAssertTrue(result.unpricedModels.isEmpty)
+    }
+
+    /// Nothing to price is not a pricing failure — nil with no reasons.
+    func testNoSlicesIsUnavailableWithoutReasons() {
+        let result = TelemetryCostCalculator.estimate(slices: [], priceTable: table())
+        XCTAssertNil(result.apiEquivalentUSD)
+        XCTAssertTrue(result.unpricedModels.isEmpty)
+        XCTAssertTrue(result.missingPriceComponents.isEmpty)
+    }
+
+    func testDuplicateCausesReportedOnce() {
+        let result = TelemetryCostCalculator.estimate(slices: [
+            slice("mystery-model-9", fresh: 10),
+            slice("mystery-model-9", output: 10)
+        ], priceTable: table())
+        XCTAssertEqual(result.unpricedModels, ["mystery-model-9"])
+    }
+
+    // MARK: - Resolved keys and free routes
+
+    private func v2Snapshot() -> RunwayPriceSnapshot {
+        let t = RunwayPriceTable.makeEmptyForTesting()
+        let json = #"""
+        {"version":2,"sequence":1,"updated":"2026-10-13","aliases":{},
+         "models":{
+          "minimax-m2.5":{"inputPerMTok":1,"cachedInputPerMTok":0.1,"outputPerMTok":4},
+          "claude-sonnet-5":{"inputPerMTok":2,"cachedInputPerMTok":0.2,"outputPerMTok":10,"cacheWritePerMTok":2.5,"cacheWrite1hPerMTok":4},
+          "gpt-5":{"inputPerMTok":1.25,"cachedInputPerMTok":0.125,"outputPerMTok":10,"cacheWritePerMTok":null}}}
+        """#
+        XCTAssertTrue(t.loadForTesting(json: Data(json.utf8)))
+        return t.snapshot()
+    }
+
+    func testFreeRouteIsPricedAtTheBaseRateAndReported() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [event("minimax-m2.5-free", input: oneMillion, context: nil, output: oneMillion)],
+            fallbackSlices: [], snapshot: v2Snapshot())
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 5.0, accuracy: 0.0001)
+        XCTAssertEqual(result.estimate.freeRouteModels, ["minimax-m2.5-free"])
+    }
+
+    func testOneStealthModelMakesTheWholeSessionUnpriced() {
+        let result = TelemetryCostCalculator.price(
+            events: [event("minimax-m2.5", input: oneMillion, context: nil),
+                     event("big-pickle", input: oneMillion, context: nil)],
+            fallbackSlices: [], snapshot: v2Snapshot())
+        XCTAssertNil(result.estimate.apiEquivalentUSD)
+        XCTAssertEqual(result.estimate.unpricedModels, ["big-pickle"], "the raw slug is reported")
+    }
+
+    func testProviderPrefixedClaudeModelPrices() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [event("anthropic/claude-sonnet-5", input: oneMillion, context: nil)],
+            fallbackSlices: [], snapshot: v2Snapshot())
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 2.0, accuracy: 0.0001)
+        XCTAssertTrue(result.estimate.freeRouteModels.isEmpty)
+    }
+
+    // MARK: - Cache-write TTL evidence
+
+    func testUnverifiedTTLRefusesAModelThatPricesTheTwoWritesDifferently() {
+        let result = TelemetryCostCalculator.price(
+            events: [event("claude-sonnet-5", input: 10, context: nil, cacheWrite5m: 1_000)],
+            fallbackSlices: [], snapshot: v2Snapshot(), cacheWriteTTLVerified: false)
+        XCTAssertNil(result.estimate.apiEquivalentUSD)
+        XCTAssertEqual(result.estimate.missingPriceComponents, ["claude-sonnet-5:cacheWriteTTL"])
+    }
+
+    func testUnverifiedTTLDoesNotBlockEventsWithoutCacheWrites() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [event("claude-sonnet-5", input: oneMillion, context: nil)],
+            fallbackSlices: [], snapshot: v2Snapshot(), cacheWriteTTLVerified: false)
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 2.0, accuracy: 0.0001)
+    }
+
+    func testVerifiedTTLStillPricesCacheWrites() throws {
+        let result = TelemetryCostCalculator.price(
+            events: [event("claude-sonnet-5", input: 0, context: nil, cacheWrite5m: oneMillion)],
+            fallbackSlices: [], snapshot: v2Snapshot(), cacheWriteTTLVerified: true)
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 2.5, accuracy: 0.0001)
+    }
+
+    // MARK: - Sources that record no cache-write count
+
+    /// A source without a cache-write count may hide writes in its input count.
+    /// The event path refuses a row whose write rate differs from its input rate,
+    /// and still prices a row with no separate write rate or a write rate equal to input.
+    func testEventPathRefusesHiddenCacheWritesWhenTheRowBillsWritesDifferently() throws {
+        let refused = TelemetryCostCalculator.price(
+            events: [event("claude-sonnet-5", input: oneMillion, context: nil),
+                     event("gpt-5", input: oneMillion, context: nil)],
+            fallbackSlices: [], snapshot: v2Snapshot(), recordsCacheWrites: false)
+        XCTAssertNil(refused.estimate.apiEquivalentUSD)
+        XCTAssertEqual(refused.estimate.missingPriceComponents, ["claude-sonnet-5:cacheWrite"])
+
+        let priced = TelemetryCostCalculator.price(
+            events: [event("gpt-5", input: oneMillion, context: nil),
+                     event("minimax-m2.5", input: oneMillion, context: nil)],
+            fallbackSlices: [], snapshot: v2Snapshot(), recordsCacheWrites: false)
+        XCTAssertEqual(try XCTUnwrap(priced.estimate.apiEquivalentUSD), 2.25, accuracy: 0.0001)
+        XCTAssertEqual(priced.estimate.missingPriceComponents, [])
+    }
+
+    func testSlicePathRefusesHiddenCacheWritesWhenTheRowBillsWritesDifferently() throws {
+        let refused = TelemetryCostCalculator.price(
+            events: [],
+            fallbackSlices: [slice("claude-sonnet-5", fresh: oneMillion),
+                             slice("gpt-5", fresh: oneMillion)],
+            snapshot: v2Snapshot(), recordsCacheWrites: false)
+        XCTAssertNil(refused.estimate.apiEquivalentUSD)
+        XCTAssertEqual(refused.estimate.missingPriceComponents, ["claude-sonnet-5:cacheWrite"])
+
+        let priced = TelemetryCostCalculator.price(
+            events: [],
+            fallbackSlices: [slice("claude-sonnet-5", fresh: oneMillion)],
+            snapshot: v2Snapshot())
+        XCTAssertEqual(try XCTUnwrap(priced.estimate.apiEquivalentUSD), 2.0, accuracy: 0.0001,
+                       "a source that records its writes is unaffected")
+    }
+
+    // MARK: - Stored results from the previous build
+
+    func testCostEstimateWithoutFreeRouteFieldStillDecodes() throws {
+        let old = #"{"unpricedModels":[],"missingPriceComponents":[],"priceTableUpdated":"2026-10-11"}"#
+        let decoded = try JSONDecoder().decode(TelemetryCostEstimate.self, from: Data(old.utf8))
+        XCTAssertEqual(decoded.freeRouteModels, [])
+    }
+
+    func testUsageSummaryWithoutCostReasonStillDecodes() throws {
+        let old = #"{"topLineTokens":1,"hasComponentBreakdown":true,"usageFamilies":[],"usageFamilyConflict":false}"#
+        let decoded = try JSONDecoder().decode(TelemetryUsageSummary.self, from: Data(old.utf8))
+        XCTAssertNil(decoded.costUnavailableReason)
+    }
+
+    // MARK: - Dated price periods
+
+    /// Gemini 3.8 Flash: $0.75/$3.75 through 2026, $1.50/$7.50 from 2027-01-01 UTC.
+    private func utc(_ text: String) -> Date {
+        ISO8601DateFormatter().date(from: text)!
+    }
+
+    func testEventIsPricedAtTheRateInForceWhenItHappened() throws {
+        let before = event("gemini-3.8-flash", input: oneMillion, context: oneMillion,
+                           output: oneMillion, observedAt: utc("2026-12-31T23:59:59Z"))
+        let after = event("gemini-3.8-flash", input: oneMillion, context: oneMillion,
+                          output: oneMillion, observedAt: utc("2027-01-01T00:00:00Z"))
+        let result = TelemetryCostCalculator.price(events: [before, after], fallbackSlices: [],
+                                                   priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.events[0].apiEquivalentUSD), 4.5, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(result.events[1].apiEquivalentUSD), 9.0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(result.estimate.apiEquivalentUSD), 13.5, accuracy: 0.0001)
+    }
+
+    func testUntimedUsageUsesTheSessionIntervalWhenItStaysInOnePeriod() throws {
+        let untimed = event("gemini-3.8-flash", input: oneMillion, context: oneMillion,
+                            observedAt: nil)
+        let in2026 = TelemetryCostCalculator.price(
+            events: [untimed], fallbackSlices: [], priceTable: table(),
+            sessionInterval: utc("2026-11-01T10:00:00Z")...utc("2026-11-01T11:00:00Z"))
+        XCTAssertEqual(try XCTUnwrap(in2026.estimate.apiEquivalentUSD), 0.75, accuracy: 0.0001)
+
+        let slices = TelemetryCostCalculator.estimate(
+            slices: [slice("gemini-3.8-flash", fresh: oneMillion)], priceTable: table(),
+            sessionInterval: utc("2027-02-01T10:00:00Z")...utc("2027-02-01T11:00:00Z"))
+        XCTAssertEqual(try XCTUnwrap(slices.apiEquivalentUSD), 1.5, accuracy: 0.0001)
+    }
+
+    /// No time, or a session spanning the change: no single rate is right, so the
+    /// figure is unavailable instead of guessed.
+    func testUntimedUsageAcrossAPriceChangeIsUnavailable() {
+        let spanning = TelemetryCostCalculator.estimate(
+            slices: [slice("gemini-3.8-flash", fresh: oneMillion)], priceTable: table(),
+            sessionInterval: utc("2026-12-31T23:00:00Z")...utc("2027-01-01T01:00:00Z"))
+        XCTAssertNil(spanning.apiEquivalentUSD)
+        XCTAssertEqual(spanning.missingPriceComponents, ["gemini-3.8-flash:pricePeriod"])
+
+        let noTime = TelemetryCostCalculator.estimate(
+            slices: [slice("gemini-3.8-flash", fresh: oneMillion)], priceTable: table())
+        XCTAssertEqual(noTime.missingPriceComponents, ["gemini-3.8-flash:pricePeriod"])
+    }
+
+    /// A session total stamped with its last time (no per-request context) must not
+    /// be priced wholly at the rate of that last instant when the session spans a change.
+    func testRollupEventAcrossAPriceChangeIsUnavailable() throws {
+        let total = event("gemini-3.8-flash", input: oneMillion, context: nil,
+                          observedAt: utc("2027-01-01T00:30:00Z"))
+        let spanning = TelemetryCostCalculator.price(
+            events: [total], fallbackSlices: [], priceTable: table(),
+            sessionInterval: utc("2026-12-31T23:00:00Z")...utc("2027-01-01T00:30:00Z"))
+        XCTAssertNil(spanning.estimate.apiEquivalentUSD)
+        XCTAssertEqual(spanning.estimate.missingPriceComponents, ["gemini-3.8-flash:pricePeriod"])
+
+        let inside = TelemetryCostCalculator.price(
+            events: [total], fallbackSlices: [], priceTable: table(),
+            sessionInterval: utc("2027-01-01T00:10:00Z")...utc("2027-01-01T00:30:00Z"))
+        XCTAssertEqual(try XCTUnwrap(inside.estimate.apiEquivalentUSD), 1.5, accuracy: 0.0001)
+    }
+
+    /// A row without periods needs no time at all, as before.
+    func testRowWithoutPeriodsIgnoresTime() throws {
+        let result = TelemetryCostCalculator.estimate(
+            slices: [slice("claude-opus-5", fresh: oneMillion)], priceTable: table())
+        XCTAssertEqual(try XCTUnwrap(result.apiEquivalentUSD), 5, accuracy: 0.0001)
+    }
+}
