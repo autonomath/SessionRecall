@@ -43,7 +43,7 @@ SessionRecall indexes every part of every session and ranks the results, so a ro
 
 On 28 harder searches from the same Mac, typed from memory to find chats that had gone missing, the right chat came first once in Agent Sessions 6.6, twice in the Codex app and 15 times in SessionRecall. The [website](https://autonomath.github.io/SessionRecall/) lists every search, explains how each app was measured, and shows where each one falls short.
 
-These figures were measured against Agent Sessions 6.6. Version 7.0 reworked its search: it looks for every word you typed instead of the exact phrase, and Return checks each session file. It still lists matches newest first and shows no passage. It has not been measured here yet.
+These figures were measured against Agent Sessions 6.6. Agent Sessions 7.0, released on 23 November, looks for every word you type instead of the exact phrase, so it finds far more, but it still lists matches newest first and shows no passage. That night the same searches ran through 7.0 and SessionRecall 1.1 on one copy of the index, leaving out the chats that quote the searches: 7.0 put the right chat first in 1 of the 17 everyday searches and 6 of the 28 harder ones, SessionRecall in 16 and 20. Those are the results 7.0 shows as you type. Pressing Return makes it read every session file, which can add matches, still newest first.
 
 ## What makes the search different
 
