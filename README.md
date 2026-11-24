@@ -77,25 +77,25 @@ SessionRecall keeps all of Agent Sessions 7.0, including Economics in Analytics,
 
 ## Supported agents
 
-| Agent | Browse and search | Resume |
-|---|:---:|:---:|
-| Codex | Yes | Supported sessions |
-| Claude Code | Yes | Supported sessions |
-| Cursor | Yes | Supported sessions |
-| GitHub Copilot CLI | Yes | Supported sessions |
-| OpenCode | Yes | Supported sessions |
-| Antigravity | Yes | Supported sessions |
-| Pi | Yes | Supported sessions |
-| Kimi Code | Yes | Supported sessions |
-| Grok CLI | Yes | Supported sessions |
-| Hermes | Yes | Supported sessions |
-| OpenClaw | Yes | No |
-| Qwen Code | Yes | Active sessions; end-to-end unverified |
-| Devin CLI | Yes | Supported active sessions |
-| fx | Yes | Command plan tested; interactive reopen unverified |
-| Cline CLI and Desktop | Yes | No |
-| DeepSeek Harness | Yes | No |
-| Droid | Legacy sessions | No active monitoring |
+| Agent | History it reads | Resume |
+|---|---|---|
+| Codex | Desktop, CLI, VS Code | Supported sessions |
+| Claude Code | Claude Desktop, Claude Code CLI | Supported sessions |
+| Cursor | Agents Window, CLI | Supported sessions |
+| GitHub Copilot CLI | CLI | Supported sessions |
+| OpenCode | Desktop, TUI | Supported sessions |
+| Antigravity | Desktop, CLI | Supported sessions |
+| Pi | CLI | Supported sessions |
+| Kimi Code | CLI | Supported sessions |
+| Grok CLI | CLI | Supported sessions |
+| Hermes | CLI | Supported sessions |
+| OpenClaw | CLI | Browse only |
+| Qwen Code | CLI | Active sessions (end-to-end unverified) |
+| Devin CLI | CLI | Supported active sessions |
+| fx | CLI | Command tested (interactive reopen unverified) |
+| Cline | Desktop, CLI | Browse only |
+| DeepSeek Harness | CLI | Browse only |
+| Droid | Legacy CLI sessions | Browse only |
 
 Cline CLI and Cline Desktop support comes from Agent Sessions 5.4. DeepSeek Harness support is an independent integration, not an official partnership. Capabilities depend on what each agent records and on its installed version.
 
