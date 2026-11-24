@@ -29,6 +29,8 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: website
+      # The artifact list can lag the upload by a few seconds, and deploy-pages reads it at once.
+      - run: sleep 15
       - id: deployment
         uses: actions/deploy-pages@v4
 
