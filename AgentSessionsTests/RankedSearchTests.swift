@@ -512,9 +512,13 @@ final class RankedSearchTests: XCTestCase {
         var sessions = try await SessionMetaRepository(db: db).fetchSessions(for: .codex)
             .filter { CodexRolloutStorage.exists(atPath: $0.filePath) }
         // Chats run in the folder AS_SEARCH_GATE_SKIP_CWD names are left out, with their sub-agents:
-        // the chats that wrote a set of cases quote them word for word.
+        // the chats that wrote a set of cases quote them word for word. The chats the cases look
+        // for stay, wherever they ran.
         if let skip = ProcessInfo.processInfo.environment["AS_SEARCH_GATE_SKIP_CWD"], !skip.isEmpty {
-            let skipped = Set(sessions.filter { ($0.cwd ?? "").contains(skip) }.map(\.id))
+            let wanted = Set(cases.map(\.chat))
+            let skipped = Set(sessions.filter {
+                ($0.cwd ?? "").contains(skip) && !wanted.contains($0.codexInternalSessionIDHint ?? $0.id)
+            }.map(\.id))
             sessions.removeAll { skipped.contains($0.id) || $0.parentSessionID.map(skipped.contains) == true }
         }
 
