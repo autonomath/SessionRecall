@@ -1987,7 +1987,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         // Enter: explicit navigation onto the hidden match asks for Tools on.
         h.controller.applyFind(source: .local, query: "needle", matches: [needleMatch(block: 2)], token: 2,
                                direction: 1, reset: false, shouldJump: true)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1, "landing on it asks for Tools on")
 
         h.activeRoleFilters = Set(TranscriptRoleFilter.allCases)
@@ -1995,7 +1995,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         XCTAssertTrue(h.rowIDs.contains(1), "the invocation row shows")
         XCTAssertTrue(h.controller.isFlashing(rowID: 1), "and the jump lands on it")
         XCTAssertTrue(h.controller.openInvocations.contains(1))
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1)
     }
 
@@ -2016,7 +2016,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         // ⇧⌘G: explicit navigation.
         h.controller.applyFind(source: .local, query: "needle", matches: [needleMatch(block: 1)], token: 2,
                                direction: -1, reset: false, shouldJump: true)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1)
 
         h.activeRoleFilters = Set(TranscriptRoleFilter.allCases)
@@ -2062,7 +2062,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         // The auto-jump into a session opened from the list does.
         h.controller.applyFind(source: .unified, query: "chunk", matches: [], token: 2, direction: 1,
                                reset: true, shouldJump: true, revealsHidden: true)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1, "the raw hit asks for Tools on")
 
         h.activeRoleFilters = Set(TranscriptRoleFilter.allCases)
@@ -2107,7 +2107,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         h.controller.applyFind(source: .local, query: "needle",
                                matches: [needleMatch(block: 2), needleMatch(block: 3)], token: 2,
                                direction: 1, reset: false, shouldJump: true)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1)
     }
 
@@ -2126,7 +2126,7 @@ final class TranscriptToolCellsTests: XCTestCase {
 
         h.controller.applyFind(source: .local, query: "needle", matches: [needleMatch(block: 2)], token: 1,
                                direction: 1, reset: false, shouldJump: true)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1)
 
         h.activeRoleFilters = Set(TranscriptRoleFilter.allCases)
@@ -2150,7 +2150,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         let entered = h.controller.applyFind(source: .local, query: "needle", matches: matches, token: 2,
                                              direction: 1, reset: false, shouldJump: true)
         XCTAssertEqual(entered.current, 1, "the first Enter lands on the match typing could not show")
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1)
     }
 
@@ -2206,7 +2206,7 @@ final class TranscriptToolCellsTests: XCTestCase {
         h.replace(start + [bash("t1", "ls"), output("t1", "needle")])
         let arrived = h.controller.refreshFindAfterRowsChanged(matches: [needleMatch(block: 3)])
         XCTAssertEqual(arrived.current, 1)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        Self.runLoop(until: { requests >= 1 })
         XCTAssertEqual(requests, 1, "the waiting jump lands on the first match that arrives")
         h.activeRoleFilters = Set(TranscriptRoleFilter.allCases)
         h.reapply()
