@@ -1040,6 +1040,7 @@ final class OnboardingCoordinator: ObservableObject {
     /// Never fires on a fresh-install launch, and never asks again once the user
     /// has opened either contribution page.
     func shouldShowContributeCard() -> Bool {
+        if AppRuntime.isSessionRecall { return false }  // the format steward program belongs to Agent Sessions
         // The steward ask is this same invitation aimed at an agent we can see
         // the user runs, so it goes first whenever it has a target. It stays a
         // separate ask with its own lifecycle: spending it does not spend this
@@ -1163,6 +1164,7 @@ final class OnboardingCoordinator: ObservableObject {
     /// Never fires on a fresh-install launch, and never asks again once the user
     /// has opened the signup form or dismissed it.
     func shouldShowStewardCard() -> Bool {
+        if AppRuntime.isSessionRecall { return false }  // the format steward program belongs to Agent Sessions
         guard stewardAskTarget != nil else { return false }
         guard whatsNewMajorMinor == nil else { return false }
         guard !didConsumeTopSlotAskThisLaunch else { return false }
