@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Dedicated search-corpus ingest. Serial, .utility, yields between files.
 ///
@@ -77,19 +78,23 @@ actor SearchIngestService {
         /// directory (see `SessionSourceDescriptor.artifactRevision`). nil preserves the
         /// path-identified behavior used by ordinary transcript files.
         let manifestRevision: String?
+        /// Discovery owns metadata; ingestion never hydrates it on the UI executor.
+        let metadata: Session?
 
         init(path: String,
              mtime: Int64,
              size: Int64,
              sessionID: String? = nil,
              contentRevision: ContentRevision? = nil,
-             manifestRevision: String? = nil) {
+             manifestRevision: String? = nil,
+             metadata: Session? = nil) {
             self.path = path
             self.mtime = mtime
             self.size = size
             self.sessionID = sessionID
             self.contentRevision = contentRevision
             self.manifestRevision = manifestRevision
+            self.metadata = metadata.map { SearchCoordinator.searchRow($0, path: path) }
         }
 
         var searchMtime: Int64 { contentRevision?.updatedMillis ?? mtime }
@@ -103,6 +108,7 @@ actor SearchIngestService {
         let processed: Int
         let total: Int
         let skipped: Int
+        let unchangedIncomplete: Int
         /// Anchors whose directory-artifact revision no longer matches the FileRef
         /// (successor selected, or resolution failed). Deterministic in input order.
         /// Stale anchors are counted in `skipped`, never in `processed`.
@@ -111,10 +117,12 @@ actor SearchIngestService {
         init(processed: Int,
              total: Int,
              skipped: Int,
+             unchangedIncomplete: Int = 0,
              staleAnchorPaths: [String] = []) {
             self.processed = processed
             self.total = total
             self.skipped = skipped
+            self.unchangedIncomplete = unchangedIncomplete
             self.staleAnchorPaths = staleAnchorPaths
         }
     }
@@ -202,6 +210,7 @@ actor SearchIngestService {
 
     private let db: IndexDB
     private let claudeImageIndexCache: ImageBrowserIndexCache
+    private let economicsIndexer: (@Sendable (Session) async -> Void)?
 
     /// The migration scan is complete only after its marker commits. Image Browser
     /// invalidations are a separate retry obligation, including after that marker.
@@ -216,6 +225,20 @@ actor SearchIngestService {
     /// fall through to the full check rather than early-out.
     private var lastCleanAggregateBySource: [String: CleanIngestState] = [:]
 
+    private struct IncompleteJSONLState {
+        let dbGeneration: Int64
+        let revisionsByPath: [String: SearchSourceRevision.File]
+    }
+    private var incompleteJSONLBySource: [SessionSource: IncompleteJSONLState] = [:]
+    /// Sources whose last pass was cancelled or hit a time-dependent/transient
+    /// failure. The provider fingerprint can remain unchanged while a quiet or
+    /// cooldown gate expires, so the monitor must not suppress the next pass.
+    private struct RetryObligation {
+        /// nil means retry on the next monitor pass.
+        let notBefore: Date?
+    }
+    private var retryObligationBySource: [SessionSource: RetryObligation] = [:]
+
     /// Test-only observability: incremented each time the aggregate early-out fires
     /// (i.e. `ingest` returned after the cheap generation check but before touching
     /// `fetchIndexedFiles`/`fetchSearchReadyPaths`/`sessionSearchUpdatedAt`/toolIO
@@ -224,10 +247,28 @@ actor SearchIngestService {
     /// was actually taken rather than inferring it indirectly from `Progress` alone.
     private(set) var earlyOutHitCountForTesting = 0
 
-    init(db: IndexDB, claudeImageIndexCache: ImageBrowserIndexCache = ImageBrowserIndexCache()) {
+    init(db: IndexDB,
+         claudeImageIndexCache: ImageBrowserIndexCache = ImageBrowserIndexCache(),
+         economicsIndexer: (@Sendable (Session) async -> Void)? = nil) {
         self.db = db
         self.claudeImageIndexCache = claudeImageIndexCache
+        self.economicsIndexer = economicsIndexer
     }
+
+    func requiresRetry(for source: SessionSource) -> Bool {
+        retryObligationBySource[source] != nil
+    }
+
+    func retryIsDue(for source: SessionSource, now: Date = Date()) -> Bool {
+        guard let obligation = retryObligationBySource[source] else { return false }
+        return obligation.notBefore.map { now >= $0 } ?? true
+    }
+
+#if DEBUG
+    func setRetryObligationForTesting(for source: SessionSource, notBefore: Date?) {
+        retryObligationBySource[source] = RetryObligation(notBefore: notBefore)
+    }
+#endif
 
     /// Re-ingest cooldown tiers: a changed-but-quiet file is re-ingested at most
     /// this often. Big files cost a full parse to refresh a 48k-char sampled
@@ -270,6 +311,13 @@ actor SearchIngestService {
                 livePathAuthority: LivePathAuthority = .notApplicable) async throws -> Progress {
         let sourceRaw = source.rawValue
         let descriptor = source.descriptor
+        // A thrown or cancelled pass leaves this obligation in place. Only the
+        // completed paths below may clear it.
+        retryObligationBySource[source] = RetryObligation(notBefore: nil)
+        var preflightRetryRequired = false
+
+        // Sessions indexed before passages existed get theirs from the stored text, a few at a time.
+        while ((try? await db.fillPassages()) ?? 0) > 0 { try Task.checkCancellation() }
 
         // The scan marker and external image-cache invalidations have separate
         // lifetimes. Retry pending removals before the aggregate early-out even
@@ -284,7 +332,11 @@ actor SearchIngestService {
                 claudeRequestLogPendingInvalidations = !pending.isEmpty
             } catch {
                 // Non-fatal: the next Claude pass retries the failed cleanup.
+                preflightRetryRequired = true
             }
+            preflightRetryRequired = preflightRetryRequired
+                || !claudeRequestLogReindexDone
+                || claudeRequestLogPendingInvalidations
         }
 
         // Directory-artifact early-out guard: the remembered aggregate is keyed by the
@@ -332,13 +384,20 @@ actor SearchIngestService {
         // A read failure disables the optimization for this pass; it is never treated
         // as a matching generation.
         let dbGenerationAtStart = try? await db.searchIngestGeneration(source: sourceRaw)
-        if noFileInDangerZone,
+        let toolIOCutoffTS = Int64(Date().addingTimeInterval(-Double(FeatureFlags.toolIOIndexRecentDays) * 24 * 60 * 60).timeIntervalSince1970)
+        // A failed readiness read must never certify this source clean.
+        let requiredMigration = try await db.requiredSearchMigrations(
+            source: sourceRaw, includeToolIO: toolIOEnabled, toolIOCutoff: toolIOCutoffTS)
+        SearchResponsivenessMetrics.shared.record(.migrationCounts, counters: [.pendingMigrations: Int64(requiredMigration.sessionIDs.count)])
+        if !preflightRetryRequired,
+           requiredMigration.sessionIDs.isEmpty, noFileInDangerZone,
            artifactAnchorsCurrent,
            let lastClean = lastCleanAggregateBySource[sourceRaw],
            let dbGenerationAtStart,
            lastClean.dbGeneration == dbGenerationAtStart,
            lastClean.aggregate == incomingAggregate {
             earlyOutHitCountForTesting += 1
+            retryObligationBySource[source] = nil
             return Progress(processed: 0, total: files.count, skipped: files.count)
         }
 
@@ -375,7 +434,7 @@ actor SearchIngestService {
         let updatedAtBySessionID = usesSessionIdentity
             ? ((try? await db.sessionSearchUpdatedAtByID(for: sourceRaw)) ?? [:])
             : [:]
-        let toolIOCutoffTS = Int64(Date().addingTimeInterval(-Double(FeatureFlags.toolIOIndexRecentDays) * 24 * 60 * 60).timeIntervalSince1970)
+
         // refTS (COALESCE(end_ts, mtime)) per path, fetched once per ingest call — mirrors
         // the deleted `AnalyticsIndexer.indexFileIfNeeded`'s per-file `sessionRefTSForPath`
         // read (git show 31f6a619^), but batched. Used at the skip-gate below to tell
@@ -390,7 +449,22 @@ actor SearchIngestService {
 
         var processed = 0
         var skipped = 0
+        var unchangedIncomplete = 0
         var hadIngestFailure = false
+        var hadRetryableFailure = preflightRetryRequired
+        var retryImmediately = preflightRetryRequired
+        var earliestRetryDate: Date?
+        func markRetryRequired(notBefore: Date? = nil) {
+            hadRetryableFailure = true
+            guard let notBefore, !retryImmediately else {
+                retryImmediately = true
+                earliestRetryDate = nil
+                return
+            }
+            earliestRetryDate = min(earliestRetryDate ?? notBefore, notBefore)
+        }
+        let rememberedIncomplete = incompleteJSONLBySource[source]
+        var incompleteRevisions: [String: SearchSourceRevision.File] = [:]
         /// Deterministic (input-order) stale directory-artifact anchors seen this pass.
         var staleAnchorPaths: [String] = []
         /// Standardized selected paths committed by revision-aware ingests this pass.
@@ -413,6 +487,7 @@ actor SearchIngestService {
                     staleAnchorPaths.append(file.path)
                     skipped += 1
                     hadIngestFailure = true
+                    markRetryRequired()
                     if idx < files.count - 1 {
                         try? await Task.sleep(nanoseconds: yieldNanoseconds)
                     }
@@ -429,7 +504,11 @@ actor SearchIngestService {
             }
             let isCurrent = identityIsCurrent ?? pathIsCurrent
             let searchIsReady = identityIsCurrent ?? searchReadyPaths.contains(file.path)
-            if isCurrent, searchIsReady {
+            // Database-backed sessions share one path. A migration for one
+            // identity must not force that identity's current siblings to rescan.
+            let needsMigration = file.sessionID.map { requiredMigration.sessionIDs.contains($0) }
+                ?? requiredMigration.paths.contains(file.path)
+            if !needsMigration, isCurrent, searchIsReady {
                 // toolIO readiness is only a requirement for files that would actually
                 // receive a toolIO row. A file whose refTS is older than the toolIO
                 // recency window (`toolIOCutoffTS`) never gets one — `ingestFile` skips
@@ -485,12 +564,16 @@ actor SearchIngestService {
                     && updatedAtBySessionID[$0] != nil
             }
                 ?? (indexedByPath[file.path] != nil || searchReadyPaths.contains(file.path))
-            if hasExistingRow {
+            if hasExistingRow, !needsMigration {
                 // Clamp to zero: a future mtime (clock skew, or a test/fixture that
                 // deliberately sets mtime slightly ahead of "now") is "as hot as it
                 // gets", not exempt from the gate via a spuriously-negative age.
                 let age = max(0, nowTS - file.activityTimestamp)
                 if age < quietSeconds {
+                    hadIngestFailure = true
+                    markRetryRequired(notBefore: Date(
+                        timeIntervalSince1970: file.activityTimestamp + quietSeconds
+                    ))
                     skipped += 1
                     continue
                 }
@@ -508,7 +591,28 @@ actor SearchIngestService {
                 let lastTS = file.sessionID.flatMap { updatedAtBySessionID[$0] }
                     ?? updatedAtByPath[file.path]
                 if cooldown > 0, let lastTS, nowTS - Double(lastTS) < cooldown {
+                    hadIngestFailure = true
+                    markRetryRequired(notBefore: Date(
+                        timeIntervalSince1970: Double(lastTS) + cooldown
+                    ))
                     skipped += 1
+                    continue
+                }
+            }
+
+            if let rememberedIncomplete,
+               rememberedIncomplete.dbGeneration == dbGenerationAtStart,
+               let previous = rememberedIncomplete.revisionsByPath[file.path] {
+                let logicalURL = URL(fileURLWithPath: file.path).standardizedFileURL
+                let storageURL = source == .codex
+                    ? (CodexRolloutStorage.storageURL(for: logicalURL) ?? logicalURL)
+                    : logicalURL
+                if storageURL.resolvingSymlinksInPath().path == previous.path,
+                   SessionFileStat.precise(from: storageURL) == previous.stat {
+                    incompleteRevisions[file.path] = previous
+                    unchangedIncomplete += 1
+                    skipped += 1
+                    hadIngestFailure = true
                     continue
                 }
             }
@@ -524,10 +628,16 @@ actor SearchIngestService {
             case .parseFailed:
                 skipped += 1
                 hadIngestFailure = true
+                markRetryRequired()
+            case .incompleteJSONL(let revision):
+                incompleteRevisions[file.path] = revision
+                skipped += 1
+                hadIngestFailure = true
             case .staleAnchor:
                 staleAnchorPaths.append(file.path)
                 skipped += 1
                 hadIngestFailure = true
+                markRetryRequired()
             }
 
             if idx < files.count - 1 {
@@ -561,6 +671,7 @@ actor SearchIngestService {
                 }
             } catch {
                 hadIngestFailure = true
+                markRetryRequired()
             }
         }
 
@@ -601,6 +712,7 @@ actor SearchIngestService {
                     )
                 } catch {
                     hadIngestFailure = true
+                    markRetryRequired()
                 }
             } else {
                 // A failed provider-live read cannot authorize deletion or retirement.
@@ -616,10 +728,12 @@ actor SearchIngestService {
                     )
                 } catch {
                     hadIngestFailure = true
+                    markRetryRequired()
                 }
                 // Keep retrying after a provider read failure. Remembering this aggregate
                 // as clean would strand the persisted corpus indefinitely.
                 hadIngestFailure = true
+                markRetryRequired()
             }
         }
 
@@ -644,6 +758,7 @@ actor SearchIngestService {
             // Keep retrying: remembering this aggregate as clean would strand the
             // persisted corpus indefinitely.
             hadIngestFailure = true
+            markRetryRequired()
         case .authoritative(let livePaths):
             if hadIngestFailure {
                 break
@@ -655,25 +770,39 @@ actor SearchIngestService {
                 )
             } catch {
                 hadIngestFailure = true
+                markRetryRequired()
             }
         }
 
         // Reaching here means the pass ran to completion (no throw/cancellation
         // propagated out of the loop above) — safe to remember this source's
         // aggregate as the early-out baseline for the next kick.
-        if !hadIngestFailure,
-           let dbGenerationAtStart,
-           let dbGenerationAtEnd = try? await db.searchIngestGeneration(source: sourceRaw),
-           dbGenerationAtStart == dbGenerationAtEnd {
+        let dbGenerationAtEnd = try? await db.searchIngestGeneration(source: sourceRaw)
+        let currentGeneration = dbGenerationAtEnd == dbGenerationAtStart ? dbGenerationAtEnd : nil
+        if let currentGeneration, !incompleteRevisions.isEmpty {
+            incompleteJSONLBySource[source] = .init(dbGeneration: currentGeneration,
+                                                  revisionsByPath: incompleteRevisions)
+        } else {
+            incompleteJSONLBySource[source] = nil
+        }
+        if !hadIngestFailure, let currentGeneration {
             lastCleanAggregateBySource[sourceRaw] = CleanIngestState(
                 aggregate: incomingAggregate,
-                dbGeneration: dbGenerationAtEnd
+                dbGeneration: currentGeneration
             )
         } else {
             lastCleanAggregateBySource[sourceRaw] = nil
         }
+        if hadRetryableFailure {
+            retryObligationBySource[source] = RetryObligation(
+                notBefore: retryImmediately ? nil : earliestRetryDate
+            )
+        } else {
+            retryObligationBySource[source] = nil
+        }
 
         return Progress(processed: processed, total: total, skipped: skipped,
+                          unchangedIncomplete: unchangedIncomplete,
                           staleAnchorPaths: staleAnchorPaths)
     }
 
@@ -685,6 +814,7 @@ actor SearchIngestService {
     private enum IngestFileOutcome {
         case ingested(selectedPath: String)
         case parseFailed
+        case incompleteJSONL(SearchSourceRevision.File)
         case staleAnchor
     }
 
@@ -700,10 +830,10 @@ actor SearchIngestService {
         URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
-    /// Full-parses one file, builds search text, and upserts everything in a single
-    /// transaction. Parsed session lifetime is scoped to this call: it is released once
-    /// the function returns. `.ingested` carries the written session path; `.parseFailed`
-    /// and `.staleAnchor` both count as skipped rather than processed.
+    /// Full-parses one file in the ingestion lane, builds the text of every field, and commits
+    /// metadata, fields and passages atomically. The parsed session lives only for this call.
+    /// `.ingested` carries the written session path; `.parseFailed` and `.staleAnchor` both
+    /// count as skipped rather than processed.
     private func ingestFile(_ file: FileRef,
                              source: SessionSource,
                              sourceRaw: String,
@@ -713,9 +843,80 @@ actor SearchIngestService {
         let _span = Perf.begin("searchIngestFile", thresholdMs: 200, "path=\(url.lastPathComponent)")
         defer { Perf.end(_span) }
 
-        guard let session = Self.parseFileFull(url: url,
-                                               source: source,
-                                               sessionID: file.sessionID) else { return .parseFailed }
+        // The field index holds every field of a chat in full, so ingest reads it with the app's
+        // own parser. The bounded scanner stops at the first record over its limit, which would
+        // leave a chat with one large image or tool result out of the index altogether.
+        let storeSample = !(await db.fieldTablesExist())
+        let indexToolOutput = SearchPreferences.indexToolOutput
+        guard await SearchScanAdmission.shared.acquire(.ingestion) else { return .parseFailed }
+        struct Projection: Sendable {
+            let session: Session
+            let searchText: String
+            let toolIO: String?
+            let fields: [TranscriptField: String]
+            let skippedEvents: Int
+            let start: Date?
+            let end: Date?
+            let messages: Int
+            let commands: Int
+        }
+        let worker = Task.detached(priority: .utility) { () -> Projection? in
+            guard let parsed = Self.parseFileFull(url: url, source: source, sessionID: file.sessionID) else {
+                // The parser has nothing for this session, an empty one for instance. Take what
+                // the bounded scanner reads, so the session still counts as indexed.
+                var metadata = file.metadata
+                if metadata == nil, let id = file.sessionID {
+                    metadata = Session(id: id, source: source, startTime: nil, endTime: nil, model: nil,
+                                       filePath: file.path, eventCount: 0, events: [])
+                }
+                guard let row = metadata else { return nil }
+                var sample = SessionSearchTextBuilder.StreamSample()
+                var parts: [TranscriptField: [String]] = [:]
+                let summary = SearchSourceScanner.scanSegments(session: row, stopAtIncomplete: true) { segment in
+                    sample.consume(segment)
+                    guard segment.provenance == .source, segment.eventID != "metadata" else { return }
+                    switch segment.kind {
+                    case .title, .repository: break
+                    case .message: parts[.assistant, default: []].append(segment.text)
+                    case .toolName, .input: parts[.toolCall, default: []].append(segment.text)
+                    case .output, .error: if indexToolOutput { parts[.toolOutput, default: []].append(segment.text) }
+                    }
+                }
+                guard summary.complete, !Task.isCancelled else { return nil }
+                return Projection(
+                    session: row,
+                    searchText: storeSample ? sample.ordinary : "",
+                    toolIO: toolIOEnabled ? sample.toolIO : nil,
+                    fields: parts.mapValues { $0.joined(separator: "\n") },
+                    skippedEvents: 0,
+                    start: summary.firstTimestamp ?? row.startTime,
+                    end: summary.lastTimestamp ?? row.endTime,
+                    messages: summary.messages,
+                    commands: summary.commands)
+            }
+            guard !Task.isCancelled else { return nil }
+            var fields = SessionSearchTextBuilder.buildFields(session: parsed)
+            if !indexToolOutput { fields[.toolOutput] = nil }
+            let times = parsed.events.compactMap { $0.timestamp }
+            // Once the field index exists the sampled text goes unread: keep its row, store no text.
+            return Projection(
+                session: parsed,
+                searchText: storeSample ? SessionSearchTextBuilder.build(session: parsed) : "",
+                toolIO: toolIOEnabled ? SessionSearchTextBuilder.buildToolIO(session: parsed) : nil,
+                fields: fields,
+                skippedEvents: SessionSearchTextBuilder.skippedEventCount(session: parsed),
+                start: parsed.startTime ?? times.min(),
+                end: parsed.endTime ?? times.max(),
+                messages: parsed.events.filter { $0.kind != .meta }.count,
+                commands: parsed.events.filter { $0.kind == .tool_call }.count)
+        }
+        let projection = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+        await SearchScanAdmission.shared.release(.ingestion)
+        guard let projection, !Task.isCancelled else { return .parseFailed }
+        let session = projection.session
+        let searchText = projection.searchText
+        let fieldText = projection.fields
+        let skippedEvents = projection.skippedEvents
 
         // Post-parse anchor revalidation: the parse above is arbitrarily expensive, and
         // a successor generation may have been selected while it ran. Resolve again and
@@ -728,12 +929,11 @@ actor SearchIngestService {
             }
         }
 
-        let times = session.events.compactMap { $0.timestamp }
-        let start = session.startTime ?? times.min() ?? Date(timeIntervalSince1970: TimeInterval(file.mtime))
-        let end = session.endTime ?? times.max() ?? Date(timeIntervalSince1970: TimeInterval(file.mtime))
+        let start = projection.start ?? Date(timeIntervalSince1970: TimeInterval(file.mtime))
+        let end = projection.end ?? Date(timeIntervalSince1970: TimeInterval(file.mtime))
         let refTS = Int64(end.timeIntervalSince1970)
-        let messages = session.events.filter { $0.kind != .meta }.count
-        let commands = session.events.filter { $0.kind == .tool_call }.count
+        let messages = projection.messages
+        let commands = projection.commands
 
         let meta = SessionMetaRow(
             sessionID: session.id,
@@ -778,51 +978,48 @@ actor SearchIngestService {
             openClawPreviewDigest: session.sourcePreviewDigest
         )
 
-        // Once the field index exists the sampled text goes unread: keep its row, store no text.
-        let searchText = await db.fieldTablesExist() ? "" : SessionSearchTextBuilder.build(session: session)
-        var fieldText = SessionSearchTextBuilder.buildFields(session: session)
-        if !SearchPreferences.indexToolOutput { fieldText[.toolOutput] = nil }
+
         let toolIOText: String? = {
             guard toolIOEnabled else { return nil }
             guard refTS >= toolIOCutoffTS else { return nil }
-            return SessionSearchTextBuilder.buildToolIO(session: session)
+            return projection.toolIO
         }()
 
         do {
-            try await db.begin()
-            try await db.upsertFile(path: session.filePath, mtime: file.mtime, size: file.size, source: sourceRaw)
-            try await db.upsertSessionMeta(meta)
-            try await db.upsertSessionSearch(sessionID: session.id,
-                                             source: sourceRaw,
-                                             mtime: file.searchMtime,
-                                             size: file.searchSize,
-                                             text: searchText)
-            try await db.upsertSessionFields(sessionID: session.id, source: sourceRaw, fields: fieldText,
-                                             skipped: SessionSearchTextBuilder.skippedEventCount(session: session))
-            if let toolIOText {
-                try await db.upsertSessionToolIO(sessionID: session.id,
-                                                 source: sourceRaw,
-                                                 mtime: file.searchMtime,
-                                                 size: file.searchSize,
-                                                 refTS: refTS,
-                                                 text: toolIOText)
+            try await db.commitSearchIngest(SearchIngestDBWrite(
+                path: session.filePath,
+                fileMtime: file.mtime,
+                fileSize: file.size,
+                source: sourceRaw,
+                meta: meta,
+                searchMtime: file.searchMtime,
+                searchSize: file.searchSize,
+                searchText: searchText,
+                toolIO: toolIOText.map {
+                    SearchIngestDBWrite.ToolIO(referenceTimestamp: refTS, text: $0)
+                },
+                fields: fieldText,
+                skippedEvents: skippedEvents
+            ))
+            // Search ingest already established the authoritative session revision.
+            // Populate compact Economics evidence now so opening Analytics does not
+            // have to discover and reread every historical transcript. This is
+            // intentionally outside the search transaction: telemetry failure must
+            // not roll back a valid search row, and Economics can repair the miss.
+            if let economicsIndexer {
+                await economicsIndexer(file.metadata
+                    ?? SearchCoordinator.searchRow(session, path: session.filePath, parsedMetadata: true))
             }
-            try await db.commit()
             return .ingested(selectedPath: session.filePath)
         } catch {
-            await db.rollbackSilently()
             return .parseFailed
         }
     }
 
     // MARK: - Parser dispatch
 
-    /// Mirrors the deleted `AnalyticsIndexer.parseSession(url:source:)` dispatch
-    /// (git show 31f6a619). The twelve-arm switch that used to live here is now the
-    /// `parseFullByPath` closure on each source's descriptor — same throwaway-parser bodies,
-    /// arm for arm. A source whose descriptor declines path-identified parsing (`nil`, e.g. a
-    /// future DB-backed source where every session shares one path — SPEC §4) yields no
-    /// session, exactly as an unhandled source would have.
+    /// Each source's descriptor carries its full parser. A source whose descriptor declines
+    /// path-identified parsing (a store where every session shares one path) yields no session.
     private static func parseFileFull(url: URL,
                                       source: SessionSource,
                                       sessionID: String?) -> Session? {

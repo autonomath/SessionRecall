@@ -1472,12 +1472,14 @@ final class SessionTelemetryEngineTests: XCTestCase {
     func testPriceRevisionChangeInvalidatesCachedCost() async throws {
         let url = try write(codexLines())
         let prices = RunwayPriceTable.makeForTesting()
+        let initial = Data(#"{"version":2,"sequence":9999999998,"updated":"2098-01-01","models":{"gpt-5.6-codex":{"inputPerMTok":8,"cachedInputPerMTok":0.8,"outputPerMTok":40,"cacheWritePerMTok":10}}}"#.utf8)
+        XCTAssertTrue(prices.loadForTesting(json: initial))
         let engine = SessionTelemetryEngine(priceTable: prices)
         let firstValue = await engine.telemetry(for: session(url, source: .codex))
         let first = try XCTUnwrap(firstValue)
         let firstRevision = try XCTUnwrap(first.costEstimate?.priceTableRevision)
 
-        let replacement = Data(#"{"version":2,"sequence":9999999999,"updated":"2099-01-01","models":{"gpt-5.6-codex":{"inputPerMTok":8,"cachedInputPerMTok":0.8,"outputPerMTok":40,"cacheWritePerMTok":10}}}"#.utf8)
+        let replacement = Data(#"{"version":2,"sequence":9999999999,"updated":"2099-01-01","models":{"gpt-5.6-codex":{"inputPerMTok":8,"cachedInputPerMTok":0.8,"outputPerMTok":41,"cacheWritePerMTok":10}}}"#.utf8)
         XCTAssertTrue(prices.loadForTesting(json: replacement))
         let secondValue = await engine.telemetry(for: session(url, source: .codex))
         let second = try XCTUnwrap(secondValue)
@@ -1485,6 +1487,69 @@ final class SessionTelemetryEngineTests: XCTestCase {
         XCTAssertNotEqual(second.costEstimate?.priceTableRevision, firstRevision)
         XCTAssertEqual(engine.parseCount, 2, "same bytes must be re-priced after a manifest revision")
         XCTAssertEqual(second.usageEvents.first?.priceTableRevision, prices.revision)
+    }
+
+    func testIndexedEvidenceRepricesWithoutReopeningTranscript() async throws {
+        let url = try write(codexLines())
+        let prices = RunwayPriceTable.makeForTesting()
+        let initial = Data(#"{"version":2,"sequence":9999999998,"updated":"2098-01-01","models":{"gpt-5.6-codex":{"inputPerMTok":8,"cachedInputPerMTok":0.8,"outputPerMTok":40,"cacheWritePerMTok":10}}}"#.utf8)
+        XCTAssertTrue(prices.loadForTesting(json: initial))
+        let engine = SessionTelemetryEngine(priceTable: prices)
+        let selectedSession = session(url, source: .codex)
+        let evidenceValue = await engine.economicsIndexEvidence(for: selectedSession)
+        let evidence = try XCTUnwrap(evidenceValue)
+        let originalCost = try XCTUnwrap(evidence.telemetry.costEstimate?.apiEquivalentUSD)
+        XCTAssertEqual(engine.parseCount, 1)
+
+        let replacement = Data(#"{"version":2,"sequence":9999999999,"updated":"2099-01-01","models":{"gpt-5.6-codex":{"inputPerMTok":80,"cachedInputPerMTok":8,"outputPerMTok":400,"cacheWritePerMTok":100}}}"#.utf8)
+        XCTAssertTrue(prices.loadForTesting(json: replacement))
+
+        let repricedValue = engine.telemetry(fromIndexed: evidence, for: selectedSession)
+        let repriced = try XCTUnwrap(repricedValue)
+        XCTAssertNotEqual(repriced.costEstimate?.apiEquivalentUSD, originalCost)
+        XCTAssertEqual(repriced.costEstimate?.priceManifestFingerprint, prices.manifestFingerprint)
+        XCTAssertEqual(engine.parseCount, 1,
+                       "repricing persistent evidence must read zero transcript bytes")
+    }
+
+    func testEconomicsWarmEvidenceAndQuotaUseOneCapturedPriceSnapshot() async throws {
+        let url = try write(codexLines().map {
+            $0.replacingOccurrences(of: "gpt-5.6-codex", with: "gpt-5.5")
+        })
+        let prices = RunwayPriceTable.makeForTesting()
+        let initial = Data(#"{"version":2,"sequence":9999999998,"updated":"2098-01-01","models":{"gpt-5.5":{"inputPerMTok":5,"cachedInputPerMTok":0.5,"outputPerMTok":30,"cacheWritePerMTok":null}}}"#.utf8)
+        XCTAssertTrue(prices.loadForTesting(json: initial))
+        let captured = prices.snapshot()
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let reset = now.addingTimeInterval(604_800)
+        let quota = configuredCodexQuota(prices: prices, now: now, reset: reset)
+        let engine = SessionTelemetryEngine(priceTable: prices, quotaStore: quota, now: { now })
+        let selected = session(url, source: .codex)
+        let evidenceValue = await engine.economicsIndexEvidence(
+            for: selected,
+            priceSnapshot: captured
+        )
+        let evidence = try XCTUnwrap(evidenceValue)
+        let capturedCost = try XCTUnwrap(evidence.telemetry.costEstimate?.apiEquivalentUSD)
+
+        let replacement = Data(#"{"version":2,"sequence":9999999999,"updated":"2099-01-01","models":{"gpt-5.5":{"inputPerMTok":50,"cachedInputPerMTok":5,"outputPerMTok":300,"cacheWritePerMTok":null}}}"#.utf8)
+        XCTAssertTrue(prices.loadForTesting(json: replacement))
+
+        let warm = try XCTUnwrap(engine.telemetry(
+            fromIndexed: evidence,
+            for: selected,
+            verifiedRevisionKey: evidence.revisionKey,
+            priceSnapshot: captured
+        ))
+        XCTAssertEqual(warm.costEstimate?.apiEquivalentUSD, capturedCost)
+        XCTAssertEqual(warm.costEstimate?.priceTableUpdated, "2098-01-01")
+        XCTAssertNotNil(engine.economicsQuotaContext(
+            for: .codex,
+            now: now,
+            priceSnapshot: captured
+        ))
+        XCTAssertNil(engine.economicsQuotaContext(for: .codex, now: now),
+                     "a live revision must not validate quota learned from the captured revision")
     }
 
     func testPriceMetadataChangeInvalidatesCachedProvenance() async throws {
@@ -1579,6 +1644,32 @@ final class SessionTelemetryEngineTests: XCTestCase {
                        0.0175, accuracy: 0.000001)
     }
 
+    func testClaudeChildTranscriptUsesItsOwnSidechainConfigurationAndUsage() async throws {
+        let childDir = directory.appendingPathComponent("11111111-2222-4333-8444-555555555555/subagents")
+        try FileManager.default.createDirectory(at: childDir, withIntermediateDirectories: true)
+        let url = childDir.appendingPathComponent("agent-child.jsonl")
+        let lines = [
+            #"{"type":"assistant","agentId":"child","isSidechain":true,"effort":"high","perTurnEffort":"medium","message":{"model":"claude-fable-5-2","id":"m1","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            #"{"type":"assistant","agentId":"grandchild","isSidechain":true,"effort":"low","message":{"model":"claude-haiku-4-5","id":"m2","usage":{"input_tokens":20,"output_tokens":10}}}"#,
+            #"{"type":"assistant","isSidechain":true,"effort":"medium","message":{"model":"claude-fable-5-2","id":"m3","usage":{"input_tokens":30,"output_tokens":10}}}"#
+        ]
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+
+        let child = session(url, source: .claude)
+        let engine = SessionTelemetryEngine(priceTable: RunwayPriceTable.makeForTesting())
+        let result = await engine.telemetry(for: child)
+        let telemetry = try XCTUnwrap(result)
+        XCTAssertEqual(telemetry.initialConfiguration?.model, "claude-fable-5-2")
+        XCTAssertEqual(telemetry.currentConfiguration?.reasoningEffort, "medium")
+        XCTAssertTrue(telemetry.configurationChanges.isEmpty)
+        XCTAssertEqual(telemetry.usageEvents.map(\.ownership), [.session, .descendant, .session])
+        XCTAssertEqual(telemetry.descendantTopLineTokens, 30)
+        let facts = SessionInfoQuickFacts(session: child)
+        XCTAssertNil(facts.reasoningEffort.value)
+        XCTAssertEqual(TranscriptTelemetryPresentation.quickThinkingValue(facts.reasoningEffort,
+                                                                          telemetry: telemetry).text, "medium")
+    }
+
     func testClaudeWeeklyQuotaFailsClosedWithoutStableAccountIdentity() async throws {
         let url = try write(claudeLines())
         let prices = RunwayPriceTable.makeForTesting()
@@ -1631,6 +1722,35 @@ final class SessionTelemetryEngineTests: XCTestCase {
         XCTAssertEqual(estimate.calibrationProvenance?.origin, .bootstrap)
         XCTAssertEqual(estimate.calibrationProvenance?.accountHash,
                        WeeklyQuotaCalibrationScope.hashAccount("account-a"))
+    }
+
+    func testEconomicsUsesQuotaMeterLocalEstimateWithoutWeakeningSessionAttribution() async throws {
+        let url = try write(codexLines().map {
+            $0.replacingOccurrences(of: "gpt-5.6-codex", with: "gpt-5.5")
+        })
+        let prices = RunwayPriceTable.makeForTesting()
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let reset = now.addingTimeInterval(604_800)
+        let quota = configuredCodexQuota(prices: prices, now: now, reset: reset)
+        let engine = SessionTelemetryEngine(priceTable: prices, quotaStore: quota, now: { now })
+
+        let telemetryValue = await engine.telemetry(for: session(url, source: .codex))
+        let telemetry = try XCTUnwrap(telemetryValue)
+        XCTAssertEqual(telemetry.weeklyQuotaEstimate?.status, .unavailable,
+                       "session attribution must still require a durable account id")
+
+        let economics = try XCTUnwrap(engine.economicsQuotaContext(for: .codex, now: now))
+        XCTAssertEqual(economics.percentPointsPerDollar, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(economics.windowStart, now.addingTimeInterval(-3600))
+        XCTAssertEqual(economics.resetAt, reset)
+        XCTAssertTrue(economics.isLocalEstimate)
+        XCTAssertTrue(engine.economicsQuotaContextIsCurrent(economics, for: .codex))
+
+        quota.invalidateInMemoryScope(provider: "codex")
+
+        XCTAssertFalse(engine.economicsQuotaContextIsCurrent(economics, for: .codex),
+                       "a suspended Economics run must reject quota captured for an invalidated owner")
+        XCTAssertNil(engine.economicsQuotaContext(for: .codex, now: now))
     }
 
     func testCodexWeeklyQuotaFailsClosedForMismatchedDurableTranscriptAccount() async throws {

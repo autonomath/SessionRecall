@@ -55,10 +55,12 @@ enum FeatureFlags {
     // this version -- so finished sessions indexed before the fix would keep
     // their NULL cwd forever and stay invisible to the path filter. The bump is
     // what forces them to be re-ingested.
+    // SessionRecall numbers its own formats above Agent Sessions' (6 in 7.0), so an index
+    // written by either app is read again by the other.
     // 7: prompts tagged with only a turn id and delegated briefs reach the field index,
     // oversized events are counted, and the sampled text is no longer stored.
     static let sessionSearchFormatVersion: Int = 7
-    static let sessionToolIOFormatVersion: Int = 1
+    static let sessionToolIOFormatVersion: Int = 2
     static let transcriptPrewarmMaxSessionsPerRefresh: Int = 96
     static let transcriptPrewarmMaxSessionBytes: Int = 50 * 1024 * 1024
 

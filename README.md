@@ -7,7 +7,7 @@
 <p align="center"><b>Find the AI coding session you remember.</b><br>A free Mac app for everything your coding agents have done, with a search that puts the chat you meant first.</p>
 
 <p align="center">
-  <a href="https://github.com/autonomath/SessionRecall/releases/latest"><b>Download SessionRecall 1.0</b></a>
+  <a href="https://github.com/autonomath/SessionRecall/releases/latest"><b>Download SessionRecall 1.1</b></a>
   ·
   <a href="https://autonomath.github.io/SessionRecall/">Website</a>
   ·
@@ -43,10 +43,13 @@ SessionRecall indexes every part of every session and ranks the results, so a ro
 
 On 28 harder searches from the same Mac, typed from memory to find chats that had gone missing, the right chat came first once in Agent Sessions 6.6, twice in the Codex app and 15 times in SessionRecall. The [website](https://autonomath.github.io/SessionRecall/) lists every search, explains how each app was measured, and shows where each one falls short.
 
+These figures were measured against Agent Sessions 6.6. Version 7.0 reworked its search: it looks for every word you typed instead of the exact phrase, and Return checks each session file. It still lists matches newest first and shows no passage. It has not been measured here yet.
+
 ## What makes the search different
 
 - **Every part of a chat is indexed.** Titles, your prompts, the agent's replies, tool calls and tool output each get their own full-text index, with the whole text rather than a sample.
 - **Your words don't have to match exactly.** The exact phrase ranks highest, but any one of the words can match. The last word also matches longer words, so results appear while you type, and accents are ignored: "cafe" finds "café".
+- **A chat where your words sit together ranks higher.** Prompts and replies are also indexed as passages of about 1,500 characters, and a chat's best passage adds to its score, so the chat that says it in one place beats a long one that mentions each word somewhere.
 - **Results are ranked.** Each match is scored with BM25, the formula search engines use, so a rare word counts for more than a common one. Then it is weighted by where it was found: title ×4, your prompts ×3, replies ×2, tool calls ×1, tool output ×0.6.
 - **One row per chat, with the reason.** A long chat that Codex stored as several files shows up as one result. Each row says which part matched and shows the passage around your words.
 - **It opens on the match.** Clicking a result loads the chat, turns on tool output if that is where the word is, and scrolls to it.
@@ -55,13 +58,14 @@ On 28 harder searches from the same Mac, typed from memory to find chats that ha
 
 ## Everything else it does
 
-SessionRecall keeps all of Agent Sessions 6.6. The screenshots below come from Agent Sessions, which looks the same.
+SessionRecall keeps all of Agent Sessions 7.0, including Economics in Analytics, syntax color in tool output and search inside the session-list pane. The screenshots below come from Agent Sessions, which looks the same.
 
 <p align="center">
   <img src="docs/assets/sessions-main-window-with-current-quota.png" alt="The session list with Codex and Claude sessions, a transcript, and the floating Quota Meter" width="100%" style="max-width:960px;border-radius:8px;"/>
 </p>
 
 - **Every agent in one list.** Sessions from all supported agents sit side by side, with filters per agent and project.
+- **See the whole chat at a glance.** The Session view draws the chat as marks, down the side or across the top: your prompts, the replies, tool runs, and dots where your search matched. Point at a mark to read it, click to go there.
 - **Read the session.** Each turn shows your prompt and the agent's answer. Tool calls, failed ones included, sit behind the Tools chip, and Find searches all of it.
 - **Pick up where you left off.** Copy a resume command, or open a supported CLI session in Terminal.app, iTerm2, Warp, Ghostty or Macterm. Claude Code sessions can open in VS Code.
 - **See which session is burning your quota.** The Quota Meter shows live per-session Codex and Claude burn against the 5-hour and weekly limits, in the menu bar or beside the MacBook camera.
@@ -97,7 +101,7 @@ Cline CLI and Cline Desktop support comes from Agent Sessions 5.4. DeepSeek Harn
 
 ## Install
 
-1. Download **SessionRecall-1.0.1.dmg** from the [latest release](https://github.com/autonomath/SessionRecall/releases/latest).
+1. Download **SessionRecall-1.1.dmg** from the [latest release](https://github.com/autonomath/SessionRecall/releases/latest).
 2. Open it and drag SessionRecall to Applications. The app is signed with a Developer ID and notarized by Apple.
 3. Open SessionRecall. It finds your agents' session folders and builds its search index in the background. You can browse and search while it works.
 

@@ -211,6 +211,7 @@ enum PreferencesKey {
         static let enableReviewCards = "TranscriptEnableReviewCards"
         static let enableCodeDiffLineNumbers = "TranscriptEnableCodeDiffLineNumbers"
         static let enableLinkification = "TranscriptEnableLinkification"
+        static let historyPlacement = "TranscriptHistoryPlacement"
     }
 
     enum Cockpit {

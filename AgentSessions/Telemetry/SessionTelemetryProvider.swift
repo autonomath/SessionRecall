@@ -15,6 +15,24 @@ struct SessionTelemetryProviderResult: Sendable {
 enum SessionTelemetryRevision: Hashable, Sendable {
     case file(RunwayFileSignature)
     case logical(String)
+
+    /// Stable, locale-independent identity persisted by the Economics index.
+    /// A file mtime uses its exact IEEE-754 bit pattern rather than a formatted
+    /// decimal, so a warm lookup cannot accidentally accept a nearby revision.
+    var economicsPersistenceKey: String {
+        switch self {
+        case .file(let signature):
+            return "file:\(signature.mtime.bitPattern):\(signature.size)"
+        case .logical(let revision):
+            return "logical:\(revision)"
+        }
+    }
+}
+
+struct SessionTelemetryIndexEvidence: Sendable {
+    let telemetry: SessionTelemetry
+    let durableAccountHash: String?
+    let revisionKey: String
 }
 
 /// Result of a registry-owned non-JSONL telemetry scan.
@@ -53,8 +71,13 @@ struct SessionTelemetryProviderScan: Sendable {
 /// keeps the engine provider-neutral: adding a parser changes one source descriptor
 /// and one provider, not a second engine switch.
 protocol SessionTelemetryProvider {
+    mutating func prepare(for url: URL)
     mutating func consume(line: String, index: Int)
     func finish() -> SessionTelemetryProviderResult
+}
+
+extension SessionTelemetryProvider {
+    mutating func prepare(for url: URL) {}
 }
 
 struct CodexTelemetryProvider: SessionTelemetryProvider {
@@ -74,6 +97,10 @@ struct CodexTelemetryProvider: SessionTelemetryProvider {
 
 struct ClaudeTelemetryProvider: SessionTelemetryProvider {
     private var accumulator = ClaudeTelemetryAccumulator()
+
+    mutating func prepare(for url: URL) {
+        accumulator = ClaudeTelemetryAccumulator(subagentID: ClaudeSessionParser.subagentID(for: url))
+    }
 
     mutating func consume(line: String, index: Int) {
         accumulator.consume(line: line, index: index)

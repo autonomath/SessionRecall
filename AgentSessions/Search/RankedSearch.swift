@@ -63,15 +63,46 @@ struct SearchHit: Equatable, Sendable {
     var also: [TranscriptField] = []
     /// The passage comes from one of the chat's sub-agents, folded into this row.
     var inSubagent = false
+    /// The text the excerpt's first match starts, for landing there when the chat opens.
+    var anchor: String? = nil
 
-    /// The passage around the first match of query in text, with the match marked.
+    /// The part of text where most of the query's words sit together, with each match marked.
     static func excerpt(in text: String, query: String) -> String? {
-        guard let match = SearchTextMatcher.matchRanges(in: text, query: query).first,
-              let range = Range(match, in: text) else { return nil }
-        let before = text[..<range.lowerBound].suffix(80)
-        let after = text[range.upperBound...].prefix(160)
-        let marked = "\(before)\(markStart)\(text[range])\(markEnd)\(after)"
-        return focused(marked.split(whereSeparator: \.isWhitespace).joined(separator: " "))
+        excerptAndAnchor(in: text, query: query)?.excerpt
+    }
+
+    /// The excerpt, and the text its first match starts (up to the line end), which finds
+    /// the same place in the transcript.
+    static func excerptAndAnchor(in text: String, query: String) -> (excerpt: String, anchor: String)? {
+        let matches = SearchTextMatcher.matchRanges(in: text, query: query).sorted { $0.location < $1.location }
+        guard !matches.isEmpty else { return nil }
+        let ns = text as NSString
+        let reach = 160
+        // Start at the match followed by the most different words within reach.
+        var first = matches[0], most = 0
+        for (i, match) in matches.enumerated() {
+            var words = Set<String>()
+            for next in matches[i...] {
+                guard next.location < match.location + reach else { break }
+                words.insert(ns.substring(with: next).lowercased())
+            }
+            if words.count > most { first = match; most = words.count }
+        }
+        let from = max(0, first.location - 80)
+        let window = ns.rangeOfComposedCharacterSequences(
+            for: NSRange(location: from, length: min(ns.length, NSMaxRange(first) + reach) - from))
+        var marked = ns.substring(with: NSRange(location: window.location, length: first.location - window.location))
+        var cursor = first.location
+        for match in matches where match.location >= cursor && NSMaxRange(match) <= NSMaxRange(window) {
+            marked += ns.substring(with: NSRange(location: cursor, length: match.location - cursor))
+            marked += "\(markStart)\(ns.substring(with: match))\(markEnd)"
+            cursor = NSMaxRange(match)
+        }
+        marked += ns.substring(with: NSRange(location: cursor, length: NSMaxRange(window) - cursor))
+        let tail = ns.substring(with: ns.rangeOfComposedCharacterSequences(
+            for: NSRange(location: first.location, length: min(48, ns.length - first.location))))
+        return (focused(marked.split(whereSeparator: \.isWhitespace).joined(separator: " ")),
+                String(tail.prefix { !$0.isNewline }))
     }
 
     /// Cuts the lead-in to a few words so the match stays visible in a narrow row.
@@ -92,6 +123,39 @@ struct SearchHit: Equatable, Sendable {
         out = out.replacingOccurrences(of: " | ", with: " · ").replacingOccurrences(of: "|", with: " ")
         out = out.replacingOccurrences(of: #"(^|\s)(#{1,6}|>)\s"#, with: "$1", options: .regularExpression)
         return out.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+}
+
+/// Cuts prompt or reply text into the passages search scores on their own.
+enum Passages {
+    static let size = 1_500
+    static let overlap = 300
+
+    /// Ranges of at most size characters (one more with a line break) that break at line ends
+    /// and repeat the last overlap characters, so words near a cut still sit together in one.
+    static func ranges(in text: [Unicode.Scalar]) -> [Range<Int>] {
+        let step = size - overlap
+        var out: [Range<Int>] = []
+        var start = 0, end = 0  // the passage being filled; empty while start == end
+        var line = 0
+        while line <= text.count {
+            var lineEnd = line
+            while lineEnd < text.count, text[lineEnd] != "\n" { lineEnd += 1 }
+            var unit = line
+            repeat {
+                let unitEnd = min(unit + step, lineEnd)  // a very long line is cut every step characters
+                if end > start, unitEnd - start > size {
+                    out.append(start..<end)
+                    start = max(start, end - overlap)
+                }
+                if end == start { start = unit }
+                end = unitEnd
+                unit = unitEnd
+            } while unit < lineEnd
+            line = lineEnd + 1
+        }
+        if text[start..<end].contains(where: { !$0.properties.isWhitespace }) { out.append(start..<end) }
+        return out
     }
 }
 

@@ -4,6 +4,7 @@ import Dispatch
 protocol SearchSessionStoring {
     func transcriptCache(for source: SessionSource) -> TranscriptCache?
     func updateSession(_ session: Session)
+    func scan(session: Session, query: SearchQuery) async -> SearchScanResult
     func parseFull(session: Session) async -> Session?
     /// Parses the file even when `session` holds events: they can lag a file still being written.
     func reread(session: Session) async -> Session?
@@ -61,5 +62,12 @@ final class SearchSessionStore: SearchSessionStoring {
     func reread(session: Session) async -> Session? {
         guard let adapter = adapters[session.source] else { return nil }
         return adapter.parseFull(URL(fileURLWithPath: session.filePath), session.id)
+    }
+}
+
+// Default keeps test and provider stores on the same bounded production scanner.
+extension SearchSessionStoring {
+    func scan(session: Session, query: SearchQuery) async -> SearchScanResult {
+        await SearchSourceScanner.scan(session: session, query: query)
     }
 }

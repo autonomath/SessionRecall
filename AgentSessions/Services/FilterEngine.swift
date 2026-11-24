@@ -88,16 +88,18 @@ enum SearchTextMatcher {
         let eventCount: Int
     }
 
-    static func hasExplicitFTSSyntax(_ query: String) -> Bool {
+    /// operatorsInCapitals: only AND, OR, NOT and NEAR in capitals count, as in the index
+    /// itself, so a plain sentence with "and" in it stays plain words.
+    static func hasExplicitFTSSyntax(_ query: String, operatorsInCapitals: Bool = false) -> Bool {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return false }
         if q.contains("\"") { return true }
         if q.contains("*") { return true }
         if q.contains("(") || q.contains(")") { return true }
         if q.contains(":") { return true }
-        let lower = q.lowercased()
-        if lower.contains(" near ") || lower.hasPrefix("near ") || lower.hasSuffix(" near") { return true }
-        if lower.contains(" and ") || lower.contains(" or ") || lower.contains(" not ") { return true }
+        let words = operatorsInCapitals ? q : q.uppercased()
+        if words.contains(" NEAR ") || words.hasPrefix("NEAR ") || words.hasSuffix(" NEAR") { return true }
+        if words.contains(" AND ") || words.contains(" OR ") || words.contains(" NOT ") { return true }
         return false
     }
 
@@ -128,7 +130,7 @@ enum SearchTextMatcher {
     static func rankedQueryParts(_ freeText: String, prefix: Bool = true) -> [String] {
         let q = freeText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
-        guard !hasExplicitFTSSyntax(q) else { return [q] }
+        guard !hasExplicitFTSSyntax(q, operatorsInCapitals: true) else { return [q] }
         let words = q.split(whereSeparator: \.isWhitespace).map(String.init)
         let telling = words.filter { !isFiller($0) }
         var parts = (telling.isEmpty ? words : telling).map { "\"\($0)\"" }
@@ -603,6 +605,28 @@ enum SearchTextMatcher {
     }
 }
 
+enum HiddenProjects {
+    static let defaultsKey = "HiddenProjectRoots"
+
+    static func roots(defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: defaultsKey) ?? [])
+    }
+
+    @discardableResult
+    static func hide(_ identity: ProjectIdentity, defaults: UserDefaults = .standard) -> Bool {
+        var hiddenRoots = roots(defaults: defaults)
+        guard hiddenRoots.insert(identity.canonicalRootPath).inserted else { return false }
+        defaults.set(hiddenRoots.sorted(), forKey: defaultsKey)
+        return true
+    }
+
+    static func unhide(_ root: String, defaults: UserDefaults = .standard) {
+        var hiddenRoots = roots(defaults: defaults)
+        guard hiddenRoots.remove(root) != nil else { return }
+        defaults.set(hiddenRoots.sorted(), forKey: defaultsKey)
+    }
+}
+
 struct Filters: Equatable {
     var query: String = ""
     var dateFrom: Date?
@@ -616,6 +640,7 @@ struct Filters: Equatable {
     var archivedClaudeSessionIDs: Set<String> = []
     var sideChatsOnly: Bool = false
     var selectedProjectIdentity: ProjectIdentity? = nil
+    var hiddenProjectRoots: Set<String> = []
 }
 
 enum FilterEngine {
@@ -654,6 +679,10 @@ enum FilterEngine {
 
         if let selected = filters.selectedProjectIdentity {
             guard session.rowProjectIdentity == selected else { return false }
+        } else if !filters.hiddenProjectRoots.isEmpty,
+                  let project = session.rowProjectIdentity,
+                  filters.hiddenProjectRoots.contains(project.canonicalRootPath) {
+            return false
         }
 
         if let repo = effectiveRepo, !repo.isEmpty {
@@ -737,68 +766,13 @@ enum FilterEngine {
     }
 
     static func parseOperators(_ q: String) -> ParsedQuery {
-        let trimmed = q.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return ParsedQuery(freeText: "", repo: nil, path: nil, sideChatsOnly: false) }
-
-        enum PendingKey {
-            case repo
-            case path
+        guard let lexemes = try? SearchQuery.lex(q),
+              let (metadata, _) = try? SearchQuery.metadataTokens(lexemes) else {
+            // The coordinator reports the validation error. Preserve the original text
+            // here so an invalid expression cannot become an all-metadata match.
+            return ParsedQuery(freeText: q, repo: nil, path: nil, sideChatsOnly: false)
         }
-
-        var repo: String? = nil
-        var path: String? = nil
-        var sideChatsOnly = false
-        var remaining: [String] = []
-        var pending: PendingKey? = nil
-
-        var lexer = QueryLexer(trimmed)
-        while let token = lexer.nextToken() {
-            let lower = token.value.lowercased()
-            let isRepoToken = lower.hasPrefix("repo:")
-            let isPathToken = lower.hasPrefix("path:")
-            let isSideTag = lower == "#side" && !token.startsWithQuote
-
-            if let pendingKey = pending, !isRepoToken, !isPathToken, !isSideTag {
-                let v = token.value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !v.isEmpty {
-                    switch pendingKey {
-                    case .repo: repo = v
-                    case .path: path = v
-                    }
-                }
-                pending = nil
-                continue
-            }
-
-            if isRepoToken {
-                let valueStart = token.value.index(token.value.startIndex, offsetBy: 5)
-                let v = String(token.value[valueStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !v.isEmpty {
-                    repo = v
-                } else {
-                    pending = .repo
-                }
-                continue
-            }
-            if isSideTag {
-                sideChatsOnly = true
-                pending = nil
-                continue
-            }
-            if isPathToken {
-                let valueStart = token.value.index(token.value.startIndex, offsetBy: 5)
-                let v = String(token.value[valueStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !v.isEmpty {
-                    path = v
-                } else {
-                    pending = .path
-                }
-                continue
-            }
-            pending = nil
-            remaining.append(token.raw)
-        }
-
-        return ParsedQuery(freeText: remaining.joined(separator: " "), repo: repo, path: path, sideChatsOnly: sideChatsOnly)
+        return ParsedQuery(freeText: metadata.freeText, repo: metadata.repo,
+                           path: metadata.path, sideChatsOnly: metadata.sideChatsOnly)
     }
 }

@@ -24,6 +24,44 @@ struct SubagentRowMeta: Equatable {
 /// The builder resolves parent references by matching `child.parentSessionID`
 /// against both `session.id` and `session.codexInternalSessionIDHint` (needed
 /// because Claude session IDs are SHA256 hashes, not raw UUIDs).
+enum SessionGroupFolding: CaseIterable, Sendable {
+    case standard
+    case collapsed
+    case expanded
+
+    func isCollapsed(_ id: String, standard: Set<String>) -> Bool {
+        switch self {
+        case .standard: standard.contains(id)
+        case .collapsed: true
+        case .expanded: false
+        }
+    }
+
+    /// Materializes a global folding mode before one parent is toggled. IDs that
+    /// are currently outside the hierarchy stay in the persisted standard set.
+    func standardCollapsedParents(
+        afterToggling id: String,
+        expandableParentIDs: Set<String>,
+        standard: Set<String>
+    ) -> Set<String> {
+        var collapsed = standard
+        switch self {
+        case .standard:
+            break
+        case .collapsed:
+            collapsed.formUnion(expandableParentIDs)
+        case .expanded:
+            collapsed.subtract(expandableParentIDs)
+        }
+        if collapsed.contains(id) {
+            collapsed.remove(id)
+        } else {
+            collapsed.insert(id)
+        }
+        return collapsed
+    }
+}
+
 enum SubagentHierarchyBuilder {
 
     struct Result {
@@ -31,6 +69,9 @@ enum SubagentHierarchyBuilder {
         let sessions: [Session]
         /// Per-session row metadata keyed by `session.id`.
         let rowMeta: [String: SubagentRowMeta]
+        /// Every in-scope parent that has a resolved child, including nested
+        /// parents hidden by a folded ancestor.
+        let expandableParentIDs: Set<String>
     }
 
     /// URL-free equivalent of URL(fileURLWithPath:).deletingPathExtension()
@@ -59,7 +100,8 @@ enum SubagentHierarchyBuilder {
     static func build(
         sessions: [Session],
         collapsedParents: Set<String> = [],
-        hierarchyEnabled: Bool
+        hierarchyEnabled: Bool,
+        folding: SessionGroupFolding = .standard
     ) -> Result {
         guard hierarchyEnabled else {
             return flatResult(sessions: sessions)
@@ -114,7 +156,7 @@ enum SubagentHierarchyBuilder {
                     hasWorkflowChildren: children.contains { $0.isClaudeWorkflowSubagent }
                 )
 
-                guard !children.isEmpty, !collapsedParents.contains(node.id) else { continue }
+                guard !children.isEmpty, !folding.isCollapsed(node.id, standard: collapsedParents) else { continue }
                 // Reversed: popLast() then yields children in sorted order.
                 for child in children.reversed() {
                     stack.append((child, depth + 1))
@@ -122,7 +164,8 @@ enum SubagentHierarchyBuilder {
             }
         }
 
-        return Result(sessions: flatSessions, rowMeta: rowMeta)
+        return Result(sessions: flatSessions, rowMeta: rowMeta,
+                      expandableParentIDs: Set(childrenByParentID.keys))
     }
 
     /// Returns a flat result with all sessions at depth 0 (no hierarchy nesting).
@@ -185,7 +228,7 @@ enum SubagentHierarchyBuilder {
         for s in sessions {
             rowMeta[s.id] = SubagentRowMeta(depth: 0, hasChildren: false, childCount: 0)
         }
-        return Result(sessions: sessions, rowMeta: rowMeta)
+        return Result(sessions: sessions, rowMeta: rowMeta, expandableParentIDs: [])
     }
 
     private static func resolvedParentID(

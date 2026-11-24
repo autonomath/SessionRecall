@@ -170,6 +170,69 @@ final class ClaudeUsageModelAuthWiringTests: XCTestCase {
         XCTAssertNil(ClaudeUsageSource.unavailable.weeklyCalibrationFamily)
     }
 
+    func testPriceRefreshDropsRevokedWebCalibrationInput() {
+        let model = ClaudeUsageModel()
+        var revoked = Self.sampleSnapshot(source: .webEndpoint)
+        revoked.ownership = "web:revoked-owner"
+        revoked.requestLease = nil
+        model.setWeeklyCalibrationInputForTesting(revoked)
+        XCTAssertTrue(model.hasWeeklyCalibrationInputForTesting)
+
+        model.refreshWeeklyCalibrationForNewPrices(now: Date())
+
+        XCTAssertFalse(model.hasWeeklyCalibrationInputForTesting,
+                       "price refresh must not replay quota from a revoked Web credential")
+    }
+
+    func testReplacementOwnerInvalidatesCalibrationBeforeDeferredCredentialObserver() {
+        let model = ClaudeUsageModel()
+        var accountA = Self.sampleSnapshot(source: .oauthEndpoint)
+        accountA.ownership = "oauth:account-a"
+        model.applyLimitSnapshotForTesting(accountA)
+        let generationA = model.weeklyCalibrationGenerationForTesting
+
+        var accountB = Self.sampleSnapshot(source: .oauthEndpoint)
+        accountB.ownership = "oauth:account-b"
+        model.applyLimitSnapshotForTesting(accountB)
+
+        XCTAssertGreaterThan(model.weeklyCalibrationGenerationForTesting, generationA,
+                             "replacement publication must invalidate A synchronously before an observer can inspect B")
+    }
+
+    func testLegacyTmuxHardProbeInvalidatesWebCalibrationOwner() {
+        let model = ClaudeUsageModel()
+        var web = Self.sampleSnapshot(source: .webEndpoint)
+        web.ownership = "web:tmux-replacement-fixture"
+        model.applyLimitSnapshotForTesting(web)
+        model.setWeeklyCalibrationInputForTesting(web)
+        let webGeneration = model.weeklyCalibrationGenerationForTesting
+        XCTAssertTrue(model.hasWeeklyCalibrationInputForTesting)
+
+        model.applyLegacyUsageSnapshotForTesting(ClaudeUsageSnapshot(
+            sessionRemainingPercent: 80,
+            sessionResetText: "",
+            weekAllModelsRemainingPercent: 70,
+            weekAllModelsResetText: ""
+        ))
+
+        XCTAssertFalse(model.hasWeeklyCalibrationInputForTesting)
+        XCTAssertGreaterThan(model.weeklyCalibrationGenerationForTesting, webGeneration,
+                             "tmux publication must close the previous Web quota scope")
+        XCTAssertEqual(model.currentSource, .tmuxUsage)
+    }
+
+    func testStoppingUsageTrackingInvalidatesCalibrationBeforeRemovingCredentialObservers() {
+        let model = ClaudeUsageModel()
+        let generation = model.weeklyCalibrationGenerationForTesting
+        model.setWeeklyCalibrationInputForTesting(Self.sampleSnapshot(source: .oauthEndpoint))
+
+        model.setEnabled(false)
+
+        XCTAssertFalse(model.hasWeeklyCalibrationInputForTesting)
+        XCTAssertGreaterThan(model.weeklyCalibrationGenerationForTesting, generation,
+                             "tracking stop must close the quota scope before its credential observers are removed")
+    }
+
     private static func sampleSnapshot(source: ClaudeUsageSource) -> ClaudeLimitSnapshot {
         ClaudeLimitSnapshot(fetchedAt: Date(), source: source, health: .live,
             fiveHourUsedRatio: 0.3, fiveHourResetText: "", weeklyUsedRatio: 0.1, weeklyResetText: "",

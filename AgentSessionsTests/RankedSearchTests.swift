@@ -9,16 +9,19 @@ private final class RankedSearchTestStore: SearchSessionStoring {
         Session(id: session.id, startTime: session.startTime, endTime: session.endTime, model: nil,
                 filePath: session.filePath, eventCount: session.eventCount, events: session.events)
     }
-    /// A parse of what is on disk now: the file's text as one prompt, when the file exists.
-    func reread(session: Session) async -> Session? {
-        guard let text = try? String(contentsOfFile: session.filePath, encoding: .utf8) else {
-            return await parseFull(session: session)
+    /// A read of what is on disk now: the file's text when the file exists, else the events
+    /// the session holds, standing in for a file these tests do not write.
+    func scan(session: Session, query: SearchQuery) async -> SearchScanResult {
+        let texts = (try? String(contentsOfFile: session.filePath, encoding: .utf8)).map { [$0] }
+            ?? session.events.compactMap(\.text)
+        var truth = SearchQuery.Truth.unknown
+        if let tokenizer = try? SearchTokenizer() {
+            let predicate = SearchPredicateAccumulator(query: query, tokenizer: tokenizer)
+            for text in texts { try? predicate.consume(field: text) }
+            truth = predicate.truth(complete: true)
         }
-        let event = SessionEvent(id: "\(session.id)-disk", timestamp: Date(), kind: .user, role: "user", text: text,
-                                 toolName: nil, toolInput: nil, toolOutput: nil, messageID: nil, parentID: nil,
-                                 isDelta: false, rawJSON: "{}")
-        return Session(id: session.id, startTime: session.startTime, endTime: Date(), model: nil,
-                       filePath: session.filePath, eventCount: 1, events: [event])
+        return SearchScanResult(key: .init(session), truth: truth,
+                                summary: SearchScanSummary(revision: SearchSourceRevision()), snippet: nil)
     }
 }
 
@@ -49,6 +52,9 @@ final class RankedSearchTests: XCTestCase {
                        ["\"cafe menu prices\"", "\"cafe\"", "\"menu\"", "\"prices\"", "\"prices\"*"])
         XCTAssertEqual(SearchTextMatcher.rankedQueryParts("UTF-8"), ["\"UTF-8\""])
         XCTAssertEqual(SearchTextMatcher.rankedQueryParts("\"exit code\" NOT zsh"), ["\"exit code\" NOT zsh"])
+        XCTAssertEqual(SearchTextMatcher.rankedQueryParts("personal and work list"),
+                       ["\"personal and work list\"", "\"personal\"", "\"work\"", "\"list\"", "\"list\"*"],
+                       "a sentence with \"and\" in it is plain words; only AND in capitals is an operator")
         XCTAssertEqual(SearchTextMatcher.rankedQuery("tee"), "tee")
         XCTAssertEqual(SearchTextMatcher.rankedQuery("tee", forIndex: true), "\"tee\" OR \"tee\"*")
     }
@@ -188,6 +194,65 @@ final class RankedSearchTests: XCTestCase {
         return coordinator
     }
 
+    // MARK: - Passages
+
+    func testPassagesBreakAtLineEndsAndOverlap() {
+        let text = Array((String(repeating: "a", count: 1000) + "\n" + String(repeating: "b", count: 1000) + "\n"
+                          + String(repeating: "c", count: 4000)).unicodeScalars)
+        let parts = Passages.ranges(in: text)
+        XCTAssertTrue(parts.allSatisfy { $0.count <= Passages.size + 1 })
+        XCTAssertEqual(parts.first, 0..<1000, "breaks at the line end")
+        XCTAssertEqual(parts[1].lowerBound, 1000 - Passages.overlap, "repeats the end of the one before")
+        XCTAssertEqual(parts.last?.upperBound, text.count, "covers the text to its end")
+        XCTAssertTrue(zip(parts, parts.dropFirst()).allSatisfy { $1.lowerBound < $0.upperBound }, "no gap between passages")
+        XCTAssertEqual(Passages.ranges(in: []), [])
+        XCTAssertEqual(Passages.ranges(in: Array("hi".unicodeScalars)), [0..<2])
+    }
+
+    func testChatWhoseWordsSitTogetherOutranksOneThatScattersThem() async throws {
+        let (db, cleanup) = try makeDB()
+        defer { cleanup() }
+        // More than one passage long, so words on either side of it never share a passage.
+        let filler = String(repeating: "lorem ipsum dolor sit amet\n", count: 80)
+        let scattered = session("scattered"), together = session("together")
+        let others = (0..<20).map { session("other-\($0)") }
+        try await db.begin()
+        for other in others { try await index(db, other, [.assistant: "nothing here\n" + filler]) }
+        try await index(db, scattered, [.assistant: (0..<3).map { _ in "the quota was raised\n" + filler + "gemini answered\n" + filler }.joined()])
+        try await index(db, together, [.assistant: filler + filler + filler + "so we give gemini its own quota\n" + filler + filler + filler])
+        try await db.commit()
+
+        let byWholeChat = try await ranked(db, "gemini quota")
+        XCTAssertEqual(byWholeChat.first, "scattered", "scored as whole chats, the one that repeats the words wins")
+        let found = try await search("gemini quota", in: [scattered, together] + others, db: db)
+        XCTAssertEqual(found.results.first?.id, "together", "its best passage holds both words")
+        let hit = try XCTUnwrap(found.hits[SearchCoordinator.SessionKey(together)])
+        XCTAssertEqual(hit.excerpt?.contains("\u{1}gemini\u{2} its own \u{1}quota\u{2}"), true, "the excerpt is that passage: \(hit.excerpt ?? "-")")
+        XCTAssertEqual(hit.anchor, "gemini its own quota", "and a click can land on it")
+    }
+
+    func testPassagesAreDroppedWhenASessionIsReadAgainAndCutFromStoredText() async throws {
+        let (db, cleanup) = try makeDB()
+        defer { cleanup() }
+        try await index(db, session("chat"), [.user: "print the envelope for the landlord"])
+        var found = try await db.searchPassages(query: "\"envelope\"", sources: ["codex"])
+        XCTAssertEqual(found.map(\.sessionID), ["chat"])
+
+        // An older build rewrites the session's row and knows nothing of passages: they are
+        // dropped, and cut again from the stored text, as for an index made before passages.
+        try await db.exec("UPDATE field_docs SET skipped = skipped;")
+        found = try await db.searchPassages(query: "\"envelope\"", sources: ["codex"])
+        XCTAssertEqual(found.count, 0, "passages of the earlier text are gone")
+        let filled = try await db.fillPassages()
+        XCTAssertEqual(filled, 1)
+        found = try await db.searchPassages(query: "\"envelope\"", sources: ["codex"])
+        XCTAssertEqual(found.map(\.ord), [0])
+        let texts = try await db.passageTexts(field: .user, passages: [("chat", 0)])
+        XCTAssertEqual(texts, ["print the envelope for the landlord"])
+        let left = try await db.fillPassages()
+        XCTAssertEqual(left, 0)
+    }
+
     func testRankedSearchOrdersByFieldExplainsEachRowAndSearchesOneField() async throws {
         let (db, cleanup) = try makeDB()
         defer { cleanup() }
@@ -290,6 +355,44 @@ final class RankedSearchTests: XCTestCase {
 
         let oneField = try await search("zebracorn", in: [live, settled, fresh], db: db, field: .user)
         XCTAssertEqual(oneField.results.map(\.id), [], "the live read cannot tell fields apart")
+    }
+
+    func testChatWhoseFileWasNotWrittenSinceIngestIsNotReadAgain() async throws {
+        let (db, cleanup) = try makeDB()
+        defer { cleanup() }
+        // The list's time for the chat runs ahead of the ingest at 100, but its file, stored
+        // compressed, was last written at 50: there is nothing newer to read.
+        let quiet = session("quiet", lastEvent: 200, said: "a zebracorn only the list's copy holds")
+        try FileManager.default.createDirectory(atPath: "/tmp/ranked-tests", withIntermediateDirectories: true)
+        let stored = quiet.filePath + ".zst"
+        try "compressed".write(toFile: stored, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 50)], ofItemAtPath: stored)
+        defer { try? FileManager.default.removeItem(atPath: stored) }
+        try await index(db, quiet, [.user: "an older question"])
+
+        let found = try await search("zebracorn", in: [quiet], db: db)
+        XCTAssertEqual(found.updatingCount, 0)
+        XCTAssertEqual(found.results.map(\.id), [])
+    }
+
+    func testChatsInOneSharedStoreAreNotAllReadWhenTheStoreChanges() async throws {
+        let (db, cleanup) = try makeDB()
+        defer { cleanup() }
+        // OpenCode keeps every chat in one database file, so the file's date says nothing about
+        // one chat. Only the chat with an event after the ingest at 100 is read again.
+        let quiet = session("quiet", lastEvent: 90, file: "store", said: "an older question")
+        let active = session("active", lastEvent: 200, file: "store", said: "an older question")
+        try FileManager.default.createDirectory(atPath: "/tmp/ranked-tests", withIntermediateDirectories: true)
+        try "the zebracorn arrived".write(toFile: active.filePath, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(atPath: active.filePath) }
+        try await db.begin()
+        try await index(db, quiet, [.user: "an older question"])
+        try await index(db, active, [.user: "an older question"])
+        try await db.commit()
+
+        let found = try await search("zebracorn", in: [quiet, active], db: db)
+        XCTAssertEqual(found.updatingCount, 1)
+        XCTAssertEqual(found.results.map(\.id), ["active"])
     }
 
     func testChangedChatIsReadFromItsFileWhenTheListCopyLags() async throws {
@@ -405,8 +508,15 @@ final class RankedSearchTests: XCTestCase {
         IndexDBTestHooks.applicationSupportDirectoryProvider = { dir }
         defer { IndexDBTestHooks.applicationSupportDirectoryProvider = original }
         let db = try IndexDB()
-        let sessions = try await SessionMetaRepository(db: db).fetchSessions(for: .codex)
+        while try await db.fillPassages(limit: 200) > 0 {}
+        var sessions = try await SessionMetaRepository(db: db).fetchSessions(for: .codex)
             .filter { CodexRolloutStorage.exists(atPath: $0.filePath) }
+        // Chats run in the folder AS_SEARCH_GATE_SKIP_CWD names are left out, with their sub-agents:
+        // the chats that wrote a set of cases quote them word for word.
+        if let skip = ProcessInfo.processInfo.environment["AS_SEARCH_GATE_SKIP_CWD"], !skip.isEmpty {
+            let skipped = Set(sessions.filter { ($0.cwd ?? "").contains(skip) }.map(\.id))
+            sessions.removeAll { skipped.contains($0.id) || $0.parentSessionID.map(skipped.contains) == true }
+        }
 
         var report: [String] = []
         var ranks: [String: Int] = [:]
@@ -415,9 +525,11 @@ final class RankedSearchTests: XCTestCase {
             let coordinator = SearchCoordinator(store: RankedSearchTestStore(), db: db)
             coordinator.start(query: item.query, filters: Filters(query: item.query), allowed: [.codex],
                               enableDeepScan: false, all: sessions)
-            try await Task.sleep(nanoseconds: 50_000_000)
-            for _ in 0..<500 where coordinator.isRunning { try await Task.sleep(nanoseconds: 20_000_000) }
+            // The ranked list is what this measures. The live read of chats changed since the
+            // index was copied is cancelled, or it runs on under the next searches.
+            for _ in 0..<3_000 where !coordinator.isRanked { try await Task.sleep(nanoseconds: 20_000_000) }
             let rank = coordinator.results.firstIndex { ($0.codexInternalSessionIDHint ?? $0.id) == item.chat }.map { $0 + 1 }
+            await coordinator.cancel()
             ranks[item.query] = rank ?? 0
             let worst = { (r: Int) in r == 0 ? Int.max : r }
             let ok = worst(rank ?? 0) <= item.within || accepted[item.query].map { worst(rank ?? 0) <= worst($0) } == true

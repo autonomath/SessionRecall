@@ -45,6 +45,120 @@ CHANGELOG already records it. The `##` sections are areas of the codebase, not p
 
 ---
 
+## Search and Transcript Integrity
+
+### Align bounded OpenCode legacy search with shared-store ownership
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** a legacy OpenCode session may scan the shared message tree up to the global 256 MiB raw-read bound, and one unrelated candidate above the per-file limit can make every affected old session report incomplete before its own parts are parsed. The bounded adapter also recognizes only the exact string `"2"` marker while the display parser accepts a trimmed integer value.
+- **Where:** `AgentSessions/Search/SearchBoundedFileAdapter.swift` OpenCode legacy discovery/marker projection and `AgentSessions/Services/OpenCodeSessionParser.swift` schema-marker parsing.
+- **Fix shape:** build one bounded shared-tree ownership inventory per store revision, isolate an oversized foreign candidate to its own owner/incomplete reason, and parse the marker with the same bounded integer policy as the transcript parser.
+- **Why deferred:** the current behavior is explicit incomplete coverage rather than a false result, and generated v2 stores use canonical markers. Changing the shared legacy budget needs multi-session allocation and cancellation fixtures.
+- **Risk if wrong:** migrated or noncanonical OpenCode stores can do repeated shared-directory work or lose otherwise readable legacy search coverage.
+- **To close:** cover two legacy sessions sharing an oversized foreign part, canonical and whitespace/integer marker variants, cancellation, raw-read totals, and one-inventory-per-revision reuse.
+
+### Coalesce deep-search publications and batch temporary eligibility writes
+> **open** · sev: low · urg: low · verified 2026-11-22
+
+- **What:** Return verification republishes full result, verified-key, and snippet collections on each 100 ms progress tick even when the hit set is unchanged. Large FTS eligibility sets are inserted into the temporary table one autocommit row at a time.
+- **Where:** `AgentSessions/Search/SearchCoordinator.swift` deep-verification publication loop and `AgentSessions/Indexing/DB.swift` `installSearchEligibleIDs`.
+- **Fix shape:** gate collection publication on a dirty hit/verification state while continuing progress counters, and wrap temporary membership replacement in a savepoint or actor-local transaction compatible with existing callers.
+- **Why deferred:** the current work fixed correctness and source bounds; this optimization needs SwiftUI invalidation metrics and nested-transaction tests before changing the search hot path.
+- **Risk if wrong:** long Return searches can spend avoidable main-thread and SQLite CPU without changing visible results.
+- **To close:** measure publication count and eligibility installation time on a large library, then prove cancellation and query replacement leave no stale temporary membership.
+
+### Match OpenCode legacy search ownership for UTF-16 parts
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** the OpenCode transcript parser accepts UTF-16LE/BE JSON through Foundation, while the bounded legacy owner projection recognizes only byte-compatible UTF-8 JSON. An imported UTF-16 flat part can be omitted from search without an explicit incomplete-coverage reason.
+- **Where:** `AgentSessions/Search/SearchBoundedFileAdapter.swift` legacy `messageID` projection and `AgentSessions/Services/OpenCodeSessionParser.swift` legacy part loading.
+- **Fix shape:** detect supported UTF-16 BOM/encoding under the existing per-record bound and use a bounded Foundation owner projection, or record incomplete coverage whenever ownership cannot be classified.
+- **Why deferred:** current OpenCode-generated stores use UTF-8 and all release-blocking UTF-8 layouts now match the display parser; adding encoding fallback needs UTF-16LE/BE fixtures and allocation measurements.
+- **Risk if wrong:** manually imported or externally rewritten UTF-16 legacy parts can appear in the transcript but not in search results.
+- **To close:** add LE/BE owner, duplicate-key, positive, negative, and resource-limit tests and prove the fallback stays within the scanner allocation budget.
+
+### Restart active search when visibility preferences change
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** changing the zero-message, 1–2-message, or housekeeping visibility preferences recomputes the session list, but an in-flight or completed Return search keeps the eligibility scope captured when its request began.
+- **Where:** `AgentSessions/Views/Preferences/PreferencesView+General.swift`, `AgentSessions/Views/UnifiedSessionsView.swift`, and `AgentSessions/Services/UnifiedSessionIndexer.swift` search-candidate construction.
+- **Fix shape:** publish these three preference changes through an observable revision and restart the active query, while preserving the sort-only display path for authoritative eventless search rows.
+- **Why deferred:** the stale scope clears on the next query and the search display correction must not reintroduce the Has Commands or side-chat double-filter bug; a proper change needs preference-notification and in-flight cancellation tests.
+- **Risk if wrong:** after changing one of these filters, search results can temporarily reflect the old visibility scope even though the ordinary list has already refreshed.
+- **To close:** toggle each preference during Return verification and after completion, then prove the old request is cancelled and the replacement uses the new candidate set.
+
+### Remove or implement the large tool-output search preference
+> **open** · sev: low · urg: low · verified 2026-11-22
+
+- **What:** Settings offers “Include large tool outputs in global search,” but Return search always scans supported output fields and the preference reader has no caller.
+- **Where:** `AgentSessions/Views/Preferences/PreferencesView+General.swift`, `AgentSessions/Search/SearchCoordinator.swift`, and `AgentSessions/Search/SearchTextSegment.swift`.
+- **Fix shape:** either remove the obsolete control and help copy, or make it an explicit coverage policy whose omissions are visible in search coverage. Do not silently skip source fields.
+- **Why deferred:** Return search is intentionally exhaustive for supported fields; changing that contract or removing localized UI copy is not required to close the v7 search correctness blockers.
+- **Risk if wrong:** users may believe disabling the setting reduces search work when it currently changes nothing.
+- **To close:** choose the product contract, add preference/coverage tests, and verify the Settings copy against actual search behavior.
+
+### Back off stable unsupported search-ingest revisions
+> **open** · sev: low · urg: low · verified 2026-11-22
+
+- **What:** the recurring retry dispatcher now wakes every due provider, but an unchanged source whose scanner returns `unsupported` can remain immediately retryable and be revisited on every monitor interval.
+- **Where:** `AgentSessions/Search/SearchDatabaseAdapters.swift` scanner outcomes and `AgentSessions/Search/SearchIngestService.swift` retry-obligation handling for unsupported files.
+- **Fix shape:** remember the stable unsupported artifact revision, or assign bounded backoff, and clear it only when that revision or provider capability changes.
+- **Why deferred:** the behavior is bounded by the monitor interval and does not strand supported indexing; changing retry classification needs provider fixtures for cold archives and newly supported revisions.
+- **Risk if wrong:** permanently unsupported artifacts consume avoidable background CPU during otherwise idle monitoring.
+- **To close:** prove an unchanged unsupported artifact is not retried every tick and that a changed revision or newly supported format becomes eligible immediately.
+
+### Qualify search rows by source as well as raw session ID
+> **open** · sev: high · urg: low · verified 2026-11-22
+
+- **What:** `session_meta`, `session_search`, and `session_tool_io` still key durable rows by raw `session_id` alone. Two providers that emit the same ID can replace each other's metadata and searchable text.
+- **Where:** `AgentSessions/Indexing/DB.swift` table creation and the search upsert, lookup, and delete paths that join by `session_id`.
+- **Fix shape:** migrate all three tables to source-qualified identity, rebuild their FTS rows, and add a fixture in which two sources share one raw ID but remain independently searchable.
+- **Why deferred:** this needs a schema migration and full search-index compatibility review; it is not part of the narrow post-merge P1 correction.
+- **Risk if wrong:** search can show the wrong provider's metadata or silently lose one of the colliding sessions.
+- **To close:** prove migration from the current schema and pass search, deletion, rebuild, and same-ID cross-source tests.
+
+### Validate transcript append-only reuse against earlier edits
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** the transcript append fast path proves that the event count grew, but it does not prove that already-rendered earlier events are unchanged. A provider rewrite plus append in one refresh can retain stale rendered content.
+- **Where:** `AgentSessions/Views/TranscriptPlainView.swift`, `tryAppendPlainTranscript` and its append-state guards.
+- **Fix shape:** retain an inexpensive prefix revision or another provider-backed append-only proof and fall back to the full render whenever the earlier prefix changes.
+- **Why deferred:** the current release work targeted scrolling and cold-open responsiveness; changing the append contract needs provider fixtures and performance qualification.
+- **Risk if wrong:** a live transcript can temporarily display an older version of an edited event until a later full reload.
+- **To close:** add rewrite-plus-append tests for supported appendable providers and repeat the large-session scroll/open profile.
+
+## Analytics Performance
+
+### Coalesce cold Economics aggregation off the main actor
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** cold Economics progress rebuilds totals, rows, and trends over the growing observation set after every four completed sessions. The cumulative aggregation work is quadratic in session count and currently runs on the main actor.
+- **Where:** `AgentSessions/Analytics/Services/AnalyticsService.swift` progress publication and `AgentSessions/Analytics/Models/EconomicsAnalytics.swift` snapshot aggregation.
+- **Fix shape:** keep progress publication cheap, coalesce snapshot construction on a bounded background task, and revalidate calculation generation, price revision, quota owner, and cancellation before publication.
+- **Why deferred:** source inspection confirms the repeated full aggregation, but representative cold-library frame latency has not been measured and the change needs cancellation/ownership tests.
+- **Risk if wrong:** opening Economics on a large uncached history can cause avoidable main-thread pauses and CPU drain.
+- **To close:** profile a representative cold backfill, add generation and owner-replacement tests, and prove snapshot rebuild count is bounded rather than proportional to every four sessions.
+
+### Clear already-displayed Economics quota on owner revocation
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** new and suspended Economics calculations reject a revoked quota owner, but a quota estimate already assigned to the current view can remain visible until another calculation completes or the user refreshes.
+- **Where:** `AgentSessions/Analytics/Services/AnalyticsService.swift` snapshot publication and `AgentSessions/Analytics/Views/AnalyticsView.swift` Economics presentation lifetime.
+- **Fix shape:** invalidate the displayed quota component when the owner changes, and perform one final context-validity check after constructing a snapshot immediately before assigning it.
+- **Why deferred:** the release blocker was stale data entering a new publication; clearing an existing rendered value is a separate UI-state contract that needs an end-to-end suspended-calculation test.
+- **Risk if wrong:** after credential removal or account replacement, an already-open Economics view can temporarily show the previous owner's estimated quota rate.
+- **To close:** drive an owner change while Economics is open and while a calculation is suspended, then prove the rendered quota clears immediately and cannot be reassigned by the old calculation.
+
+### Move warm OpenCode Economics revision validation off the main actor
+> **open** · sev: med · urg: low · verified 2026-11-22
+
+- **What:** a warm Economics calculation validates each OpenCode session by synchronously reading and hashing SQLite payloads while `AnalyticsService` is isolated to the main actor.
+- **Where:** `AgentSessions/Analytics/Services/AnalyticsService.swift` warm lookup loop and `AgentSessions/Telemetry/SessionTelemetryEngine.swift` OpenCode revision generation.
+- **Fix shape:** compute the revision checks in a bounded background task, then publish only results that still match the calculation generation.
+- **Why deferred:** the merged P1 fix makes one calculation internally consistent; moving validation changes scheduling and needs a representative large OpenCode database profile.
+- **Risk if wrong:** opening or filtering Economics can cause a visible main-thread pause on large OpenCode histories.
+- **To close:** add cancellation/revision tests and profile a warm Economics refresh with a large current-schema database.
+
 ## Cross-Surface Session Storage
 
 ### OpenCode Desktop selected-but-idle presence
@@ -261,14 +375,19 @@ CHANGELOG already records it. The `##` sections are areas of the codebase, not p
 - **Risk if wrong:** treating internal metadata as display authority could duplicate messages or misstate account limits.
 - **To close:** prove a user-visible read path with positive and negative fixtures, or document why a field is noise.
 
-### Recent model prices: unidentified routes and time-dependent DeepSeek rates
-> **open** · sev: med · urg: low · verified 2026-11-02
+### Codex item token counts and Kimi content timings
+> **open** · sev: low · urg: low · verified 2026-11-17
 
-- **What:** recent usage names `cline-free/nemotron-3.5-super-vl`, `mai-code-1.1-flash`, `big-pickle` and `~anthropic/claude-fable-latest`; no first-party per-token rate or exact version mapping was established. DeepSeek `deepseek-flash` / `deepseek-v4.1-flash-free` / `cline-free/deepseek-v4.1-flash` has peak $0.30/$0.006/$1.20 and offpeak $0.15/$0.003/$0.60 input/cache/output per MTok. The current date-based price periods cannot encode its daily hours and holiday calendar. OpenClaw `delivery-mirror` is an internal unpriced label; establish zero-token eligibility before adding an exemption.
-- **Where:** official-source evidence `scripts/probe_scan_output/official-provider-prices-2026-11-02.md`; [DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing/), [NVIDIA model](https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b), [OpenCode model identities](https://opencode.ai/v2/docs/console/models/).
-- **Why deferred:** a free promotion is not a published API-equivalent base rate, and a family guess or static DeepSeek peak rate would present an unsupported estimate as exact.
-- **Risk if wrong:** inaccurate dollar estimates or silently omitted contributing usage.
-- **To close:** verify route identity and published rates, or implement time-aware tariffs with positive and negative boundary cases.
+- Codex 0.169.0 emits `item_completed.content_token_count`; seven records in the initial weekly sample carried a count and a stable tool session reproduced it. Check whether it measures rendered item content before exposing it on an item row or adding it to telemetry.
+- Kimi 2.6.3 emits `startedAt` and `durationMs` on `content.part` records. The focused tool session recorded three parts with start times. Determine whether these measure cumulative stream time or individual content blocks before using them for transcript timing.
+- **To close:** verify units and coverage, then test attribution across repeated item IDs and streaming chunks.
+
+### Recent model prices still missing a reliable historical rate
+> **open** · sev: med · urg: low · verified 2026-11-17
+
+- **What:** `big-pickle` is a free OpenCode stealth model with no disclosed API-equivalent rate. OpenRouter's `~anthropic/claude-fable-latest` can point to different generations, so alias-only logs cannot recover the billed model. Direct DeepSeek `deepseek-flash` has daily peak and off-peak rates that the manifest's date-based periods cannot express.
+- **Covered:** OpenCode's V4.1 Flash route has a published fixed rate and the Nemotron 3.5 Super VL model has a published OpenRouter list rate. Manifest 2026111701 uses those rates for the corresponding free routes, with the free-route label preserved.
+- **To close:** recover concrete response model IDs for moving aliases, or add tariff support with provider timezone and calendar boundary tests. Keep stealth models without a published estimate unavailable. [OpenRouter alias](https://openrouter.ai/~anthropic/claude-fable-latest/) · [OpenCode rates](https://opencode.ai/docs/console/models) · [DeepSeek rates](https://api-docs.deepseek.com/quick_start/pricing/)
 
 ### Explain nil telemetry in the real-session replay
 > **partial** · sev: low · urg: low · verified 2026-11-02
@@ -280,13 +399,11 @@ CHANGELOG already records it. The `##` sections are areas of the codebase, not p
 - **Risk if wrong:** calling this an expected race could hide a real backend failure. Keep the unexplained count visible; never turn it into zero usage or claim a clean semantic replay.
 - **To close:** the diagnostic gap is fixed; if nil recurs, use its controlled reason to establish whether a real defect exists. The original historical event cannot be attributed from its counts-only artifact; do not call the live-file hypothesis proved.
 
-### Extend semantic replay beyond the three core agents
-> **open** · sev: low · urg: low · verified 2026-11-02
+### Extend semantic replay to additional stores
+> **partial** · sev: low · urg: low · verified 2026-11-17
 
-- **What:** `AgentSessionsTests/RealSessionReplayTests.swift` replays Codex, Claude and OpenCode only. Other agents have schema/fixture checks but no real-store semantic replay in this initial bounded implementation.
-- **Why deferred:** shared-store discovery and unavailable telemetry need source-specific reason categories; a generic nil result must not be presented as a parser regression.
-- **Risk if wrong:** known-key behavioral regressions in other readers remain outside the replay channel.
-- **To close:** add each production discovery/full-parser/usage path, keep SQLite read-only and output counts-only, and explain unavailable reasons. Do not install absent steward agents.
+- Real-session replay now covers Codex, Claude, OpenCode, Copilot and Kimi. A focused manifest can replay retained probe sessions through their production parsers, including Antigravity.
+- **To close:** add the remaining production discovery and usage paths, keep SQLite read-only, and continue emitting counts only.
 
 ### Check the DeepSeek Harness reader against the v3→v4 notes from the DSH discussion
 > **open** · sev: med · urg: low · verified —
@@ -1333,6 +1450,59 @@ time), `steering`, `interrupted`, `context_checkpoint`, manifest `title`/`model`
 ---
 
 ## Transcript UI
+
+### Release scroll-performance preflight follow-ups
+> **partial** · sev: med · urg: high · verified 2026-11-20
+
+- **What:** the final Sol 6.2 High review found no remaining P0/P1 after the Codex tail-first ownership fix, but four lower-priority concurrency/performance gaps remain. A superseded provider worker can pass its lease check and later kick search or consume focused-reload intent after an `await`; focused monitoring records a file signature before hydration is accepted; search FileRefs resolve artifacts and stat every row on the main actor; and OpenCode SQLite can begin full hydration when scrolling resumes after its cheap revision probe.
+- **Where:** provider completion and idle cleanup are in `AgentSessions/Services/UnifiedSessionIndexer.swift:2070-2093` and `:2221-2279`; focused signature acknowledgement is at `:2644-2692`; main-actor FileRef construction and filesystem reads are at `:2336-2352` and `:2577-2618`; the missing second OpenCode scroll checkpoint is at `AgentSessions/Services/OpenCodeSessionIndexer.swift:362-411`. The Codex publication path also emits Swift 6 async-lock warnings at `AgentSessions/Services/SessionIndexer.swift:751-787`.
+- **Fix shape:** make lease validation and its side effects one main-actor transaction; retain a revision-specific focused reload until accepted or superseded; snapshot sessions/authority on main and construct FileRefs off-main; add a second quiet check before OpenCode SQLite hydration; replace async-context `NSCondition` calls with a scoped lock helper.
+- **Why deferred:** the owner set P0/P1 as the closure threshold for this pass. These P2/P3 items need their own race fixtures and a Release replay rather than another unbounded review/fix cycle.
+- **Risk if wrong:** a rare refresh interleaving can start redundant search work, consume a newer manual intent, or leave a focused transcript stale until another change. Main-thread stats and OpenCode hydration can still add CPU during a gesture.
+- **To close:** implement the four fixes, run the focused concurrency suite and full preflight suite, then repeat the 100-gesture Release Time Profiler replay. Recheck the previously measured 338.57 ms SwiftUI/AppKit layout stall with Hangs and record peak/p95 CPU, total/main-thread CPU, samples at or above 160%, and stalls over 250 ms before merging.
+
+### Session window becomes unresponsive during live syntax review
+> **open** · sev: high · urg: low · verified 2026-11-11
+
+- **Implementation (2026-11-11):** Shared off-main presentation bundles now own groups, filtered counts and timing; content revisions invalidate same-size changes and image mapping. Code and synthetic validation are recorded in [the implementation ledger](reviews/2026-11-10-search-responsiveness-implementation.md). The owner explicitly deferred live profiling; the 8,000-message cause and production improvement remain unproven.
+- **What:** the owner observed beachballs and inability to scroll the November 7 Session transcript in the fresh Debug build. PID 47916 reached 186.6% CPU, a 1.4 GB physical footprint, and a 2.2 GB peak while system CPU idle exceeded 50%.
+- **Owner follow-up:** the deployed release scrolls normally on the November 7 session, but opens the approximately 8,000-message session `01a0e10e-4ff2-7f80-9a41-65eb91364db4` slowly. The owner explicitly deferred this work to another session on November 10.
+- **Where:** [live review and profile evidence](reviews/2026-11-10-syntax-highlighting-live-review.md). The sampled main thread includes SwiftUI toolbar/layout and `UnifiedTranscriptView.roleOccurrenceCount` at `TranscriptPlainView.swift:1423`. Background discovery and search ingestion were active. The cause is unresolved.
+- **Why deferred:** owner request. Profiles and a standalone Release build are saved; the slow large-session opening interval still needs to be captured.
+- **Risk if wrong:** attributing the lag to one sampled stack could leave the actual trigger active.
+- **To close:** reproduce the same session and scroll/Find/fold interactions, identify the dominant work with repeated samples, fix the cause, and complete the live review in both appearances.
+
+### Claude cloud Keychain read can block the main thread
+> **open** · sev: high · urg: low · verified 2026-11-11
+
+- **Implementation (2026-11-11):** The credential service now owns physical Security work on a serial background queue; epoch/lease checks cover clients, usage persistence and UI delivery. Deterministic delayed-read and stale-owner tests are recorded in [the implementation ledger](reviews/2026-11-10-search-responsiveness-implementation.md). Real delayed-Keychain launch acceptance remains deferred.
+- **What:** the new standalone Release app stalled before window inspection. All 525 main-thread samples were blocked inside `SecItemCopyMatching` through the synchronous session-key provider. The wait later cleared. A concurrent usage refresh was also reading the Keychain.
+- **Where:** `AgentSessions/ClaudeCloud/ClaudeCloudSessionCatalog.swift:122` invokes the provider on the main actor. `AgentSessions/ClaudeStatus/ClaudeOAuth/ClaudeManualWebCookie.swift:114` calls the synchronous Security API. Profile is `/private/tmp/as-live-current-release-launch.sample.txt`.
+- **Fix shape:** move credential retrieval off the main actor, then apply catalog state on its actor. Recheck the enabled state after the asynchronous read.
+- **Why deferred:** the owner requested that responsiveness fixes move to another session.
+- **Risk if wrong:** moving catalog mutation across actors could introduce races or publish cloud rows after the feature is disabled.
+- **To close:** a delayed credential read permits main-thread UI work, disabling during that wait prevents a fetch, and the real app opens while the credential provider is delayed.
+
+### Known session ID cannot locate its session in list search
+> **open** · sev: med · urg: low · verified 2026-11-11
+
+- **Implementation (2026-11-11):** The normal search entry point now matches source-qualified own IDs and known provider ID hints before content-query parsing. Synthetic collision/identity coverage is recorded in [the implementation ledger](reviews/2026-11-10-search-responsiveness-implementation.md); the owner-visible live query remains deferred.
+- **What:** list search for `01a1b92f-e29b-7b82-964d-86140e9652fa` returned zero matches. Prompt-text search located the same session as “Review transcript readability plan”.
+- **Where:** `AgentSessions/Services/FilterEngine.swift:663` searches title and repository metadata without an explicit session-ID match. [Live evidence](reviews/2026-11-10-syntax-highlighting-live-review.md).
+- **Fix shape:** add an explicit session-ID lookup through the normal list-search entry point.
+- **Why deferred:** recorded during syntax review; the current focus is the unresponsive Session window.
+- **Risk if wrong:** adding identity matching only in the metadata fallback could leave an earlier indexed-candidate filter excluding the session.
+- **To close:** paste a complete known ID into list search and open the correct session.
+
+### Tool-output list search loses content and overstates deep-scan coverage
+> **open** · sev: med · urg: low · verified 2026-11-11
+
+- **Implementation (2026-11-11):** Return now verifies all eligible rows through bounded semantic scanners, including sampled hits; UI reports incomplete and unresolved coverage. Ordinary/Tool I/O formats are 6/2 and migration obligations bypass cooldowns. Provider and large-field fixtures are recorded in [the implementation ledger](reviews/2026-11-10-search-responsiveness-implementation.md); private-corpus profiling remains deferred.
+- **What:** the [tool-output search diagnosis](reviews/2026-11-10-tool-output-search.md) reproduces Claude output placeholders replacing source text in the index, sampled output recall gaps, and Return skipping indexed sessions under the default deep-scan setting. In-session Find can locate text that list search misses.
+- **Where:** `ToolTextBlockNormalizer.swift:212`, `SessionSearchTextBuilder.swift:273`, `SearchCoordinator.swift:947`, and the linked report's concrete database probes.
+- **Why deferred:** diagnosis is saved; a search-specific implementation and index migration need their own scoped change.
+- **Risk if wrong:** widening indexing or deep scanning without bounds could add large storage and CPU costs.
+- **To close:** correct the omitted-output fallback, align Return behavior and help with actual coverage, and verify exact output-only queries across the recorded source and size cases.
 
 ### Switching to Text or JSON view beachballs
 > **open** · sev: low · urg: low · verified 2026-11-09

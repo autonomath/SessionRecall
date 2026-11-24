@@ -487,6 +487,39 @@ actor IndexDB {
             """
         )
 
+        // Durable, lossless token evidence for Analytics > Economics. The
+        // session row is the repricable payload; the narrow event table lets a
+        // selected date range reject out-of-range sessions without decoding the
+        // payload or reopening transcripts.
+        try exec(db,
+            """
+            CREATE TABLE IF NOT EXISTS economics_telemetry_sessions (
+              source TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              revision_key TEXT NOT NULL,
+              parser_version INTEGER NOT NULL,
+              durable_account_hash TEXT,
+              reference_ts REAL NOT NULL,
+              event_count INTEGER NOT NULL,
+              telemetry_json BLOB NOT NULL,
+              extracted_at INTEGER NOT NULL,
+              PRIMARY KEY(source, session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_economics_telemetry_revision
+              ON economics_telemetry_sessions(source, parser_version, revision_key);
+
+            CREATE TABLE IF NOT EXISTS economics_telemetry_events (
+              source TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              event_index INTEGER NOT NULL,
+              observed_ts REAL NOT NULL,
+              PRIMARY KEY(source, session_id, event_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_economics_telemetry_event_time
+              ON economics_telemetry_events(source, observed_ts, session_id);
+            """
+        )
+
         // Tool IO full-text search (FTS5). Optional, same rationale as session_search_fts.
         do {
             try exec(db,
@@ -546,6 +579,37 @@ actor IndexDB {
             if !tableHasColumn(db, table: "field_docs", column: "skipped") {
                 try exec(db, "ALTER TABLE field_docs ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0;")
             }
+            // Passages: prompt and reply text cut into overlapping pieces with one word index
+            // over them, so a chat where the typed words sit together can outrank a long one
+            // that mentions each somewhere. passages keeps where each piece sits in its field's
+            // stored text. field_docs.passages counts them; NULL means not cut yet. Deleting or
+            // re-reading a session clears its passages, also when an older build does it.
+            if !tableHasColumn(db, table: "field_docs", column: "passages") {
+                try exec(db, "ALTER TABLE field_docs ADD COLUMN passages INTEGER;")
+            }
+            try exec(db,
+                """
+                CREATE TABLE IF NOT EXISTS passages (
+                  id INTEGER PRIMARY KEY,
+                  doc INTEGER NOT NULL,
+                  field TEXT NOT NULL,
+                  ord INTEGER NOT NULL,
+                  start INTEGER NOT NULL,
+                  length INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS passages_doc ON passages(doc, field, ord);
+                CREATE VIRTUAL TABLE IF NOT EXISTS passage_fts USING fts5(text, \(toolTableOptions)tokenize='unicode61 remove_diacritics 2');
+                CREATE TRIGGER IF NOT EXISTS passages_ad AFTER DELETE ON field_docs BEGIN
+                  DELETE FROM passage_fts WHERE rowid IN (SELECT id FROM passages WHERE doc = old.id);
+                  DELETE FROM passages WHERE doc = old.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS passages_au AFTER UPDATE OF source, skipped ON field_docs BEGIN
+                  DELETE FROM passage_fts WHERE rowid IN (SELECT id FROM passages WHERE doc = old.id);
+                  DELETE FROM passages WHERE doc = old.id;
+                  UPDATE field_docs SET passages = NULL WHERE id = old.id;
+                END;
+                """
+            )
         } catch {
             // Optional: without these tables search falls back to the sampled index.
         }
@@ -818,6 +882,233 @@ actor IndexDB {
 
     func rollbackSilently() { try? exec("ROLLBACK;") }
 
+    /// Owns the complete search write transaction in one actor turn. Callers must
+    /// not assemble a transaction from separate awaited actor calls: another DB
+    /// operation could otherwise begin or roll back work on the same connection.
+    func commitSearchIngest(_ write: SearchIngestDBWrite) throws {
+        try begin()
+        do {
+            try upsertFile(
+                path: write.path,
+                mtime: write.fileMtime,
+                size: write.fileSize,
+                source: write.source
+            )
+            try upsertSessionMeta(write.meta)
+            try upsertSessionSearch(
+                sessionID: write.meta.sessionID,
+                source: write.source,
+                mtime: write.searchMtime,
+                size: write.searchSize,
+                text: write.searchText
+            )
+            if let fields = write.fields {
+                try upsertSessionFields(sessionID: write.meta.sessionID, source: write.source,
+                                        fields: fields, skipped: write.skippedEvents)
+            }
+            if let toolIO = write.toolIO {
+                try upsertSessionToolIO(
+                    sessionID: write.meta.sessionID,
+                    source: write.source,
+                    mtime: write.searchMtime,
+                    size: write.searchSize,
+                    refTS: toolIO.referenceTimestamp,
+                    text: toolIO.text
+                )
+            }
+            try commit()
+        } catch {
+            rollbackSilently()
+            throw error
+        }
+    }
+
+    // MARK: - Economics telemetry index
+
+    /// Atomically replaces one session's repricable telemetry payload and its
+    /// narrow timestamp index. The payload contains no transcript text.
+    func upsertEconomicsTelemetry(_ entry: EconomicsTelemetryIndexEntry) throws {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let payload = try JSONEncoder().encode(entry.telemetry)
+        let indexedEvents = entry.telemetry.usageEvents.filter {
+            $0.ownership == .session && $0.topLineTokens > 0
+        }
+        let deleteSQL = "DELETE FROM economics_telemetry_events WHERE source = ? AND session_id = ?;"
+        let sessionSQL =
+            """
+            INSERT OR REPLACE INTO economics_telemetry_sessions(
+              source, session_id, revision_key, parser_version,
+              durable_account_hash, reference_ts, event_count,
+              telemetry_json, extracted_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+        let eventSQL =
+            """
+            INSERT INTO economics_telemetry_events(
+              source, session_id, event_index, observed_ts
+            ) VALUES(?, ?, ?, ?);
+            """
+
+        try exec("BEGIN IMMEDIATE;")
+        do {
+            var deleteStatement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK else {
+                throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(deleteStatement) }
+            sqlite3_bind_text(deleteStatement, 1, entry.source.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(deleteStatement, 2, entry.sessionID, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(deleteStatement) == SQLITE_DONE else {
+                throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            var sessionStatement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sessionSQL, -1, &sessionStatement, nil) == SQLITE_OK else {
+                throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(sessionStatement) }
+            sqlite3_bind_text(sessionStatement, 1, entry.source.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(sessionStatement, 2, entry.sessionID, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(sessionStatement, 3, entry.revisionKey, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(sessionStatement, 4, Int32(entry.parserVersion))
+            if let durableAccountHash = entry.durableAccountHash {
+                sqlite3_bind_text(sessionStatement, 5, durableAccountHash, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(sessionStatement, 5)
+            }
+            sqlite3_bind_double(sessionStatement, 6, entry.referenceDate.timeIntervalSince1970)
+            sqlite3_bind_int64(sessionStatement, 7, Int64(indexedEvents.count))
+            _ = payload.withUnsafeBytes { bytes in
+                sqlite3_bind_blob(sessionStatement, 8, bytes.baseAddress, Int32(bytes.count), SQLITE_TRANSIENT)
+            }
+            sqlite3_bind_int64(sessionStatement, 9, Int64(Date().timeIntervalSince1970))
+            guard sqlite3_step(sessionStatement) == SQLITE_DONE else {
+                throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            if !indexedEvents.isEmpty {
+                var eventStatement: OpaquePointer?
+                guard sqlite3_prepare_v2(db, eventSQL, -1, &eventStatement, nil) == SQLITE_OK else {
+                    throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+                }
+                defer { sqlite3_finalize(eventStatement) }
+                for (index, event) in indexedEvents.enumerated() {
+                    sqlite3_reset(eventStatement)
+                    sqlite3_clear_bindings(eventStatement)
+                    sqlite3_bind_text(eventStatement, 1, entry.source.rawValue, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(eventStatement, 2, entry.sessionID, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_int64(eventStatement, 3, Int64(index))
+                    let observedAt = event.completedAt ?? event.observedAt ?? entry.referenceDate
+                    sqlite3_bind_double(eventStatement, 4, observedAt.timeIntervalSince1970)
+                    guard sqlite3_step(eventStatement) == SQLITE_DONE else {
+                        throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
+                    }
+                }
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Loads revision metadata for every candidate and decodes a payload only
+    /// when its event index intersects the selected period. A current row with a
+    /// nil payload is a warm, in-range-empty result, not a cache miss.
+    func economicsTelemetryLookups(
+        keys: [EconomicsTelemetryIndexKey],
+        periodStart: Date?,
+        periodEnd: Date
+    ) throws -> [EconomicsTelemetryIndexLookup] {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        guard !keys.isEmpty else { return [] }
+        let sessionSQL =
+            """
+            SELECT revision_key, parser_version, durable_account_hash,
+                   reference_ts, event_count, telemetry_json
+            FROM economics_telemetry_sessions
+            WHERE source = ? AND session_id = ?;
+            """
+        let eventSQL =
+            """
+            SELECT EXISTS(
+              SELECT 1 FROM economics_telemetry_events
+              WHERE source = ? AND session_id = ?
+                AND observed_ts >= ? AND observed_ts < ?
+              LIMIT 1
+            );
+            """
+        var sessionStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sessionSQL, -1, &sessionStatement, nil) == SQLITE_OK else {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(sessionStatement) }
+        var eventStatement: OpaquePointer?
+        if periodStart != nil {
+            guard sqlite3_prepare_v2(db, eventSQL, -1, &eventStatement, nil) == SQLITE_OK else {
+                throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+        defer { sqlite3_finalize(eventStatement) }
+
+        var lookups: [EconomicsTelemetryIndexLookup] = []
+        lookups.reserveCapacity(keys.count)
+        for key in keys {
+            sqlite3_reset(sessionStatement)
+            sqlite3_clear_bindings(sessionStatement)
+            sqlite3_bind_text(sessionStatement, 1, key.source.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(sessionStatement, 2, key.sessionID, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(sessionStatement) == SQLITE_ROW else { continue }
+
+            let revisionKey = sqlite3_column_text(sessionStatement, 0).map { String(cString: $0) } ?? ""
+            let parserVersion = Int(sqlite3_column_int64(sessionStatement, 1))
+            let durableHash = sqlite3_column_text(sessionStatement, 2).map { String(cString: $0) }
+            let referenceDate = Date(timeIntervalSince1970: sqlite3_column_double(sessionStatement, 3))
+            let eventCount = Int(sqlite3_column_int64(sessionStatement, 4))
+            let hasEvidenceInPeriod: Bool
+            if let periodStart {
+                if eventCount == 0 {
+                    hasEvidenceInPeriod = referenceDate >= periodStart && referenceDate < periodEnd
+                } else if let eventStatement {
+                    sqlite3_reset(eventStatement)
+                    sqlite3_clear_bindings(eventStatement)
+                    sqlite3_bind_text(eventStatement, 1, key.source.rawValue, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(eventStatement, 2, key.sessionID, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_double(eventStatement, 3, periodStart.timeIntervalSince1970)
+                    sqlite3_bind_double(eventStatement, 4, periodEnd.timeIntervalSince1970)
+                    hasEvidenceInPeriod = sqlite3_step(eventStatement) == SQLITE_ROW
+                        && sqlite3_column_int(eventStatement, 0) == 1
+                } else {
+                    hasEvidenceInPeriod = false
+                }
+            } else {
+                hasEvidenceInPeriod = true
+            }
+
+            var telemetry: SessionTelemetry?
+            if hasEvidenceInPeriod,
+               let blob = sqlite3_column_blob(sessionStatement, 5) {
+                let count = Int(sqlite3_column_bytes(sessionStatement, 5))
+                telemetry = try? JSONDecoder().decode(
+                    SessionTelemetry.self,
+                    from: Data(bytes: blob, count: count)
+                )
+                // A corrupt payload is a miss. Do not preserve its metadata as a
+                // warm empty row because that would suppress a repair backfill.
+                if telemetry == nil { continue }
+            }
+            lookups.append(EconomicsTelemetryIndexLookup(
+                source: key.source,
+                sessionID: key.sessionID,
+                revisionKey: revisionKey,
+                parserVersion: parserVersion,
+                durableAccountHash: durableHash,
+                telemetry: telemetry
+            ))
+        }
+        return lookups
+    }
+
     // MARK: - Simple query helpers
     private func queryOneInt64(_ sql: String) throws -> Int64 {
         guard let db = handle else { throw DBError.openFailed("db closed") }
@@ -1056,6 +1347,41 @@ actor IndexDB {
             out.append(row)
         }
         return out
+    }
+
+    /// Required schema/extraction rebuilds survive restarts and bypass content cooldowns.
+    func requiredSearchMigrations(source: String, includeToolIO: Bool, toolIOCutoff: Int64)
+        throws -> (paths: Set<String>, sessionIDs: Set<String>) {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let sql = """
+        SELECT m.path, m.session_id FROM session_meta m
+        LEFT JOIN session_search s ON s.session_id = m.session_id AND s.source = m.source
+        WHERE m.source = ? AND (s.session_id IS NULL OR s.format_version != ?)
+        UNION
+        SELECT m.path, m.session_id FROM session_meta m LEFT JOIN session_tool_io t
+          ON t.session_id = m.session_id AND t.source = m.source
+        WHERE m.source = ? AND ? = 1 AND COALESCE(t.ref_ts, m.end_ts) >= ?
+          AND (t.session_id IS NULL OR t.format_version != ?);
+        """
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, source, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(statement, 2, Int32(FeatureFlags.sessionSearchFormatVersion))
+        sqlite3_bind_text(statement, 3, source, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(statement, 4, includeToolIO ? 1 : 0)
+        sqlite3_bind_int64(statement, 5, toolIOCutoff)
+        sqlite3_bind_int(statement, 6, Int32(FeatureFlags.sessionToolIOFormatVersion))
+        var paths = Set<String>(), sessionIDs = Set<String>()
+        var step = sqlite3_step(statement)
+        while step == SQLITE_ROW {
+            if let path = sqlite3_column_text(statement, 0) { paths.insert(String(cString: path)) }
+            if let id = sqlite3_column_text(statement, 1) { sessionIDs.insert(String(cString: id)) }
+            step = sqlite3_step(statement)
+        }
+        guard step == SQLITE_DONE else {
+            throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return (paths, sessionIDs)
     }
 
     /// Fetch file paths that are fully populated for search (files + session_meta + session_search).
@@ -2448,6 +2774,141 @@ actor IndexDB {
             sqlite3_bind_text(insert, 2, text, -1, SQLITE_TRANSIENT)
             if sqlite3_step(insert) != SQLITE_DONE { throw DBError.execFailed("insert \(table)") }
         }
+        if passageTablesExist() { try writePassages(doc: id, fields: fields) }
+    }
+
+    private func passageTablesExist() -> Bool {
+        Self.tableHasColumn(handle, table: "field_docs", column: "passages")
+    }
+
+    /// Cuts one session's prompt and reply text into passages and indexes them. Its earlier
+    /// passages are already gone (trigger passages_au).
+    private func writePassages(doc: Int64, fields: [TranscriptField: String]) throws {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let span = try prepare("INSERT INTO passages(doc, field, ord, start, length) VALUES(?,?,?,?,?);")
+        defer { sqlite3_finalize(span) }
+        let index = try prepare("INSERT INTO passage_fts(rowid, text) VALUES(?,?);")
+        defer { sqlite3_finalize(index) }
+        var count: Int64 = 0
+        for field in TranscriptField.allCases where field.storesText {
+            guard let text = fields[field], !text.isEmpty else { continue }
+            // Unicode scalars, the characters SQLite's substr() counts.
+            let scalars = Array(text.unicodeScalars)
+            for (ord, range) in Passages.ranges(in: scalars).enumerated() {
+                sqlite3_reset(span)
+                sqlite3_bind_int64(span, 1, doc)
+                sqlite3_bind_text(span, 2, field.rawValue, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int64(span, 3, Int64(ord))
+                sqlite3_bind_int64(span, 4, Int64(range.lowerBound + 1))  // substr() counts from 1
+                sqlite3_bind_int64(span, 5, Int64(range.count))
+                if sqlite3_step(span) != SQLITE_DONE { throw DBError.execFailed("insert passages") }
+                var piece = String.UnicodeScalarView()
+                piece.append(contentsOf: scalars[range])
+                sqlite3_reset(index)
+                sqlite3_bind_int64(index, 1, sqlite3_last_insert_rowid(db))
+                sqlite3_bind_text(index, 2, String(piece), -1, SQLITE_TRANSIENT)
+                if sqlite3_step(index) != SQLITE_DONE { throw DBError.execFailed("insert passage_fts") }
+                count += 1
+            }
+        }
+        let done = try prepare("UPDATE field_docs SET passages = ? WHERE id = ?;")
+        defer { sqlite3_finalize(done) }
+        sqlite3_bind_int64(done, 1, count)
+        sqlite3_bind_int64(done, 2, doc)
+        if sqlite3_step(done) != SQLITE_DONE { throw DBError.execFailed("count passages") }
+    }
+
+    /// Cuts passages for sessions indexed before passages existed, from their stored prompt
+    /// and reply text. Returns how many sessions it handled; 0 when none are left.
+    func fillPassages(limit: Int = 25) throws -> Int {
+        guard passageTablesExist() else { return 0 }
+        var docs: [Int64] = []
+        do {
+            let pending = try prepare("SELECT id FROM field_docs WHERE passages IS NULL LIMIT ?;")
+            defer { sqlite3_finalize(pending) }
+            sqlite3_bind_int64(pending, 1, Int64(limit))
+            while sqlite3_step(pending) == SQLITE_ROW { docs.append(sqlite3_column_int64(pending, 0)) }
+        }
+        guard !docs.isEmpty else { return 0 }
+        // A savepoint: an ingest on another task may hold a transaction open.
+        try exec("SAVEPOINT passages;")
+        do {
+            for doc in docs {
+                var fields: [TranscriptField: String] = [:]
+                for field in TranscriptField.allCases where field.storesText {
+                    guard let table = field.table else { continue }
+                    let read = try prepare("SELECT text FROM \(table) WHERE rowid = ?;")
+                    defer { sqlite3_finalize(read) }
+                    sqlite3_bind_int64(read, 1, doc)
+                    if sqlite3_step(read) == SQLITE_ROW, let c = sqlite3_column_text(read, 0) { fields[field] = String(cString: c) }
+                }
+                try writePassages(doc: doc, fields: fields)
+            }
+            try exec("RELEASE passages;")
+        } catch {
+            try? exec("ROLLBACK TO passages; RELEASE passages;")
+            throw error
+        }
+        return docs.count
+    }
+
+    struct PassageMatch: Sendable {
+        let sessionID: String
+        let source: String
+        let field: TranscriptField
+        let ord: Int
+        let score: Double
+    }
+
+    /// The best-scoring passage of each session and field, scored by BM25 over all passages
+    /// and weighted like its field. Empty until passages exist.
+    func searchPassages(query: String, sources: [String]) throws -> [PassageMatch] {
+        guard !sources.isEmpty, passageTablesExist() else { return [] }
+        let qs = Array(repeating: "?", count: sources.count).joined(separator: ",")
+        // bm25() cannot be read inside max(), hence the materialized step.
+        let stmt = try prepare("""
+            WITH m AS MATERIALIZED (SELECT rowid AS id, -bm25(passage_fts) AS score FROM passage_fts WHERE passage_fts MATCH ?)
+            SELECT d.session_id, d.source, p.field, p.ord, max(m.score)
+            FROM m JOIN passages p ON p.id = m.id JOIN field_docs d ON d.id = p.doc
+            WHERE d.source IN (\(qs))
+            GROUP BY p.doc, p.field;
+            """)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, query, -1, SQLITE_TRANSIENT)
+        for (i, source) in sources.enumerated() { sqlite3_bind_text(stmt, Int32(i + 2), source, -1, SQLITE_TRANSIENT) }
+        var out: [PassageMatch] = []
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            if let id = sqlite3_column_text(stmt, 0), let source = sqlite3_column_text(stmt, 1),
+               let name = sqlite3_column_text(stmt, 2), let field = TranscriptField(rawValue: String(cString: name)) {
+                out.append(PassageMatch(sessionID: String(cString: id), source: String(cString: source), field: field,
+                                        ord: Int(sqlite3_column_int64(stmt, 3)),
+                                        score: sqlite3_column_double(stmt, 4) * field.weight))
+            }
+            step = sqlite3_step(stmt)
+        }
+        guard step == SQLITE_DONE else { throw DBError.execFailed("search passages") }
+        return out
+    }
+
+    /// The text of passages of one field, in the order asked, read from the field's stored text.
+    func passageTexts(field: TranscriptField, passages: [(sessionID: String, ord: Int)]) throws -> [String?] {
+        guard field.storesText, let table = field.table, !passages.isEmpty else { return [] }
+        let stmt = try prepare("""
+            SELECT substr(t.text, p.start, p.length)
+            FROM field_docs d JOIN passages p ON p.doc = d.id AND p.field = ? AND p.ord = ?
+            JOIN \(table) t ON t.rowid = d.id
+            WHERE d.session_id = ?;
+            """)
+        defer { sqlite3_finalize(stmt) }
+        return passages.map { passage in
+            sqlite3_reset(stmt)
+            sqlite3_bind_text(stmt, 1, field.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(stmt, 2, Int64(passage.ord))
+            sqlite3_bind_text(stmt, 3, passage.sessionID, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) else { return nil }
+            return String(cString: c)
+        }
     }
 
     /// Sessions that have been through the field indexer, for reporting incomplete coverage.
@@ -2947,6 +3408,21 @@ actor IndexDB {
         return (clause: "\(column) NOT IN (\(placeholders))", binds: sorted)
     }
 
+    /// Actor-local temporary membership is installed synchronously before preparing
+    /// the query. Eligibility reaches SQLite before ranking/LIMIT even above its bind limit.
+    private func installSearchEligibleIDs(_ ids: Set<String>) throws {
+        try exec("CREATE TEMP TABLE IF NOT EXISTS search_eligible_ids (id TEXT PRIMARY KEY) WITHOUT ROWID;")
+        try exec("DELETE FROM temp.search_eligible_ids;")
+        let statement = try prepare("INSERT INTO temp.search_eligible_ids(id) VALUES (?);")
+        defer { sqlite3_finalize(statement) }
+        for id in ids {
+            try Task.checkCancellation()
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, id, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw DBError.execFailed("search eligibility") }
+        }
+    }
+
     func searchSessionIDsFTS(
         sources: [String],
         model: String?,
@@ -2966,7 +3442,13 @@ actor IndexDB {
         guard limit > 0 else { return [] }
         var clauses: [String] = []
         var binds: [Any] = []
+        if let eligibleSessionIDs {
+            if eligibleSessionIDs.isEmpty { return [] }
+            try installSearchEligibleIDs(eligibleSessionIDs)
+            clauses.append("sm.session_id IN (SELECT id FROM temp.search_eligible_ids)")
+        }
 
+        clauses.append("s.format_version = \(FeatureFlags.sessionSearchFormatVersion)")
         clauses.append("session_search_fts MATCH ?")
         binds.append(query)
 
@@ -3004,7 +3486,7 @@ actor IndexDB {
         SELECT sm.session_id
         FROM session_search_fts f
         JOIN session_search s ON s.rowid = f.rowid
-        JOIN session_meta sm ON sm.session_id = s.session_id
+        JOIN session_meta sm ON sm.session_id = s.session_id AND sm.source = s.source
         \(whereSQL)
         ORDER BY bm25(session_search_fts), sm.session_id
         LIMIT ? OFFSET ?;
@@ -3073,7 +3555,13 @@ actor IndexDB {
         guard limit > 0 else { return [] }
         var clauses: [String] = []
         var binds: [Any] = []
+        if let eligibleSessionIDs {
+            if eligibleSessionIDs.isEmpty { return [] }
+            try installSearchEligibleIDs(eligibleSessionIDs)
+            clauses.append("sm.session_id IN (SELECT id FROM temp.search_eligible_ids)")
+        }
 
+        clauses.append("t.format_version = \(FeatureFlags.sessionToolIOFormatVersion)")
         clauses.append("session_tool_io_fts MATCH ?")
         binds.append(query)
 
@@ -3110,7 +3598,7 @@ actor IndexDB {
         SELECT sm.session_id
         FROM session_tool_io_fts f
         JOIN session_tool_io t ON t.rowid = f.rowid
-        JOIN session_meta sm ON sm.session_id = t.session_id
+        JOIN session_meta sm ON sm.session_id = t.session_id AND sm.source = t.source
         \(whereSQL)
         ORDER BY bm25(session_tool_io_fts), sm.session_id
         LIMIT ? OFFSET ?;
@@ -3688,7 +4176,7 @@ actor IndexDB {
 }
 
 // MARK: - DTOs
-struct SessionMetaRow {
+struct SessionMetaRow: Sendable {
     let sessionID: String
     let source: String
     let path: String
@@ -3769,6 +4257,27 @@ struct SessionMetaRow {
         self.surface = surface ?? codexSurface
         self.openClawPreviewDigest = openClawPreviewDigest
     }
+}
+
+struct SearchIngestDBWrite: Sendable {
+    struct ToolIO: Sendable {
+        let referenceTimestamp: Int64
+        let text: String
+    }
+
+    let path: String
+    let fileMtime: Int64
+    let fileSize: Int64
+    let source: String
+    let meta: SessionMetaRow
+    let searchMtime: Int64
+    let searchSize: Int64
+    let searchText: String
+    let toolIO: ToolIO?
+    /// The whole text of each field for the ranked index; nil leaves the field index alone.
+    var fields: [TranscriptField: String]? = nil
+    /// Events the parser dropped as too large to read.
+    var skippedEvents: Int = 0
 }
 
 struct SessionDayRow {

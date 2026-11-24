@@ -169,6 +169,29 @@ struct WeeklyQuotaAttributionContext: Sendable {
     let calibrationProvenance: WeeklyQuotaCalibrationProvenance
 }
 
+/// Provider-window conversion for aggregate Economics reporting.
+///
+/// This deliberately uses the same displayable local estimate as Quota Meter.
+/// Unlike per-session attribution, it does not claim that a transcript belongs
+/// to a particular account. Callers may only apply it to local usage inside the
+/// returned provider window and must continue to label the result estimated.
+struct WeeklyQuotaEconomicsContext: Sendable {
+    let percentPointsPerDollar: Double
+    let windowStart: Date
+    let resetAt: Date
+    let isLocalEstimate: Bool
+    let calibrationProvenance: WeeklyQuotaCalibrationProvenance
+    /// Process-local ownership token. Credential/account invalidation advances
+    /// this generation so a suspended Economics calculation cannot publish a
+    /// context captured for the previous owner.
+    let ownerGeneration: Int
+    /// Process-local producer identity. Claude Web contexts also retain the
+    /// request lease so a credential epoch change invalidates them immediately,
+    /// before NotificationCenter can deliver its deferred cleanup callback.
+    let processOwner: String?
+    let processOwnerLease: ClaudeCredentialRequestLease?
+}
+
 /// One accepted observation of the conversion.
 struct WeeklyQuotaCalibration: Equatable, Codable, Sendable {
     let percentPointsPerDollar: Double
@@ -277,6 +300,7 @@ final class WeeklyQuotaActivityLedger {
     private var seenEventOrder: [(key: String, at: Date)] = []
     private var lastPollAt: Date?
     private var firstPollAt: Date?
+    private var priceRevision: Int?
     private let lock = NSLock()
     /// Provider whose quota this ledger measures (`"claude"`, `"codex"`). Prices
     /// come from that provider's own rows only
@@ -298,12 +322,27 @@ final class WeeklyQuotaActivityLedger {
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
+        resetLocked()
+    }
+
+    private func resetLocked() {
         lastSeen.removeAll()
         buckets.removeAll()
         seenEvents.removeAll()
         seenEventOrder.removeAll()
         lastPollAt = nil
         firstPollAt = nil
+        priceRevision = nil
+    }
+
+    /// Start a new coverage span when provider prices change. The old dollars
+    /// cannot be combined with the new table's dollars in a calibration.
+    private func beginRecording(with snapshot: RunwayPriceSnapshot) {
+        let revision = provider.map { snapshot.rateRevision(forProvider: $0) } ?? snapshot.revision
+        if priceRevision != revision {
+            resetLocked()
+            priceRevision = revision
+        }
     }
 
     /// Bank one cycle's worth of activity. Every call appends a bucket — even a
@@ -315,6 +354,7 @@ final class WeeklyQuotaActivityLedger {
         lock.lock(); defer { lock.unlock() }
 
         let snapshot = priceTable.snapshot()
+        beginRecording(with: snapshot)
         var dollars = 0.0
         var hadUnpriced = false
 
@@ -378,6 +418,7 @@ final class WeeklyQuotaActivityLedger {
         lock.lock(); defer { lock.unlock() }
 
         let snapshot = priceTable.snapshot()
+        beginRecording(with: snapshot)
         let previousPollAt = lastPollAt
         let effectivePollAt = max(previousPollAt ?? now, now)
         for event in events {
@@ -461,8 +502,9 @@ final class WeeklyQuotaActivityLedger {
         let maxPollGap: TimeInterval
     }
 
-    func activity(from start: Date, to end: Date) -> IntervalActivity? {
+    func activity(from start: Date, to end: Date, matchingPriceRevision: Int? = nil) -> IntervalActivity? {
         lock.lock(); defer { lock.unlock() }
+        if provider != nil, let matchingPriceRevision, priceRevision != matchingPriceRevision { return nil }
         let inRange = buckets.filter { $0.at > start && $0.at <= end }
             .sorted { $0.at < $1.at }
         guard !inRange.isEmpty else { return nil }
@@ -657,7 +699,8 @@ struct WeeklyQuotaCalibrationTracker {
         // poll would turn it into an artificial last-poll spike.
         guard drop >= minimumDrop else { return nil }
 
-        guard let activity = ledger.activity(from: previous.observedAt, to: observedAt) else {
+        guard let activity = ledger.activity(from: previous.observedAt, to: observedAt,
+                                             matchingPriceRevision: newScope.priceRevision) else {
             anchor = Anchor(remainingPercent: remainingPercent, observedAt: observedAt, resetAt: resetAt)
             return nil
         }
@@ -846,6 +889,8 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     /// Latest weekly consumption seen per provider, so a stored bootstrap's
     /// numerator can be kept current without rescanning.
     private var latestUsedPercentPoints: [String: Double] = [:]
+    /// Cutoff for denominators paired with the reported quota percentage.
+    private var latestQuotaObservedAt: [String: Date] = [:]
     /// The window that `latestUsedPercentPoints` was reported against. Freshening
     /// pairs a numerator with a denominator, and the two must describe the SAME
     /// window — see `freshenedBootstrapRatio`.
@@ -886,6 +931,15 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     /// dispatch and its completion is discarded if it no longer matches, so an old
     /// account's in-flight walk cannot land in the new account's state.
     private var scopeGenerations: [String: Int] = [:]
+    private struct ProcessOwnerBinding {
+        let owner: String?
+        let lease: ClaudeCredentialRequestLease?
+    }
+    /// The provider's process-local producer identity is intentionally separate
+    /// from durable calibration scope. Claude exposes no durable account id, so
+    /// this is the only proof that a Web-derived conversion still belongs to the
+    /// credential that produced it.
+    private var processOwnerBindings: [String: ProcessOwnerBinding] = [:]
     /// Backoff after a scan that returned nothing usable. Long enough that a
     /// permanently unscannable root costs one walk per interval, short enough that
     /// a transient read failure self-heals well inside a weekly window.
@@ -893,12 +947,15 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     /// Best-conditioned bootstrap ever seen for a provider (largest numerator),
     /// retained across weekly resets. See `bestConditionedBootstrap`.
     private var bestBootstraps: [String: WeeklyQuotaBootstrapResult] = [:]
-    /// Anchors already scanned (or being scanned), so the week is walked once per
-    /// window rather than once per 5s runway cycle.
-    private var scannedAnchors: Set<String> = []
+    private struct CompletedBootstrapScan {
+        let resetsAt: Date
+        let growthBucket: Int
+    }
+    /// Successful scans within each provider's active calibration scope.
+    private var scannedAnchors: [String: [CompletedBootstrapScan]] = [:]
     /// Providers with a bootstrap scan currently running. The waiting clock must
     /// not flip to "n/a" mid-scan and then flip back to a number when it lands.
-    private var scansInFlight: Set<String> = []
+    private var scansInFlight: [String: Int] = [:]
     /// When each in-flight scan began, so a stalled one cannot suppress the
     /// waiting budget forever (see `calibrationAbandoned`).
     private var scanStartedAt: [String: Date] = [:]
@@ -935,6 +992,7 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                 usedPercentPoints: usedPercentPoints,
                 priceTable: priceTable,
                 now: now,
+                shouldCancel: shouldCancel,
                 fileManager: FileManager.default)
         }
         guard let accountHash else { return nil }
@@ -998,6 +1056,10 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
 
     func ledger(provider: String) -> WeeklyQuotaActivityLedger {
         lock.lock(); defer { lock.unlock() }
+        return ledgerLocked(provider: provider)
+    }
+
+    private func ledgerLocked(provider: String) -> WeeklyQuotaActivityLedger {
         if let existing = ledgers[provider] { return existing }
         let created = WeeklyQuotaActivityLedger(provider: provider)
         ledgers[provider] = created
@@ -1305,6 +1367,86 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                                              calibrationProvenance: selection.provenance)
     }
 
+    /// Aggregate quota economics for the current provider window.
+    ///
+    /// Quota Meter already presents account-unidentified transcript history as a
+    /// local estimate because providers do not stamp every transcript with a
+    /// durable account id. Economics needs that same aggregate conversion; using
+    /// `attributionContext` here made quota/hour permanently unavailable for real
+    /// Codex history. The exact per-session path remains unchanged and fail-closed.
+    func economicsContext(provider: String, now: Date) -> WeeklyQuotaEconomicsContext? {
+        lock.lock(); defer { lock.unlock() }
+        let calibration = runwayCalibrationLocked(provider: provider, now: now)
+        guard calibration.state.canDisplayRate,
+              let ratio = calibration.ratio,
+              ratio.isFinite,
+              ratio > 0,
+              let provenance = calibration.provenance else { return nil }
+
+        let scope = trackers[provider]?.currentScope
+        let scopedReset: Date? = snapshots[provider]?.last.flatMap { snapshot -> Date? in
+            guard let scope,
+                  snapshot.provider == scope.provider,
+                  snapshot.accountHash == scope.accountHash,
+                  snapshot.sourceFamily == scope.sourceFamily,
+                  snapshot.limitShape == scope.limitShape,
+                  snapshot.priceRevision == scope.priceRevision else { return nil }
+            return snapshot.resetAt
+        }
+        let currentReset = scopedReset
+            ?? latestResetsAt[provider]
+            ?? provenance.originResetAt
+        guard let resetAt = currentReset else { return nil }
+
+        let measuredWindow = provenance.originResetAt.flatMap { originReset in
+            provenance.originWindowStart.map { originReset.timeIntervalSince($0) }
+        }
+        let windowSeconds = measuredWindow.flatMap {
+            $0.isFinite && $0 > 0 ? $0 : nil
+        } ?? (7 * 24 * 60 * 60)
+
+        return WeeklyQuotaEconomicsContext(
+            percentPointsPerDollar: ratio,
+            windowStart: resetAt.addingTimeInterval(-windowSeconds),
+            resetAt: resetAt,
+            isLocalEstimate: calibration.state == .localEstimate,
+            calibrationProvenance: provenance,
+            ownerGeneration: scopeGenerations[provider] ?? 0,
+            processOwner: processOwnerBindings[provider]?.owner,
+            processOwnerLease: processOwnerBindings[provider]?.lease
+        )
+    }
+
+    func economicsContextIsCurrent(provider: String,
+                                   context: WeeklyQuotaEconomicsContext) -> Bool {
+        lock.lock()
+        let generationIsCurrent = (scopeGenerations[provider] ?? 0) == context.ownerGeneration
+        let currentBinding = processOwnerBindings[provider]
+        let ownerIsCurrent = currentBinding?.owner == context.processOwner
+        lock.unlock()
+
+        guard generationIsCurrent, ownerIsCurrent else { return false }
+        guard context.processOwner?.hasPrefix("web:") == true
+                || context.processOwner?.hasPrefix("legacy:") == true else {
+            return true
+        }
+        guard let lease = context.processOwnerLease,
+              lease.owner == context.processOwner else { return false }
+        return lease.isValid
+    }
+
+    /// Binds otherwise-unscoped process-local evidence to the producer that
+    /// supplied it. Callers invalidate the whole scope before changing owners.
+    func bindInMemoryScopeOwner(provider: String,
+                                owner: String?,
+                                requestLease: ClaudeCredentialRequestLease?) {
+        lock.lock(); defer { lock.unlock() }
+        processOwnerBindings[provider] = ProcessOwnerBinding(
+            owner: owner,
+            lease: requestLease
+        )
+    }
+
     /// Ledger activity since a bootstrap was measured, or nil when the ledger
     /// cannot vouch for that span.
     ///
@@ -1323,7 +1465,8 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                                 now: Date) -> WeeklyQuotaActivityLedger.IntervalActivity? {
         guard now.timeIntervalSince(bootstrap.scannedAt) <= WeeklyQuotaActivityLedger.retention,
               let ledger = ledgers[provider],
-              let since = ledger.activity(from: bootstrap.scannedAt, to: now),
+              let since = ledger.activity(from: bootstrap.scannedAt, to: now,
+                                          matchingPriceRevision: bootstrap.priceRevision),
               !since.hadIncompleteCoverage,
               !since.hadUnpriced,
               since.maxPollGap <= WeeklyQuotaCalibrationTracker.maximumPollGap else { return nil }
@@ -1359,7 +1502,8 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
         // consumption is somewhere in [2, 3); taking 2 biases every estimate low,
         // and the bias is worst exactly where the numerator is smallest.
         let used = reported + WeeklyQuotaBootstrapResult.quantizationMidpoint
-        guard let since = ledgerCoverage(provider: provider, since: bootstrap, now: now) else { return nil }
+        let cutoff = min(latestQuotaObservedAt[provider] ?? now, now)
+        guard let since = ledgerCoverage(provider: provider, since: bootstrap, now: cutoff) else { return nil }
         let dollars = bootstrap.dollars + since.dollars
         guard dollars > 0 else { return nil }
         let ratio = used / dollars
@@ -1412,20 +1556,18 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     /// True once the waiting budget has elapsed with nothing to show. Measured
     /// from APP LAUNCH, deliberately: a per-attempt or per-session timer would
     /// restart under the user and let the spinner run indefinitely in practice.
-    func calibrationAbandoned(provider: String, now: Date) -> Bool {
+    func calibrationAbandoned(provider: String, now: Date, matchingPriceRevision: Int? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if provider == "codex" {
-            if runwayCalibrationLocked(provider: provider, now: now).state.canDisplayRate {
-                return false
-            }
-        } else if calibrationSelectionLocked(provider: provider, now: now) != nil {
+        let calibration = runwayCalibrationLocked(provider: provider, now: now)
+        if calibration.state.canDisplayRate,
+           matchingPriceRevision.map({ calibration.provenance?.priceRevision == $0 }) ?? true {
             return false
         }
         // A scan still running WILL produce a number, so don't show "n/a" only to
         // contradict it seconds later. Bounded by `scanDeadline`: without that, a
         // stalled scan would pin the clock on screen forever, which is the exact
         // failure the launch budget exists to prevent.
-        if scansInFlight.contains(provider),
+        if scansInFlight[provider] != nil,
            let startedAt = scanStartedAt[provider],
            now.timeIntervalSince(startedAt) <= Self.scanDeadline {
             return false
@@ -1444,8 +1586,8 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                       scope: WeeklyQuotaCalibrationScope,
                       now: Date,
                       defaults: UserDefaults = .standard) -> WeeklyQuotaCalibration? {
-        let ledger = self.ledger(provider: provider)
         lock.lock(); defer { lock.unlock() }
+        let ledger = ledgerLocked(provider: provider)
 
         var tracker = trackers[provider] ?? WeeklyQuotaCalibrationTracker()
         let restoreKey = Self.defaultsKey(provider: provider, scope: scope)
@@ -1596,7 +1738,9 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     }
 
     /// Compute the historical calibration for the current weekly window, once per
-    /// anchor, off the main thread. Safe to call on every usage poll.
+    /// anchor, off the main thread. Safe to call on every usage poll. Returns
+    /// false when a scan for an older scope still needs to exit before retrying.
+    @discardableResult
     func ensureBootstrap(provider: String,
                          root: URL,
                          resetsAt: Date,
@@ -1605,8 +1749,10 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                          accountHash: String? = nil,
                          limitShape: String? = nil,
                          sourceFamily: String? = nil,
+                         matchingPriceRevision: Int? = nil,
+                         quotaObservedAt: Date? = nil,
                          now: Date = Date(),
-                         defaults: UserDefaults = .standard) {
+                         defaults: UserDefaults = .standard) -> Bool {
         // A bootstrap without durable account identity may serve the current
         // process and current quota window, but it must not survive either an app
         // restart or a window transition. Otherwise another account can inherit
@@ -1617,14 +1763,17 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
         let canPersistBootstrap = provider != "claude" || accountHash != nil
         let storeKey = Self.bootstrapKey(provider: provider, accountHash: accountHash, resetsAt: resetsAt)
         let bestKey = Self.bestBootstrapKey(provider: provider, accountHash: accountHash)
+        lock.lock()
         let priceRevision = priceRevisionProvider(provider)
+        guard matchingPriceRevision.map({ $0 == priceRevision }) ?? true else {
+            lock.unlock()
+            return false
+        }
         let scopeKey = BootstrapScopeKey(
             accountHash: accountHash,
             priceRevision: priceRevision,
             limitShape: limitShape,
             sourceFamily: sourceFamily)
-        var promoted: WeeklyQuotaBootstrapResult?
-        lock.lock()
         if !canPersistBootstrap {
             if let current = bootstraps[provider],
                abs(current.resetsAt.timeIntervalSince(resetsAt))
@@ -1660,12 +1809,13 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
             migratedProviders.remove(provider)
             scanCooldownUntil[provider] = nil
             dispatchedScans[provider] = nil
-            scannedAnchors = scannedAnchors.filter { !$0.hasPrefix("\(provider)|") }
+            scannedAnchors[provider] = nil
             // Any scan still walking belongs to the previous account.
             scopeGenerations[provider] = (scopeGenerations[provider] ?? 0) + 1
         }
         activeScopeKeys[provider] = scopeKey
         latestUsedPercentPoints[provider] = usedPercentPoints
+        latestQuotaObservedAt[provider] = quotaObservedAt
         latestResetsAt[provider] = resetsAt
         // Restore the carried-over measurement once per process. Without this the
         // cross-reset carry only works while the app keeps running.
@@ -1724,22 +1874,20 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
            let current = bootstraps[provider],
            (bestBootstraps[provider]?.usedPercentPoints ?? 0) <= current.usedPercentPoints {
             bestBootstraps[provider] = current
-            promoted = current
+            if let encoded = try? JSONEncoder().encode(current) {
+                defaults.set(encoded, forKey: bestKey)
+            }
         }
+        let generation = scopeGenerations[provider] ?? 0
         let stored = bootstraps[provider]
         let storedIsFreshenable = stored.map {
             ledgerCoverage(provider: provider, since: $0, now: now) != nil
         } ?? false
         lock.unlock()
-        if canPersistBootstrap,
-           let promoted,
-           let encoded = try? JSONEncoder().encode(promoted) {
-            defaults.set(encoded, forKey: bestKey)
-        }
 
         // Re-scan when the window has moved on enough that the stored ratio is
         // materially less accurate than a fresh one would be.
-        let anchorKey = "\(provider)|\(Int(resetsAt.timeIntervalSince1970))|\(Int(usedPercentPoints / Self.bootstrapRefreshGrowthPercentPoints))"
+        let growthBucket = Int(usedPercentPoints / Self.bootstrapRefreshGrowthPercentPoints)
         // Two independent triggers, because either alone leaves a stale ratio.
         //
         // Growth: the window has consumed enough more that a fresh scan is better
@@ -1762,7 +1910,7 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                 || now.timeIntervalSince($0.scannedAt) > WeeklyQuotaActivityLedger.retention
                 || !storedIsFreshenable
         } ?? true
-        guard staleEnough else { return }
+        guard staleEnough else { return true }
 
         // `scannedAnchors` records SUCCESSES, never attempts. Marking on dispatch
         // looks equivalent and is not: every failure path below returns without
@@ -1773,22 +1921,32 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
         // share a bucket, so the burnt attempt blocked any retry until 3pp.
         // Failures back off on a cooldown instead.
         lock.lock()
-        let blocked = scannedAnchors.contains(anchorKey)
-            || scansInFlight.contains(provider)
+        guard (scopeGenerations[provider] ?? 0) == generation,
+              priceRevisionProvider(provider) == priceRevision else {
+            lock.unlock()
+            return false
+        }
+        let obsoleteScanInFlight = scansInFlight[provider].map { $0 != generation } ?? false
+        let alreadyScanned = scannedAnchors[provider]?.contains {
+            $0.growthBucket == growthBucket
+                && abs($0.resetsAt.timeIntervalSince(resetsAt)) < CodexWeeklyQuotaBootstrapScanner.anchorTolerance
+        } ?? false
+        let blocked = alreadyScanned
+            || scansInFlight[provider] != nil
             || (scanCooldownUntil[provider].map { now < $0 } ?? false)
         if !blocked {
-            scansInFlight.insert(provider)
+            scansInFlight[provider] = generation
             scanStartedAt[provider] = now
             dispatchedScans[provider, default: 0] += 1
         }
-        let generation = scopeGenerations[provider] ?? 0
         lock.unlock()
-        guard !blocked else { return }
+        // The caller can retry on its next tick after an old scope's scan exits.
+        guard !blocked else { return !obsoleteScanInFlight }
 
         DispatchQueue.global(qos: .utility).async {
             defer {
                 self.lock.lock()
-                self.scansInFlight.remove(provider)
+                self.scansInFlight[provider] = nil
                 self.scanStartedAt[provider] = nil
                 self.lock.unlock()
             }
@@ -1797,7 +1955,8 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                 // A failed scan belongs to the scope that dispatched it just as
                 // much as a successful result does. Without this guard, account A
                 // can fail after a switch and impose its ten-minute cooldown on B.
-                guard (self.scopeGenerations[provider] ?? 0) == generation else {
+                guard (self.scopeGenerations[provider] ?? 0) == generation,
+                      self.priceRevisionProvider(provider) == priceRevision else {
                     self.lock.unlock()
                     return
                 }
@@ -1806,9 +1965,10 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
             }
             guard let result = self.scanRunner(
                 provider, root, resetsAt, windowMinutes, usedPercentPoints,
-                RunwayPriceTable.shared, now, accountHash, {
+                RunwayPriceTable.shared, min(quotaObservedAt ?? now, now), accountHash, {
                     self.lock.lock(); defer { self.lock.unlock() }
                     return (self.scopeGenerations[provider] ?? 0) != generation
+                        || self.priceRevisionProvider(provider) != priceRevision
                 }
             ) else { backOff(); return }
             // A week can contain one slug the price table has never seen without
@@ -1826,19 +1986,21 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
             // The account may have changed while this walk was running. Its
             // result describes the PREVIOUS account and must not land here — the
             // dictionaries are keyed by provider, so nothing else would stop it.
-            guard (self.scopeGenerations[provider] ?? 0) == generation else {
+            guard (self.scopeGenerations[provider] ?? 0) == generation,
+                  self.priceRevisionProvider(provider) == priceRevision,
+                  stamped.priceRevision.map({ $0 == priceRevision }) ?? true else {
                 self.lock.unlock()
                 CodexWeeklyQuotaBootstrapScanner.debugLog(
                     "BOOTSTRAP DISCARDED provider=\(provider) reason=scope-changed-during-scan")
                 return
             }
-            self.scannedAnchors.insert(anchorKey)
+            self.scannedAnchors[provider, default: []].append(
+                .init(resetsAt: resetsAt, growthBucket: growthBucket))
             self.scanCooldownUntil[provider] = nil
             self.bootstraps[provider] = stamped
             let isBest = canPersistBootstrap
                 && (self.bestBootstraps[provider]?.usedPercentPoints ?? 0) <= stamped.usedPercentPoints
             if isBest { self.bestBootstraps[provider] = stamped }
-            self.lock.unlock()
             if isBest, let encoded = try? JSONEncoder().encode(stamped) {
                 defaults.set(encoded, forKey: bestKey)
             }
@@ -1846,8 +2008,44 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
                let encoded = try? JSONEncoder().encode(stamped) {
                 defaults.set(encoded, forKey: storeKey)
             }
+            self.lock.unlock()
             CodexWeeklyQuotaBootstrapScanner.debugLog(
                 "BOOTSTRAP STORED provider=\(provider) ppPerDollar=\(result.percentPointsPerDollar ?? -1)")
+        }
+        return true
+    }
+
+    /// Drops process-local evidence for one provider and invalidates any scan
+    /// still running under the previous credential/scope. Persisted evidence is
+    /// left untouched; normal scope checks decide whether it can be restored.
+    func invalidateInMemoryScope(provider: String) {
+        lock.lock(); defer { lock.unlock() }
+        ledgers[provider] = nil
+        trackers[provider] = nil
+        bootstraps[provider] = nil
+        bestBootstraps[provider] = nil
+        latestUsedPercentPoints[provider] = nil
+        latestQuotaObservedAt[provider] = nil
+        latestResetsAt[provider] = nil
+        activeScopeKeys[provider] = nil
+        processOwnerBindings[provider] = nil
+        snapshots[provider] = nil
+        migratedProviders.remove(provider)
+        scanCooldownUntil[provider] = nil
+        dispatchedScans[provider] = nil
+        scannedAnchors[provider] = nil
+        // Keep an old scan registered until its defer runs. The generation bump
+        // below makes its result ineligible; retaining the slot prevents a second
+        // scan from overlapping it and the old defer from clearing the new lease.
+        scopeGenerations[provider] = (scopeGenerations[provider] ?? 0) + 1
+        restored = restored.filter {
+            !$0.hasPrefix("quotaMeter.weeklyCalibration.\(provider).")
+        }
+        restoredSnapshotKeys = restoredSnapshotKeys.filter {
+            !$0.hasPrefix("quotaMeter.weeklyQuotaSnapshots.\(provider).")
+        }
+        lastSnapshotPersistedAt = lastSnapshotPersistedAt.filter {
+            !$0.key.hasPrefix("quotaMeter.weeklyQuotaSnapshots.\(provider).")
         }
     }
 
@@ -1862,12 +2060,14 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
         bootstraps.removeAll()
         bestBootstraps.removeAll()
         latestUsedPercentPoints.removeAll()
+        latestQuotaObservedAt.removeAll()
         latestResetsAt.removeAll()
         activeScopeKeys.removeAll()
         migratedProviders.removeAll()
         scanCooldownUntil.removeAll()
         dispatchedScans.removeAll()
         scopeGenerations.removeAll()
+        processOwnerBindings.removeAll()
         scannedAnchors.removeAll()
         scansInFlight.removeAll()
         scanStartedAt.removeAll()
@@ -1877,6 +2077,11 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     }
 
     #if DEBUG
+    func scopeGenerationForTesting(provider: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return scopeGenerations[provider] ?? 0
+    }
+
     func setBootstrapForTesting(provider: String, result: WeeklyQuotaBootstrapResult?) {
         lock.lock(); defer { lock.unlock() }
         bootstraps[provider] = result
@@ -1913,7 +2118,7 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
     /// Whether a scan for this provider completed with a usable result.
     func scanSucceededForTesting(provider: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return scannedAnchors.contains { $0.hasPrefix("\(provider)|") }
+        return scannedAnchors[provider]?.isEmpty == false
     }
 
     /// True while a failed scan is backing off. A blocked retry here is a bug when
@@ -1925,7 +2130,7 @@ final class WeeklyQuotaCalibrationStore: @unchecked Sendable {
 
     func scanIsInFlightForTesting(provider: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return scansInFlight.contains(provider)
+        return scansInFlight[provider] != nil
     }
 
     func clearScanCooldownForTesting(provider: String) {

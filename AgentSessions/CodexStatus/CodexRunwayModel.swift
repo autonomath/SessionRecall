@@ -45,14 +45,34 @@ struct RunwayFileSignature: Hashable, Sendable {
 /// recomputed by the caller each cycle from the cached artifact, so state still
 /// advances as `now` moves with the disk unchanged.
 final class RunwayFileParseCache<Value>: @unchecked Sendable {
+    private struct FileRevision: Hashable {
+        let path: String
+        let signature: RunwayFileSignature
+    }
+
+    private final class PendingParse {
+        let completion = DispatchGroup()
+        var result: Value?
+
+        init() { completion.enter() }
+    }
+
     private let lock = NSLock()
+    private let coalescesConcurrentParses: Bool
     private var entries: [String: (signature: RunwayFileSignature, value: Value)] = [:]
+    private var pendingParses: [FileRevision: PendingParse] = [:]
+    private var latestParseByPath: [String: PendingParse] = [:]
 
     #if DEBUG
     /// Counts `parse` invocations (cache misses). Tests assert this does not
     /// advance on a second scan of unchanged files.
     private(set) var missCount = 0
     #endif
+
+    /// Enable only when all consumers parse the same byte range for a revision.
+    init(coalescesConcurrentParses: Bool = false) {
+        self.coalescesConcurrentParses = coalescesConcurrentParses
+    }
 
     /// Cached value for `path` when its signature is unchanged; otherwise runs
     /// `parse`, stores, and returns it. `signature` comes from the caller's
@@ -64,17 +84,45 @@ final class RunwayFileParseCache<Value>: @unchecked Sendable {
             lock.unlock()
             return value
         }
+        let revision = FileRevision(path: path, signature: signature)
+        let pending: PendingParse?
+        if coalescesConcurrentParses {
+            if let existing = pendingParses[revision] {
+                lock.unlock()
+                existing.completion.wait()
+                // Completion is signaled only after the result is stored.
+                lock.lock()
+                defer { lock.unlock() }
+                return existing.result!
+            }
+            let reservation = PendingParse()
+            pendingParses[revision] = reservation
+            latestParseByPath[path] = reservation
+            pending = reservation
+        } else {
+            pending = nil
+        }
         lock.unlock()
-        // Parse outside the lock — file IO must not serialize the whole cache.
-        // A concurrent miss on the same path simply parses twice and stores the
-        // same value (last writer wins); the artifact is a pure function of bytes.
+        // Other paths and revisions can parse while the lock is released.
         let value = parse()
         lock.lock()
-        entries[path] = (signature, value)
+        if let pending {
+            // An older read can finish late. Its callers still get their
+            // result, while the cache keeps the newer requested revision.
+            if latestParseByPath[path] === pending {
+                entries[path] = (signature, value)
+                latestParseByPath.removeValue(forKey: path)
+            }
+            pending.result = value
+            pendingParses.removeValue(forKey: revision)
+        } else {
+            entries[path] = (signature, value)
+        }
         #if DEBUG
         missCount += 1
         #endif
         lock.unlock()
+        pending?.completion.leave()
         return value
     }
 
@@ -477,6 +525,15 @@ struct CodexRunwaySnapshotRequest: Equatable, Identifiable, Sendable {
     var weeklyPercentPointsPerDollar: Double? {
         weeklyCalibration.state.canDisplayRate ? weeklyCalibration.ratio : nil
     }
+    func weeklyCalibration(matching prices: RunwayPriceSnapshot) -> WeeklyRunwayCalibration {
+        let provider = baseline.source == .codex ? "codex" : "claude"
+        if let provenance = weeklyCalibration.provenance,
+           provenance.priceRevision != prices.rateRevision(forProvider: provider) {
+            return .measuring
+        }
+        return weeklyCalibration
+    }
+
     /// False when the provider exposes no weekly limit at all — weekly rows then
     /// read "n/a" instead of waiting for a calibration that can never arrive.
     let weeklyWindowAvailable: Bool
@@ -603,23 +660,28 @@ enum CodexRunwaySnapshotLoader {
         "\(request.baseline.source)|\(request.recentSessionsRoot?.path ?? "")"
     }
 
-    static func snapshot(for request: CodexRunwaySnapshotRequest) async -> CodexRunwaySnapshot? {
+    static func snapshot(for request: CodexRunwaySnapshotRequest,
+                         priceTable: RunwayPriceTable = .shared,
+                         calibrationStore: WeeklyQuotaCalibrationStore = .shared) async -> CodexRunwaySnapshot? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let needsWeeklyHistory = request.weeklyResetAt != nil
                     || request.baseline.rateUnit == .weeklyPercentPerHour
-                let sessionScan = CodexRunwayRecentSessionScanner.scan(
+                let recentFiles = CodexRunwayRecentSessionScanner.collectRecentFiles(
                     root: request.recentSessionsRoot,
+                    now: request.now
+                )
+                let sessionScan = CodexRunwayRecentSessionScanner.scan(
+                    files: recentFiles,
                     now: request.now,
                     activeSampleAge: CodexRunwayRecentSessionScanner.maximumActiveSampleAge,
-                    completionGrace: CodexRunwayRecentSessionScanner.maximumActiveSampleAge,
-                    pruneCache: !needsWeeklyHistory
+                    completionGrace: CodexRunwayRecentSessionScanner.maximumActiveSampleAge
                 )
                 // Weekly accounting needs old in-window files; the displayed
                 // runway must still contain only currently active sessions.
                 let ledgerSessionScan = !needsWeeklyHistory ? sessionScan
                     : CodexRunwayRecentSessionScanner.scan(
-                        root: request.recentSessionsRoot,
+                        files: recentFiles,
                         now: request.now,
                         activeSampleAge: CodexRunwayTokenActivityParser.weeklyWindow,
                         completionGrace: CodexRunwayTokenActivityParser.weeklyWindow
@@ -659,9 +721,9 @@ enum CodexRunwaySnapshotLoader {
                             now: request.now
                         )
                     } ?? (events: [], coverageComplete: false)
-                WeeklyQuotaCalibrationStore.shared.ledger(provider: "codex").recordIncremental(
+                calibrationStore.ledger(provider: "codex").recordIncremental(
                     events: ledgerScan.events,
-                    priceTable: RunwayPriceTable.shared,
+                    priceTable: priceTable,
                     now: request.now,
                     coverageComplete: ledgerSessionScan.coverageComplete && ledgerScan.coverageComplete
                 )
@@ -678,9 +740,12 @@ enum CodexRunwaySnapshotLoader {
                 var weeklyUnavailableIDs: Set<String> = []
                 // With a calibration in hand, "no current burn" is a measured zero
                 // ("flat"), not an unanswered question (the clock).
+                let prices = priceTable.snapshot()
+                let weeklyCalibration = request.weeklyCalibration(matching: prices)
+                let weeklyRatio = weeklyCalibration.state.canDisplayRate ? weeklyCalibration.ratio : nil
                 let weeklyPendingConfidence: RunwayAttributionConfidence =
                     (request.baseline.rateUnit == .weeklyPercentPerHour
-                     && request.weeklyPercentPointsPerDollar != nil) ? .direct : .waiting
+                     && weeklyRatio != nil) ? .direct : .waiting
                 switch request.baseline.rateUnit {
                 case .tokensPerHour:
                     // 5h window dropped → no run-out to normalize against, so rows
@@ -693,9 +758,7 @@ enum CodexRunwaySnapshotLoader {
                         maxRows: request.maxRows
                     )
                 case .dollarsPerHour:
-                    // Lazy, self-throttling (<=1/day): the price manifest is only
-                    // ever fetched once someone actually uses the $ presentation.
-                    RunwayPriceTable.shared.refreshInBackground(now: request.now)
+                    priceTable.refreshInBackground()
                     // Per-session $/h from the price table. Sessions we can't price
                     // are dropped; only when NOTHING is priceable do we fall back to
                     // token snapshot-wide (P1) with a token baseline so rows never
@@ -703,7 +766,7 @@ enum CodexRunwaySnapshotLoader {
                     if let dollars = CodexRunwayCalculator.dollarSnapshot(
                         baseline: request.baseline,
                         activities: activities,
-                        priceTable: RunwayPriceTable.shared,
+                        prices: prices, at: request.now,
                         maxRows: request.maxRows
                     ) {
                         core = dollars.snapshot
@@ -724,27 +787,27 @@ enum CodexRunwaySnapshotLoader {
                     // There is deliberately NO fallback to tokens here: `Wk` must
                     // never render tk/h. Without a calibration the rows stay on the
                     // waiting clock; sessions that can never be estimated get "n/a".
-                    RunwayPriceTable.shared.refreshInBackground(now: request.now)
+                    priceTable.refreshInBackground()
                     if !request.weeklyWindowAvailable || request.weeklyCalibrationAbandoned
-                        || request.weeklyCalibration.state.isUnavailable {
+                        || weeklyCalibration.state.isUnavailable {
                         // No weekly limit on this provider at all, or we have waited
                         // long enough that a calibration is evidently not coming.
                         // Either way the clock would be promising a number that will
                         // not arrive, so say "n/a" instead.
                         core = nil
                         weeklyUnavailableIDs = Set(identities.map(\.id))
-                    } else if let calibration = request.weeklyPercentPointsPerDollar,
+                    } else if let calibration = weeklyRatio,
                               let weekly = CodexRunwayCalculator.weeklyEstimatedSnapshot(
                                   baseline: request.baseline,
                                   activities: weeklyProfile.activities,
-                                  priceTable: RunwayPriceTable.shared,
+                                  prices: prices, at: request.now,
                                   percentPointsPerDollar: calibration,
                                   maxRows: request.maxRows
                               ) {
                         core = weekly.snapshot
                         weeklyUnavailableIDs = weekly.unpriceableIDs
                         pendingIdentities = identities.filter { !weekly.unpriceableIDs.contains($0.id) }
-                    } else if request.weeklyPercentPointsPerDollar != nil {
+                    } else if weeklyRatio != nil {
                         // Calibrated, but nothing currently priceable.
                         core = nil
                         weeklyUnavailableIDs = Set(weeklyProfile.activities.map(\.identity.id))
@@ -785,8 +848,8 @@ enum CodexRunwaySnapshotLoader {
                     waitingIDs: weeklyProfile.measuringIDs
                 )
                 if request.baseline.rateUnit == .weeklyPercentPerHour {
-                    snapshot?.weeklyCalibrationState = request.weeklyCalibration.state
-                    snapshot?.weeklyCalibrationRatio = request.weeklyPercentPointsPerDollar
+                    snapshot?.weeklyCalibrationState = weeklyCalibration.state
+                    snapshot?.weeklyCalibrationRatio = weeklyRatio
                 }
                 snapshot?.dollarAggregateIncomplete = dollarAggregateIncomplete
                 // Aggregate token throughput (fine-grained, window-independent) — an
@@ -1329,7 +1392,7 @@ enum CodexRunwayCalculator {
     /// fall back to tokens on nil: `Wk` never renders `tk/h`.
     static func weeklyEstimatedSnapshot(baseline: RunwayProviderBaseline,
                                         activities: [RunwaySessionActivity],
-                                        priceTable: RunwayPriceTable,
+                                        prices: RunwayPriceSnapshot, at: Date = Date(),
                                         percentPointsPerDollar: Double,
                                         maxRows: Int) -> (snapshot: CodexRunwaySnapshot, unpriceableIDs: Set<String>)? {
         guard maxRows > 0 else { return nil }
@@ -1338,7 +1401,7 @@ enum CodexRunwayCalculator {
         var estimated: [(activity: RunwaySessionActivity, percentPerHour: Double)] = []
         var unpriceableIDs: Set<String> = []
         for activity in activities {
-            guard let dollarsPerHour = dollarsPerHour(for: activity, priceTable: priceTable,
+            guard let dollarsPerHour = dollarsPerHour(for: activity, prices: prices, at: at,
                                                       source: baseline.source) else {
                 // Cannot be weighted, so it cannot be estimated. Surfaced as "n/a"
                 // rather than silently omitted or shown as a waiting clock.
@@ -1406,7 +1469,7 @@ enum CodexRunwayCalculator {
     /// Runway burn is provider quota spend, and a session on a third-party model
     /// (`glm-4.7` through Claude Code) is not, even though Session Info prices it.
     static func dollarsPerHour(for activity: RunwaySessionActivity,
-                               priceTable: RunwayPriceTable,
+                               prices: RunwayPriceSnapshot, at: Date = Date(),
                                source: UsageTrackingSource) -> Double? {
         let provider: String
         switch source {
@@ -1424,7 +1487,7 @@ enum CodexRunwayCalculator {
             // the session rather than drop it honestly. That covers an unknown model
             // AND a slice served at a billing tier the model has no rates for — a
             // fast-mode record priced at standard would understate it by half.
-            guard let p = priceTable.price(forModel: component.modelSlug, provider: provider)?.effective(at: Date()),
+            guard let p = prices.price(forModel: component.modelSlug, provider: provider)?.effective(at: at),
                   (component.cacheCreationPerSecond == 0 || p.cacheWritePerMTok != nil),
                   (component.cacheCreation1hPerSecond == 0 || p.cacheWrite1hPerMTok != nil),
                   let rates = p.rates(for: component.speed,
@@ -1455,13 +1518,13 @@ enum CodexRunwayCalculator {
     /// genuinely burning.
     static func dollarSnapshot(baseline: RunwayProviderBaseline,
                                activities: [RunwaySessionActivity],
-                               priceTable: RunwayPriceTable,
+                               prices: RunwayPriceSnapshot, at: Date = Date(),
                                maxRows: Int) -> (snapshot: CodexRunwaySnapshot, unpriceableIDs: Set<String>)? {
         guard maxRows > 0 else { return nil }
         var priced: [(activity: RunwaySessionActivity, dollarsPerHour: Double)] = []
         var unpriceableIDs: Set<String> = []
         for a in activities {
-            if let rate = dollarsPerHour(for: a, priceTable: priceTable, source: baseline.source) {
+            if let rate = dollarsPerHour(for: a, prices: prices, at: at, source: baseline.source) {
                 priced.append((a, rate))
             } else {
                 unpriceableIDs.insert(a.identity.id)
@@ -1894,14 +1957,27 @@ enum CodexRunwayRecentSessionScanner {
                      now: Date = Date(),
                      activeSampleAge: TimeInterval = maximumActiveSampleAge,
                      completionGrace: TimeInterval = maximumGoalCompletionGrace,
-                     pruneCache: Bool = true,
                      fileManager: FileManager = .default) -> CodexRunwayRecentSessionScan {
+        scan(files: collectRecentFiles(root: root, now: now, fileManager: fileManager),
+             now: now, activeSampleAge: activeSampleAge, completionGrace: completionGrace)
+    }
+
+    fileprivate struct RecentFiles {
+        let entries: [(url: URL, signature: RunwayFileSignature)]
+        let threadNames: [String: String]
+        let coverageComplete: Bool
+    }
+
+    /// Both activity windows in a poll use the same physical file inventory.
+    fileprivate static func collectRecentFiles(root: URL?,
+                                               now: Date,
+                                               fileManager: FileManager = .default) -> RecentFiles {
         let rootURL = root ?? defaultRoot()
         let cutoff = now.addingTimeInterval(-maximumFileAge)
         var candidates: [(url: URL, modifiedAt: Date, signature: RunwayFileSignature)] = []
 
         guard fileManager.fileExists(atPath: rootURL.path) else {
-            return CodexRunwayRecentSessionScan(identities: [], coverageComplete: false)
+            return RecentFiles(entries: [], threadNames: [:], coverageComplete: false)
         }
         let roots = rootURL.lastPathComponent == "sessions"
             ? [rootURL, rootURL.deletingLastPathComponent()
@@ -1937,27 +2013,34 @@ enum CodexRunwayRecentSessionScanner {
         let readEntries = candidates
             .sorted { $0.modifiedAt > $1.modifiedAt }
             .prefix(maximumMetadataFiles)
-        // Unchanged files reuse their head/tail parse; the now-dependent active
-        // window is recomputed below. Prune to the files actually read this cycle.
-        if pruneCache {
-            fileCache.retain(paths: Set(readEntries.map { $0.url.path }))
-        }
-        let recentCandidates = readEntries
+        fileCache.retain(paths: Set(readEntries.map { $0.url.path }))
+        return RecentFiles(
+            entries: readEntries.map { ($0.url, $0.signature) },
+            threadNames: threadNames,
+            coverageComplete: rootsReadComplete && candidates.count <= maximumMetadataFiles
+        )
+    }
+
+    fileprivate static func scan(files: RecentFiles,
+                                 now: Date,
+                                 activeSampleAge: TimeInterval,
+                                 completionGrace: TimeInterval) -> CodexRunwayRecentSessionScan {
+        // Both activity windows reuse the cached, time-independent head/tail parse.
+        let recentCandidates = files.entries
             .compactMap {
                 candidate(
                     for: $0.url,
                     now: now,
                     activeSampleAge: activeSampleAge,
                     completionGrace: completionGrace,
-                    threadNames: threadNames,
+                    threadNames: files.threadNames,
                     signature: $0.signature
                 )
             }
         let merged = mergeParentCandidates(recentCandidates)
         return CodexRunwayRecentSessionScan(
             identities: Array(merged.prefix(maximumFiles)),
-            coverageComplete: rootsReadComplete && candidates.count <= maximumMetadataFiles
-                && merged.count <= maximumFiles
+            coverageComplete: files.coverageComplete && merged.count <= maximumFiles
         )
     }
 
@@ -2409,6 +2492,7 @@ private final class CodexWeeklyHistoryStore: @unchecked Sendable {
 }
 
 enum CodexRunwayTokenActivityParser {
+    private static let durableAccountIDFields = [Data("account_id".utf8), Data("accountId".utf8)]
     /// Upper bound on the backward hunt for a `turn_context`. Past this we give up
     /// and the session goes unpriced (dropped from $, still shown in tk/h) rather
     /// than risk pricing it at a guessed model.
@@ -3309,8 +3393,7 @@ enum CodexRunwayTokenActivityParser {
         var coverageComplete = true
         for path in identities.flatMap(\.logPaths) where !seen.contains(path) {
             seen.insert(path)
-            let actualAccountHash = transcriptAccountHash(fromLogPath: path)
-            if let expectedAccountHash, let actualAccountHash,
+            if let expectedAccountHash, let actualAccountHash = transcriptAccountHash(fromLogPath: path),
                actualAccountHash != expectedAccountHash {
                 continue
             }
@@ -3379,7 +3462,8 @@ enum CodexRunwayTokenActivityParser {
     private static func transcriptAccountHash(fromLogPath path: String) -> String? {
         // Durable session metadata is emitted at the start of a rollout. Keep the
         // hot five-second ledger scan bounded even for 100+ MB transcripts.
-        guard let data = CodexRunwayRateLimitParser.headData(path: path, maxBytes: 256 * 1024) else { return nil }
+        guard let data = CodexRunwayRateLimitParser.headData(path: path, maxBytes: 256 * 1024),
+              durableAccountIDFields.contains(where: { data.range(of: $0) != nil }) else { return nil }
         var identity = CodexTranscriptAccountIdentity()
         for line in String(decoding: data, as: UTF8.self)
             .split(separator: "\n", omittingEmptySubsequences: true) {

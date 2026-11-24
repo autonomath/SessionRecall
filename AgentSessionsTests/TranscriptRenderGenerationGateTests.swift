@@ -64,22 +64,17 @@ final class UnifiedTableSelectionPolicyTests: XCTestCase {
         XCTAssertFalse(beforeLivePoll.contains("activeMembership"))
     }
 
-    func testCollapseAllPreservesOffScopeCollapsedParents() {
-        let result = UnifiedHierarchyCommandPolicy.collapsedParentsAfterCollapseAll(
-            existing: ["off-scope-parent"],
-            visibleParentIDs: ["visible-parent"]
-        )
-
-        XCTAssertEqual(result, ["off-scope-parent", "visible-parent"])
+    func testCollapseAllIncludesNewGroupsWithoutReplacingStandardFolds() {
+        let standard: Set<String> = ["manually-collapsed"]
+        XCTAssertTrue(SessionGroupFolding.collapsed.isCollapsed("new-group", standard: standard))
+        XCTAssertFalse(SessionGroupFolding.standard.isCollapsed("new-group", standard: standard))
+        XCTAssertTrue(SessionGroupFolding.standard.isCollapsed("manually-collapsed", standard: standard))
     }
 
-    func testExpandAllOnlyClearsVisibleCollapsedParents() {
-        let result = UnifiedHierarchyCommandPolicy.collapsedParentsAfterExpandAll(
-            existing: ["off-scope-parent", "visible-parent"],
-            visibleParentIDs: ["visible-parent"]
-        )
-
-        XCTAssertEqual(result, ["off-scope-parent"])
+    func testExpandAllLeavesStandardFoldsAvailableForRestoration() {
+        let standard: Set<String> = ["manually-collapsed"]
+        XCTAssertFalse(SessionGroupFolding.expanded.isCollapsed("manually-collapsed", standard: standard))
+        XCTAssertTrue(SessionGroupFolding.standard.isCollapsed("manually-collapsed", standard: standard))
     }
 
     func testCollapseAllPromotesSelectedChildToVisibleParent() {
@@ -464,11 +459,13 @@ final class TranscriptSessionRenderKeyTests: XCTestCase {
 }
 
 final class SessionEquatablePayloadTests: XCTestCase {
-    func testSessionEqualityUsesLightweightEventEdgesNotTranscriptText() {
+    func testSessionEqualityUsesConstantTimeContentRevisionForChangedPayload() {
         let base = makeSession(text: String(repeating: "a", count: 120_000))
         let updatedText = makeSession(text: String(repeating: "b", count: 120_000))
 
-        XCTAssertEqual(base, updatedText)
+        XCTAssertNotEqual(base, updatedText)
+        let samePublication = base
+        XCTAssertEqual(base, samePublication)
     }
 
     func testSessionEqualityChangesWhenEventEdgesChange() {
@@ -639,6 +636,47 @@ final class TranscriptSessionResolutionPolicyTests: XCTestCase {
 
         XCTAssertEqual(preferred?.events.count, 1)
         XCTAssertEqual(preferred?.id, "session-1")
+    }
+
+    /// A reload of a large chat paints its last 2 MB first. Over a complete transcript that
+    /// stand-in is not shown; on a first open, with nothing complete cached, it is.
+    func testTailStandInDoesNotReplaceACompleteCachedTranscript() {
+        var tail = makeSession(id: "session-1", events: [makeEvent(id: "e9")])
+        tail.isPartiallyHydrated = true
+        let complete = makeSession(id: "session-1", events: (1...9).map { makeEvent(id: "e\($0)") })
+        func preferred(cached: Session?) -> Session? {
+            TranscriptSessionResolutionPolicy.preferredSession(live: tail, cached: cached, sessionID: "session-1",
+                                                               isLoadingSession: true, loadingSessionID: "session-1")
+        }
+        XCTAssertEqual(preferred(cached: complete)?.events.count, 9)
+        XCTAssertEqual(preferred(cached: nil)?.events.count, 1)
+        XCTAssertEqual(preferred(cached: tail)?.events.count, 1)
+        XCTAssertEqual(preferred(cached: makeSession(id: "session-2", events: [makeEvent(id: "x")]))?.events.count, 1)
+        // The complete parse that follows is shown as soon as it lands.
+        let grown = makeSession(id: "session-1", events: (1...12).map { makeEvent(id: "e\($0)") })
+        XCTAssertEqual(TranscriptSessionResolutionPolicy.preferredSession(live: grown, cached: complete, sessionID: "session-1",
+                                                                           isLoadingSession: false, loadingSessionID: nil)?.events.count, 12)
+    }
+
+    /// A refresh publishes rows without transcripts; the open chat keeps the one it has loaded.
+    func testRefreshCarriesTheOpenChatsLoadedTranscript() {
+        let loaded = makeSession(id: "session-1", events: (1...9).map { makeEvent(id: "e\($0)") })
+        let refreshed = [makeSession(id: "session-0", events: []), makeSession(id: "session-1", events: [], eventCount: 40),
+                         makeSession(id: "session-2", events: [])]
+        let carried = SessionIndexer.carryingLoadedTranscript(of: loaded, into: refreshed)
+        XCTAssertEqual(carried.map(\.id), ["session-0", "session-1", "session-2"])
+        XCTAssertEqual(carried.map(\.events.count), [0, 9, 0])
+        XCTAssertFalse(carried[1].isPartiallyHydrated)
+        // A tail-first stand-in stays marked as one, so the full parse still follows it.
+        var tail = makeSession(id: "session-1", events: [makeEvent(id: "e9")])
+        tail.isPartiallyHydrated = true
+        XCTAssertTrue(SessionIndexer.carryingLoadedTranscript(of: tail, into: refreshed)[1].isPartiallyHydrated)
+        // Nothing loaded, a chat that is gone, or a row that already has a transcript: unchanged.
+        XCTAssertEqual(SessionIndexer.carryingLoadedTranscript(of: nil, into: refreshed).map(\.events.count), [0, 0, 0])
+        XCTAssertEqual(SessionIndexer.carryingLoadedTranscript(of: makeSession(id: "gone", events: [makeEvent(id: "x")]), into: refreshed)
+            .map(\.events.count), [0, 0, 0])
+        let reparsed = [makeSession(id: "session-1", events: (1...12).map { makeEvent(id: "e\($0)") })]
+        XCTAssertEqual(SessionIndexer.carryingLoadedTranscript(of: loaded, into: reparsed)[0].events.count, 12)
     }
 
     private func makeSession(id: String,

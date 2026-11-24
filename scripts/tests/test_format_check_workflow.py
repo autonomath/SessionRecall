@@ -394,6 +394,16 @@ def test_price_prefix_normalization_and_unpriced_negative():
     assert flow.price_key("<synthetic>", table) == "<synthetic>"
 
 
+def test_deepseek_route_estimates_match_coverage():
+    import agent_watch_workflow as flow
+    table = json.loads((REPO / "docs/prices-v2.json").read_text())
+    for slug in ("opencode/deepseek-v4.1-flash", "opencode/deepseek-v4.1-flash-free",
+                 "cline-free/deepseek-v4.1-flash", "DeepSeek-V4.1-Flash-Free (Medium)"):
+        assert flow.price_key(slug, table) == "opencode/deepseek-v4.1-flash"
+    for slug in ("deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash", "deepseek-flash"):
+        assert flow.price_key(slug, table) is None
+
+
 def test_recent_model_coverage_excludes_old_and_tool_input(tmp_path):
     import agent_watch_workflow as flow
     import os
@@ -508,15 +518,34 @@ def test_sampling_summary_names_store_size():
     assert flow.sampling_summary({"sampled_sessions": 5, "store_sessions": 162}) == " sampled 5 of 162"
 
 
-def test_pi_uses_the_provider_refreshed_by_the_owner():
+def test_pi_prebump_uses_the_tool_capable_openai_chat_model():
     cfg = json.loads((REPO / "docs/agent-support/agent-watch-config.json").read_text())
-    assert cfg["agents"]["pi"]["prebump"]["model"] == "openai/gpt-6-luna"
+    assert cfg["agents"]["pi"]["prebump"]["model"] == "openai/gpt-6.1-sol"
 
 
 def test_failure_classifier_sees_oauth_refresh_error_at_end(tmp_path):
     out = tmp_path / "stdout.txt"
     out.write_text("initialization\n" * 500 + "OAuth token refresh failed: refresh_token_reused (401)\n")
     assert watch._classify_prebump_failure({"error": "pi_tool_turn_missing", "stdout_file": str(out)}) == "auth_failed"
+
+
+def test_failure_classifier_distinguishes_pi_oauth_from_a_missing_tool_turn(tmp_path):
+    out = tmp_path / "stdout.jsonl"
+    entry = {"error": "pi_tool_turn_missing", "stdout_file": str(out)}
+    out.write_text(json.dumps({"message": {"stopReason": "error",
+        "errorMessage": 'OAuth refresh failed for openai: OAuth token request failed (400): {"error":"invalid_grant"}'}}))
+    assert watch._classify_prebump_failure(entry) == "auth_failed"
+    out.write_text(json.dumps({"message": {"stopReason": "stop", "content": "No tool was called"}}))
+    assert watch._classify_prebump_failure(entry) == "driver_failed"
+
+
+def test_failure_classifier_recognizes_openclaw_config_error(tmp_path):
+    out = tmp_path / "stdout.json"
+    entry = {"error": "openclaw_local_agent_failed rc=1", "stdout_file": str(out)}
+    out.write_text(json.dumps({"message": "OpenClaw config is invalid: ~/.openclaw/openclaw.json"}))
+    assert watch._classify_prebump_failure(entry) == "config_error"
+    out.write_text(json.dumps({"message": "OpenClaw session failed"}))
+    assert watch._classify_prebump_failure(entry) == "driver_failed"
 
 
 def test_opencode_version_helper_uses_sandbox_cwd(tmp_path, monkeypatch):
@@ -535,6 +564,29 @@ def test_stable_wrapper_uses_relative_derived_data():
 def test_stable_wrapper_forwards_replay_opt_in_to_xctest_host():
     script = (REPO / "scripts/xcode_test_stable.sh").read_text()
     assert 'TEST_RUNNER_AS_REAL_SESSION_REPLAY="${AS_REAL_SESSION_REPLAY:-0}"' in script
+
+
+@pytest.mark.parametrize("manifest_name", ["selected sessions.json", None])
+def test_stable_wrapper_forwards_optional_replay_manifest(tmp_path, monkeypatch, manifest_name):
+    import os
+
+    xcodebuild = tmp_path / "xcodebuild"
+    xcodebuild.write_text(
+        '#!/bin/sh\nprintf "%s" "${TEST_RUNNER_AS_REAL_SESSION_REPLAY_MANIFEST-unset}"\n'
+    )
+    xcodebuild.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.delenv("TEST_RUNNER_AS_REAL_SESSION_REPLAY_MANIFEST", raising=False)
+    monkeypatch.delenv("AS_REAL_SESSION_REPLAY_MANIFEST", raising=False)
+    expected = "unset"
+    if manifest_name is not None:
+        expected = str(tmp_path / manifest_name)
+        monkeypatch.setenv("AS_REAL_SESSION_REPLAY_MANIFEST", expected)
+
+    result = subprocess.run(
+        [str(REPO / "scripts/xcode_test_stable.sh")], capture_output=True, text=True, check=True
+    )
+    assert result.stdout == expected
 
 
 def test_hermes_weekly_unions_five_real_sessions(tmp_path):

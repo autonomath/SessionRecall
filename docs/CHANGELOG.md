@@ -6,9 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Improvements
 
+- **Built on Agent Sessions 7.0.** SessionRecall now has everything in 7.0: Economics in Analytics, syntax color in tool output, smoother large transcripts, Hide Project, and search and filters inside the session-list pane. Ranked search answers from its own index as before. The line above the list says how many sessions search has checked, and Return reads the ones the index has not reached. The search index is not rebuilt.
+- **See the whole chat at a glance.** The Session view draws the chat as marks, in a rail beside the scroll bar or a bar across the top: prompts, replies, tool runs, Codex compactions, forks, and dots where search or Find matched. Pointing at a mark shows what it is and up to four lines of its text; a click or drag goes there. A toolbar button chooses Side, Top, Both or None.
+- **A long Codex chat opens whole.** Codex stores a long chat as several files. Opening one now loads the files it continues first, so the transcript and the history views start at the chat's first prompt.
 - **Indexing is about three times faster.** Reading a session and preparing its text for search took 124 seconds for a sample of 203 Codex sessions and now takes 41, with the same result. Sessions with screenshots gain most: one 232 MB session went from 56 seconds to 12.
 - **A changed session reaches the index sooner.** Each indexing pass paused 40 ms after every session it had nothing to do for, so with 5,000 sessions a changed one waited minutes for its turn. Unchanged sessions no longer cause a pause.
 - **Small words no longer steer the ranking.** Words such as "the", "to", "de" or "les" are not looked up on their own when you type other words with them; the exact phrase still counts. The last word you type, which also matches longer words while you type, now counts once instead of twice.
+- **A session where your words sit together ranks above one that only mentions each somewhere.** Each session was scored as a whole, so a long one that used every word you typed, pages apart, could outrank the one that said them in one sentence. Prompts and replies are now also indexed as passages of about 1,500 characters, and a session's best passage adds to its score. The passage under a result is that passage, and opening the result lands on it. Sessions already indexed get their passages in the background within a minute or so, with no reindex; the index grows by about 50 MB for 5,000 sessions.
 - **Search ignores accents everywhere.** Typing `cafe` already listed a session that says "Café", but the transcript highlighted nothing, Find counted no matches, and titles and not-yet-indexed sessions did not match. They all match now.
 - **Search finds a passage anywhere in a session and lists the best match first.** Search read a 48,000-character sample of each session and listed matches by date. It now indexes the whole text of prompts, replies, tool calls and tool output, ranks sessions by how rare the matched words are and where they appear (title, then prompts, replies, tool calls, tool output), and shows the matched passage under each title. Click a column header to sort by date again. After updating, the search index is rebuilt once; sessions not reindexed yet are still found through the previous index, listed after the ranked results, and the footer says how many remain.
 - **Search one part of a session.** While you search, a bar under the toolbar lists Everything, Title, My prompts, Replies, Tool calls and Tool output, each with how many sessions match there. Click one to search only that part. When nothing matches in it, the bar says so and offers to search everything instead. The bar also says how many sessions are not indexed yet and opens their status in Settings.
@@ -21,9 +25,57 @@ All notable changes to this project will be documented in this file.
 
 ### Fixes
 
+- **The open chat keeps its text during a refresh.** A rescan of the Codex files, which runs every few minutes while agents work, dropped the open chat's loaded text. A chat of 8 MB or more then showed only its last part for a second or two, sometimes for minutes.
+- **A search with "and", "or" or "not" in it finds sessions again.** Typing a plain sentence such as `personal and work task list` was read as hand-written search syntax, which required every word, "and" included, in one part of a session, so it often found nothing. Only `AND`, `OR`, `NOT` and `NEAR` in capitals are operators now.
+- **Search no longer re-reads sessions that did not change.** Agents such as OpenCode keep all their sessions in one database file. When that file changed, every one of its sessions was read from disk again on each search and counted as "updating" in the footer (86 here, with one chat being written). A session in a shared file is now read live only when its own last message is newer than its index entry, and a session with its own file only when that file is newer.
 - **Prompts from newer Codex builds are searchable again.** Codex messages tagged with only a turn id were treated as hidden context, so their prompts were neither searchable nor counted as typed. A delegated chat's brief also counts as its prompt now.
 - **Archived and deleted sessions leave the index.** When Codex moved a session to `archived_sessions`, the old path stayed in the index database forever. Rows of files that are gone are now removed, unless their folder is missing too (an unmounted drive).
 - **Opening a search result lands on the match in long chats and chats still being written.** A long chat first shows its last part while the rest loads, and a chat being written can be a few seconds behind what search read. The jump to the match ran on what was loaded, so the match was counted (1/1) but never shown. The jump now waits for the whole chat, or for the new text to arrive, and turns Tools on when the match is in tool output. A jump that turned Tools on is no longer pulled back to the end of the chat a moment later.
+
+## [7.0] - 2026-11-23
+
+### Highlights
+
+- **Search every local session with explicit coverage.** Search supports terms, phrases, prefixes, Boolean queries, and complete session IDs across enabled agents. Results appear as they are found; Return verifies eligible source sessions and reports complete, incomplete, and unresolved coverage without discarding partial results.
+- **Compare agent economics.** Analytics adds API-equivalent value and attributed quota by agent, model, and thinking effort. It states timing and coverage limits, excludes untimed spend from hourly rates, and keeps provider-wide quota left separate from quota attributable to the selected sessions.
+- **Smoother large transcripts.** Transcript presentation shares message grouping, timing, navigation, and syntax work off the main thread. Fast scrolling defers directory and Presence scans until input settles, reduces repeated row layout, and reliably replaces a large Codex session's provisional tail with the full transcript.
+
+### Search and Organization
+
+- Search and filters stay inside the session-list pane, with active scopes, progress, and detailed coverage kept next to the results. Resume uses one readable button and destination menu; Saved, Archived, and group folding take less toolbar space.
+- Search indexing and verification use bounded source readers, preserve structured tool fields, and rebuild older ordinary and Tool I/O indexes without waiting for content cooldowns.
+- Hide a project from the session list and search with **Hide Project**, then undo immediately or restore it from View → Unhide Projects. Contributed by @buildfolk in #90.
+- Disabled agents no longer appear in the active-filter summary, and search index migrations skip sessions that are already current in a shared database.
+
+### Session View
+
+- Supported fenced code, interpreter heredocs, and verified source text in expanded tool output use syntax color. Unproven multiline commands and mixed-file reads stay plain rather than guessing a language.
+- Git-blame syntax stays contiguous for LF and CRLF output without repeatedly recounting the growing text. Reused tool rows discard old syntax state before displaying new content.
+- Claude sub-sessions show their task name and recorded thinking effort. Session Info counts their own usage separately from work they delegate.
+- Tool-row hover actions do less work while scrolling; Copy and Raw return when scrolling settles. Jump controls keep a stable view hierarchy as their visibility changes.
+- Toggling one hierarchy group after Collapse All or Expand All preserves every other group's visible state.
+
+### Economics, Quota, and Pricing
+
+- Session Info adds prices for GPT-6.2 Astra and Sol, Claude Fable and Mythos 5.2, MAI Code 2 Flash, and two verified free routes. Antigravity uses the response model recorded for each request when available.
+- Quota Meter picks up new model prices in the open app. The $ and Wk views recalculate existing usage, and failed price checks retry automatically.
+- Economics uses one captured price revision from quota attribution through stored-session repricing. Claude discards weekly calibration when its Web credential owner changes.
+- Economics labels zero timed activity as `0m` instead of implying that some activity was measured.
+- Kimi explains incomplete cache-read usage instead of describing the session record as malformed.
+
+### Reliability and Performance
+
+- Search refreshes commit each session atomically across concurrent providers. Quiet, cooled-down, cancelled, failed, or unsupported work remains eligible for a later retry instead of being silently stranded.
+- Background indexing stops at the first incomplete Codex or Claude record and skips unchanged incomplete files on later passes. Search ingest scans newly read JSONL bytes and avoids redundant decoding.
+- Claude Web credentials load asynchronously; changing or removing a credential invalidates older requests, cached responses, quota calibration, and usage publications.
+- Switching apps no longer relabels a completed search as cancelled, and clearing search removes its verification and snippet state. A legacy Claude tmux hard probe now closes any previous Web quota-calibration owner before publishing CLI usage.
+- Live polling matches processes in one pass. Claude keeps CLI and Desktop scan caches separate and shares overlapping reads; Codex shares one session-folder inventory and skips log headers without account metadata.
+- Sessions reuse cleaned titles, transcript cells skip redundant layout, Claude image discovery skips long string runs, and quota scans avoid repeat work for small reset-time variations.
+- Sessions window commands retain a stable focus binding while switching transcripts, avoiding repeated AppKit layout work.
+
+### Website and Documentation
+
+- The README puts the first search next to installation and links the three latest release highlights. The website adds a phone-sized preview, an on-demand notch demo, clearer privacy copy, and direct mobile links to The Rollout, Guides, Bench, and GitHub.
 
 ## [6.6] - 2026-11-18
 

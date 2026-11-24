@@ -53,9 +53,7 @@ final class SessionRowsBuilderTests: XCTestCase {
 
         let cachedExpandableParentIDs: Set<String>
         if isHierarchyBrowsing {
-            cachedExpandableParentIDs = Set(newRows.compactMap { session in
-                hierarchyResult.rowMeta[session.id]?.hasChildren == true ? session.id : nil
-            })
+            cachedExpandableParentIDs = hierarchyResult.expandableParentIDs
         } else {
             cachedExpandableParentIDs = []
         }
@@ -168,6 +166,67 @@ final class SessionRowsBuilderTests: XCTestCase {
 
     // MARK: - Tests
 
+    func testSingleToggleMaterializesGlobalFoldingWithoutChangingOtherParents() {
+        let parents: Set<String> = ["one", "two", "three"]
+        let persistedOffscreen: Set<String> = ["offscreen"]
+
+        XCTAssertEqual(
+            SessionGroupFolding.collapsed.standardCollapsedParents(
+                afterToggling: "one",
+                expandableParentIDs: parents,
+                standard: persistedOffscreen
+            ),
+            ["two", "three", "offscreen"]
+        )
+        XCTAssertEqual(
+            SessionGroupFolding.expanded.standardCollapsedParents(
+                afterToggling: "two",
+                expandableParentIDs: parents,
+                standard: ["one", "offscreen"]
+            ),
+            ["two", "offscreen"]
+        )
+    }
+
+    func testCollapsedModeMaterializesNestedParentsBeforeOpeningOneRoot() {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let rows = [
+            makeSession(id: "root", modifiedAt: date),
+            makeSession(id: "nested", modifiedAt: date.addingTimeInterval(1),
+                        parentSessionID: "root"),
+            makeSession(id: "leaf", modifiedAt: date.addingTimeInterval(2),
+                        parentSessionID: "nested")
+        ]
+        let collapsed = SessionRowsBuilder.build(input: .init(
+            nextRows: rows,
+            allSessions: rows,
+            previousCachedRows: [],
+            collapsedParents: [],
+            folding: .collapsed,
+            showSubagentHierarchy: true,
+            searchActive: false,
+            isHierarchyBrowsing: true,
+            presences: [],
+            directJoinFallbackKeys: []
+        ))
+        XCTAssertEqual(collapsed.cachedRowIDs, ["root"])
+        XCTAssertEqual(collapsed.cachedExpandableParentIDs, ["root", "nested"])
+
+        let standard = SessionGroupFolding.collapsed.standardCollapsedParents(
+            afterToggling: "root",
+            expandableParentIDs: collapsed.cachedExpandableParentIDs,
+            standard: []
+        )
+        let reopened = SubagentHierarchyBuilder.build(
+            sessions: rows,
+            collapsedParents: standard,
+            hierarchyEnabled: true,
+            folding: .standard
+        )
+        XCTAssertEqual(reopened.sessions.map(\.id), ["root", "nested"])
+        XCTAssertEqual(standard, ["nested"], "opening the root must not also reopen its nested parent")
+    }
+
     func testFlatSessionsNoHierarchy() {
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let rows = (0..<10).map { i in
@@ -218,6 +277,26 @@ final class SessionRowsBuilderTests: XCTestCase {
             searchActive: false,
             isHierarchyBrowsing: true
         )
+    }
+
+    func testGroupFoldingShowsTheSameManuallyFoldedGroupsOnReturnToStandard() {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let rows = [
+            makeSession(id: "first", modifiedAt: date),
+            makeSession(id: "second", modifiedAt: date),
+            makeSession(id: "first-child", modifiedAt: date, parentSessionID: "first"),
+            makeSession(id: "second-child", modifiedAt: date, parentSessionID: "second")
+        ]
+        let standard: Set<String> = ["first"]
+        func children(_ mode: SessionGroupFolding) -> Set<String> {
+            let result = SubagentHierarchyBuilder.build(sessions: rows, collapsedParents: standard,
+                                                        hierarchyEnabled: true, folding: mode)
+            return Set(result.sessions.filter { $0.parentSessionID != nil }.map(\.id))
+        }
+        XCTAssertEqual(children(.standard), ["second-child"])
+        XCTAssertEqual(children(.collapsed), [])
+        XCTAssertEqual(children(.expanded), ["first-child", "second-child"])
+        XCTAssertEqual(children(.standard), ["second-child"])
     }
 
     func testHierarchySuppressedDuringSearch() {
