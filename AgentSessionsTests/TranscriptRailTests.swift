@@ -343,10 +343,12 @@ final class TranscriptRailTests: XCTestCase {
         indexer.reloadSession(id: alone.id, force: true, reason: .manualRefresh)
         XCTAssertTrue(indexer.waitForReloadToFinishForTesting(id: alone.id, timeout: 10))
         RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-        let whole = try XCTUnwrap(indexer.allSessions.first { $0.id == alone.id })
+        let row = try XCTUnwrap(indexer.allSessions.first { $0.id == alone.id })
+        XCTAssertEqual(said(row), said(alone), "Search and the session list still see the selected file")
+        let whole = row.transcriptPresentation
         XCTAssertEqual(said(whole), ["prompt one", "reply one", "prompt two", "reply two", "prompt three", "reply three"])
         XCTAssertEqual(Set(whole.events.map(\.id)).count, whole.events.count)
-        XCTAssertEqual(whole.startTime, CodexLineage.date("2026-11-22T19:02:46.000Z"))
+        XCTAssertEqual(whole.events.compactMap(\.timestamp).min(), CodexLineage.date("2026-11-22T19:02:46.000Z"))
         XCTAssertEqual(whole.filePath, pages[2].path)
     }
 

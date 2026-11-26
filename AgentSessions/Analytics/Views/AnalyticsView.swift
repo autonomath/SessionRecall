@@ -258,7 +258,9 @@ struct AnalyticsView: View {
             EconomicsAnalyticsView(
                 snapshot: service.economicsSnapshot,
                 phase: service.economicsPhase,
-                progress: service.economicsProgress
+                progress: service.economicsProgress,
+                catalog: service.catalog,
+                contributingSessions: service.contributingSessions(for:)
             )
         }
     }

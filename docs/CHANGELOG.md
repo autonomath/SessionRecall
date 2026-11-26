@@ -4,7 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Improvements
+## SessionRecall 1.1.1 - 2026-11-25
+
+- Fixed a crash when moving the Quota Meter from Notch to Desktop or reopening it at launch.
+- Updated the Agent Sessions base to 7.0.1, including retained Codex history and screenshots, OpenCode 2.4.1 transcript repair, and Economics comparisons. SessionRecall keeps its passage search and history rail.
+
+### Improvements in SessionRecall 1.1
 
 - **Built on Agent Sessions 7.0.** SessionRecall now has everything in 7.0: Economics in Analytics, syntax color in tool output, smoother large transcripts, Hide Project, and search and filters inside the session-list pane. Ranked search answers from its own index as before. The line above the list says how many sessions search has checked, and Return reads the ones the index has not reached. The search index is not rebuilt.
 - **See the whole chat at a glance.** The Session view draws the chat as marks, in a rail beside the scroll bar or a bar across the top: prompts, replies, tool runs, Codex compactions, forks, and dots where search or Find matched. Pointing at a mark shows what it is and up to four lines of its text; a click or drag goes there. A toolbar button chooses Side, Top, Both or None.
@@ -31,6 +36,30 @@ All notable changes to this project will be documented in this file.
 - **Prompts from newer Codex builds are searchable again.** Codex messages tagged with only a turn id were treated as hidden context, so their prompts were neither searchable nor counted as typed. A delegated chat's brief also counts as its prompt now.
 - **Archived and deleted sessions leave the index.** When Codex moved a session to `archived_sessions`, the old path stayed in the index database forever. Rows of files that are gone are now removed, unless their folder is missing too (an unmounted drive).
 - **Opening a search result lands on the match in long chats and chats still being written.** A long chat first shows its last part while the rest loads, and a chat being written can be a few seconds behind what search read. The jump to the match ran on what was loaded, so the match was counted (1/1) but never shown. The jump now waits for the whole chat, or for the new text to arrive, and turns Tools on when the match is in tool output. A jump that turned Tools on is no longer pulled back to the end of the chat a moment later.
+
+## [7.0.1] - 2026-11-24
+
+### Highlights
+
+- **OpenCode 2.4.1 transcripts are complete again.** Assistant replies and tool output return to transcripts and search. Existing OpenCode SQLite search entries rebuild automatically.
+- **Search shows why a session matched.** Strong matches rank higher, and excerpts show the matching passage. Press Return to verify against the transcripts.
+- **Economics makes effort comparisons easier to judge.** Compare hourly rates, covered time, and session counts under the same filters, then open the transcripts behind the numbers.
+
+### Bug Fixes
+
+- Refresh removes stale search and Analytics entries for Codex and Claude transcripts that were moved or deleted. Disconnected folders keep their index entries. Reported by @nostitos in #98.
+- Codex transcripts stored in several rollouts show the retained history, including compressed pages. Screenshots appear with their original prompts. Based on #102 by @nostitos.
+- Older Codex prompts with turn-ID-only metadata appear in transcripts and exports. Recognized harness context stays out of user text. Reported by @nostitos in #97.
+- Opening a search result waits for the full transcript before jumping to a match. Reported by @nostitos in #99.
+- Find highlights accent variants such as `quebec` and `Québec`. Reported by @nostitos in #96.
+
+### Improvements
+
+- Click a column header to sort the current search results by that column. Ranked results and excerpts are based on the proposal by @nostitos in #95.
+- Codex transcript parsing scans oversized image records faster when looking for tool call IDs. Contributed by @nostitos in #100.
+- Economics model details now show selected-period totals, hourly rate inputs, and exact evidence counts. Weekly rates appear when at least two weeks have enough covered activity. The 7.0 What's New highlight includes an Economics dashboard screenshot in builds from this update.
+- Economics can compare two effort settings for the same model under the active filters. The quota estimate shows record coverage alongside it, and each configuration links to its contributing sessions.
+- Economics reports unavailable pricing and missing transcripts, and only offers effort comparisons for known models. Opening a contributing transcript loads only its provider's viewer.
 
 ## [7.0] - 2026-11-23
 

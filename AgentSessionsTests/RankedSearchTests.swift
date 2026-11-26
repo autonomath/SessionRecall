@@ -431,8 +431,8 @@ final class RankedSearchTests: XCTestCase {
             try await db.upsertSessionSearch(sessionID: id, source: "codex", mtime: 1, size: 1, text: "x")
             try await db.upsertSessionFields(sessionID: id, source: "codex", fields: [.user: "x"])
         }
-        try await db.deleteSessionsForMissingFiles(source: "codex", paths: [moved, unmounted])
         try await db.commit()
+        try await db.persistCoreSessionRefresh(source: .codex, metadata: [], missingPathCandidates: [moved, unmounted])
         let left = try await db.fieldIndexedSessionIDs(sources: ["codex"])
         XCTAssertEqual(left, ["unmounted"])
     }

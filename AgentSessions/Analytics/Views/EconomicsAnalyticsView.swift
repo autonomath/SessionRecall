@@ -5,9 +5,14 @@ struct EconomicsAnalyticsView: View {
     let snapshot: EconomicsSnapshot
     let phase: EconomicsAnalysisPhase
     let progress: EconomicsAnalysisProgress
+    let catalog: SessionProviderCatalog
+    let contributingSessions: (EconomicsConfigurationRow) -> [Session]
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.locale) private var locale
     @State private var selectedConfigurationID: String?
+    @State private var comparisonID: String?
+    @State private var sessionsRow: EconomicsConfigurationRow?
     @State private var metric: EconomicsMetric = .quotaPerHour
 
     private var displayRows: [EconomicsConfigurationRow] {
@@ -45,6 +50,14 @@ struct EconomicsAnalyticsView: View {
         }
         .onAppear { selectFirstRowIfNeeded() }
         .onChange(of: snapshot.rows.map(\.id)) { _, _ in selectFirstRowIfNeeded() }
+        .onChange(of: selectedRow?.id) { _, _ in comparisonID = nil }
+        .sheet(item: $sessionsRow) { row in
+            EconomicsContributingSessionsView(
+                configuration: row.configuration,
+                sessions: contributingSessions(row),
+                catalog: catalog
+            )
+        }
     }
 
     private var content: some View {
@@ -81,7 +94,7 @@ struct EconomicsAnalyticsView: View {
         HStack(spacing: AnalyticsDesign.metricsCardSpacing) {
             summaryCard(
                 title: "API-equivalent value",
-                value: Self.currency(snapshot.totalAPIEquivalentUSD),
+                value: snapshot.pricedAPIEquivalentUSD.map(Self.currency),
                 detail: "Published API rates"
             )
             quotaSummaryCard
@@ -100,14 +113,14 @@ struct EconomicsAnalyticsView: View {
 
     private func summaryCard(
         title: LocalizedStringKey,
-        value: String,
+        value: String?,
         detail: LocalizedStringKey
     ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(value)
+            (value.map { Text(verbatim: $0) } ?? Text("Unavailable"))
                 .font(.system(size: 25, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
@@ -287,7 +300,7 @@ struct EconomicsAnalyticsView: View {
     }
 
     private var detailCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             if let row = selectedRow {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(row.configuration.source.displayName)
@@ -302,71 +315,198 @@ struct EconomicsAnalyticsView: View {
 
                 Divider()
 
-                HStack(spacing: 12) {
-                    detailMetric(
-                        "Attributed quota / timed hour",
-                        value: row.weeklyQuotaPercentPointsPerHour.map(Self.percentPoints) ?? "—"
-                    )
-                    detailMetric(
-                        "API $ / timed hour",
-                        value: row.apiCostPerHour.map(Self.currency) ?? "—"
-                    )
-                }
+                selectedPeriodSummary(for: row)
 
-                if !row.hasSufficientTimedSample(for: .apiCostPerHour)
-                    || !row.hasSufficientTimedSample(for: .quotaPerHour) {
-                    Text("Each hourly rate needs its own 15-minute covered sample. Total value is still included above.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Button("View contributing sessions") { sessionsRow = row }
+                    .font(.callout)
 
-                trendChart(for: row)
+                effortComparison(for: row)
 
                 Divider()
 
-                VStack(alignment: .leading, spacing: 6) {
-                    coverageLine("Price coverage", value: row.priceCoverage)
-                    coverageLine("Quota coverage", value: row.quotaCoverage)
-                    coverageLine("Timed price coverage", value: row.timedPriceCoverage)
-                    HStack {
-                        Text("API timed activity")
-                        Spacer()
-                        Text(AnalyticsSummary.formatDuration(row.apiTimedSeconds))
-                            .monospacedDigit()
-                    }
-                    HStack {
-                        Text("Quota timed activity")
-                        Spacer()
-                        Text(AnalyticsSummary.formatDuration(row.quotaTimedSeconds))
-                            .monospacedDigit()
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                hourlyRateSummary(for: row)
+
+                rateHistory(for: row)
+
+                Divider()
+
+                evidenceSummary(for: row)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 430, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .analyticsCard(colorScheme: colorScheme)
     }
 
-    private func detailMetric(_ title: LocalizedStringKey, value: String) -> some View {
+    private func selectedPeriodSummary(for row: EconomicsConfigurationRow) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Selected period")
+                .font(.caption.weight(.semibold))
+
+            HStack(alignment: .top, spacing: 12) {
+                detailMetric(
+                    "API-equivalent value",
+                    value: row.pricedObservationCount > 0 ? Self.currency(row.apiEquivalentUSD) : nil,
+                    detail: "Published model prices"
+                )
+                detailMetric(
+                    "Weekly quota estimate",
+                    value: row.weeklyQuotaPercentPoints.map(Self.percentPoints),
+                    detail: "\(row.quotaObservationCount) of \(row.observationCount) records covered"
+                )
+            }
+
+            HStack(alignment: .top, spacing: 12) {
+                detailMetric(
+                    "Sessions",
+                    value: row.sessions.formatted(),
+                    detail: "Using this model and effort"
+                )
+                detailMetric(
+                    "Usage records",
+                    value: row.observationCount.formatted(),
+                    detail: "Transcript-derived evidence"
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func effortComparison(for row: EconomicsConfigurationRow) -> some View {
+        let options = EconomicsRowOrdering.otherEfforts(for: row, in: snapshot.rows)
+        if !options.isEmpty {
+            Divider()
+            Picker("Compare effort", selection: $comparisonID) {
+                Text("None").tag(nil as String?)
+                ForEach(options) { option in
+                    Text(option.configuration.effortDisplayName).tag(Optional(option.id))
+                }
+            }
+            if let other = options.first(where: { $0.id == comparisonID }) {
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
+                    GridRow {
+                        Text("Effort")
+                        Text(row.configuration.effortDisplayName)
+                        Text(other.configuration.effortDisplayName)
+                    }
+                    .fontWeight(.semibold)
+                    comparisonRow("Quota per timed hour", row, other) {
+                        $0.weeklyQuotaPercentPointsPerHour.map(Self.percentPoints)
+                    }
+                    comparisonRow("Quota-covered time", row, other) {
+                        AnalyticsSummary.formatDuration($0.quotaTimedSeconds)
+                    }
+                    comparisonRow("API cost per timed hour", row, other) {
+                        $0.apiCostPerHour.map(Self.currency)
+                    }
+                    comparisonRow("Price-covered time", row, other) {
+                        AnalyticsSummary.formatDuration($0.apiTimedSeconds)
+                    }
+                    comparisonRow("Sessions", row, other) { $0.sessions.formatted() }
+                }
+                .font(.caption)
+                .monospacedDigit()
+            }
+        }
+    }
+
+    private func comparisonRow(
+        _ title: LocalizedStringKey,
+        _ row: EconomicsConfigurationRow,
+        _ other: EconomicsConfigurationRow,
+        value: (EconomicsConfigurationRow) -> String?
+    ) -> some View {
+        GridRow {
+            Text(title).foregroundStyle(.secondary)
+            comparisonValue(value(row))
+            comparisonValue(value(other))
+        }
+    }
+
+    @ViewBuilder
+    private func comparisonValue(_ value: String?) -> some View {
+        if let value {
+            Text(value)
+        } else {
+            Text("Unavailable").foregroundStyle(.secondary)
+        }
+    }
+
+    private func hourlyRateSummary(for row: EconomicsConfigurationRow) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Rates from timed activity")
+                .font(.caption.weight(.semibold))
+
+            HStack(spacing: 12) {
+                detailMetric(
+                    "Attributed quota per hour",
+                    value: row.weeklyQuotaPercentPointsPerHour.map(Self.percentPoints),
+                    detail: "\(AnalyticsSummary.formatDuration(row.quotaTimedSeconds)) quota-calibrated"
+                )
+                detailMetric(
+                    "API-equivalent cost per hour",
+                    value: row.apiCostPerHour.map(Self.currency),
+                    detail: "\(AnalyticsSummary.formatDuration(row.apiTimedSeconds)) priced"
+                )
+            }
+
+            if !row.hasSufficientTimedSample(for: .apiCostPerHour)
+                || !row.hasSufficientTimedSample(for: .quotaPerHour) {
+                Text("A rate appears only after 15 minutes of covered activity for that metric. Untimed value remains in the selected-period total.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func detailMetric(
+        _ title: LocalizedStringKey,
+        value: String?,
+        detail: LocalizedStringKey
+    ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Text(value)
-                .font(.title3.weight(.semibold))
-                .monospacedDigit()
+            if let value {
+                Text(value)
+                    .font(.title3.weight(.semibold))
+                    .monospacedDigit()
+            } else {
+                Text("Unavailable")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
-    private func trendChart(for row: EconomicsConfigurationRow) -> some View {
-        let points = snapshot.trendByConfiguration[row.id] ?? []
+    private func rateHistory(for row: EconomicsConfigurationRow) -> some View {
+        let measuredPoints = (snapshot.trendByConfiguration[row.id] ?? [])
+            .filter { $0.value(for: metric) != nil }
+
+        if measuredPoints.count >= 2 {
+            trendChart(points: measuredPoints, row: row)
+        } else {
+            Text("Weekly rate history needs at least two weeks with enough covered activity for the selected metric.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func trendChart(
+        points: [EconomicsTrendPoint],
+        row: EconomicsConfigurationRow
+    ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Selected-period trend")
+                Text("Weekly rates")
                     .font(.caption.weight(.semibold))
                 Spacer()
                 Text(metric == .quotaPerHour ? "attributed % / timed hour" : "$ / timed hour")
@@ -377,13 +517,6 @@ struct EconomicsAnalyticsView: View {
             Chart {
                 ForEach(points) { point in
                     if let value = point.value(for: metric) {
-                        LineMark(
-                            x: .value("Week", point.weekStart),
-                            y: .value("Value", value)
-                        )
-                        .foregroundStyle(Color.agentColor(for: row.configuration.source))
-                        .interpolationMethod(.catmullRom)
-
                         PointMark(
                             x: .value("Week", point.weekStart),
                             y: .value("Value", value)
@@ -393,7 +526,7 @@ struct EconomicsAnalyticsView: View {
                 }
             }
             .chartXAxis {
-                AxisMarks(values: .stride(by: .weekOfYear, count: 2)) { _ in
+                AxisMarks(values: .automatic(desiredCount: 3)) { _ in
                     AxisGridLine().foregroundStyle(.clear)
                     AxisValueLabel(format: .dateTime.month(.abbreviated).day())
                 }
@@ -401,26 +534,52 @@ struct EconomicsAnalyticsView: View {
             .chartYAxis {
                 AxisMarks(position: .leading)
             }
-            .frame(height: 155)
-            .overlay {
-                if points.allSatisfy({ $0.value(for: metric) == nil }) {
-                    Text(metric == .quotaPerHour
-                         ? "Quota history begins with observed provider windows."
-                         : "No priced history for this configuration.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding()
-                }
-            }
+            .frame(height: 135)
         }
     }
 
-    private func coverageLine(_ title: LocalizedStringKey, value: Double) -> some View {
+    private func evidenceSummary(for row: EconomicsConfigurationRow) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Evidence behind these numbers")
+                .font(.caption.weight(.semibold))
+
+            evidenceLine(
+                "Priced usage records",
+                count: row.pricedObservationCount,
+                total: row.observationCount
+            )
+            evidenceLine(
+                "Timed priced records",
+                count: row.timedPricedObservationCount,
+                total: row.pricedObservationCount
+            )
+            evidenceLine(
+                "Quota-attributed priced records",
+                count: row.quotaObservationCount,
+                total: row.pricedObservationCount
+            )
+            evidenceLine(
+                "Timed quota records",
+                count: row.timedQuotaObservationCount,
+                total: row.quotaObservationCount
+            )
+
+            Text("Coverage counts usage records. Hourly rates use only the timestamped activity shown above.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func evidenceLine(
+        _ title: LocalizedStringKey,
+        count: Int,
+        total: Int
+    ) -> some View {
         HStack {
             Text(title)
             Spacer()
-            Text(Self.percentage(value))
+            Text(Self.coverageCount(count: count, total: total, locale: locale))
                 .monospacedDigit()
         }
         .font(.caption)
@@ -548,6 +707,19 @@ struct EconomicsAnalyticsView: View {
         (value * 100).formatted(.number.precision(.fractionLength(0))) + "%"
     }
 
+    static func coverageCount(count: Int, total: Int, locale: Locale) -> String {
+        guard total > 0 else { return String(localized: "No records", locale: locale) }
+        let covered = count.formatted(.number.locale(locale))
+        let records = total.formatted(.number.locale(locale))
+        let fraction = Double(count) / Double(total)
+        let percentage = fraction.formatted(.percent.precision(.fractionLength(0)).locale(locale))
+        return String(
+            localized: "\(covered) of \(records) (\(percentage))",
+            locale: locale,
+            comment: "Economics coverage: covered record count, eligible record count, and formatted coverage percentage."
+        )
+    }
+
     private var quotaSummarySources: [SessionSource] {
         snapshot.quotaPercentPointsBySource.keys.sorted {
             $0.displayName < $1.displayName
@@ -562,4 +734,93 @@ struct EconomicsAnalyticsView: View {
         }
     }
 
+}
+
+private struct EconomicsContributingSessionsView: View {
+    let configuration: EconomicsConfigurationKey
+    let sessions: [Session]
+    let catalog: SessionProviderCatalog
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selection: (session: Session, hasStorage: Bool)?
+    @StateObject private var focusCoordinator = WindowFocusCoordinator()
+    @StateObject private var searchState = UnifiedSearchState()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AnalyticsDesign.metricsCardSpacing) {
+            if let selection {
+                let session = selection.session
+                Button {
+                    focusCoordinator.perform(.closeAllSearch)
+                    self.selection = nil
+                } label: {
+                    Label("Contributing sessions", systemImage: "chevron.left")
+                }
+                Text(session.listTitle)
+                    .font(.headline)
+                    .lineLimit(2)
+                if selection.hasStorage {
+                    TranscriptHostView(
+                        kind: session.source,
+                        selection: session.id,
+                        catalog: catalog,
+                        keepsInactiveProvidersMounted: false
+                    )
+                    .environmentObject(focusCoordinator)
+                    .environmentObject(searchState)
+                    .environmentObject(SessionArchiveManager.shared)
+                    .id(session.id)
+                } else {
+                    Label("Session file not found", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else {
+                Text("Contributing sessions")
+                    .font(.headline)
+                Text("\(configuration.modelDisplayName) · \(configuration.effortDisplayName)")
+                    .foregroundStyle(.secondary)
+                sessionList
+            }
+
+            Button("Done", role: .cancel) { dismiss() }
+                .keyboardShortcut(.cancelAction)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(AnalyticsDesign.windowPadding)
+        .frame(width: 760, height: 560)
+    }
+
+    @ViewBuilder
+    private var sessionList: some View {
+        if sessions.isEmpty {
+            Text("These sessions are no longer in the index.")
+                .frame(maxHeight: .infinity)
+        } else {
+            List(sessions) { session in
+                Button {
+                    let hasStorage = EconomicsTranscriptAvailability.hasStorage(for: session)
+                    if hasStorage, session.events.isEmpty || session.isPartiallyHydrated {
+                        catalog[session.source].handle.reloadFocusedSession(session.id, false, .selection)
+                    }
+                    if hasStorage {
+                        focusCoordinator.perform(.selectSession(id: session.id))
+                    }
+                    selection = (session, hasStorage)
+                } label: {
+                    VStack(alignment: .leading) {
+                        Text(session.listTitle).lineLimit(2)
+                        if let date = session.endTime ?? session.startTime {
+                            Text(date, format: .dateTime.month().day().hour().minute())
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
 }

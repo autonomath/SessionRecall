@@ -837,7 +837,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
     }
 
     private func resolvedSessionForRender(id: String) -> Session? {
-        let live = indexer.allSessions.first(where: { $0.id == id })
+        let live = indexer.allSessions.first(where: { $0.id == id })?.transcriptPresentation
         let preferred = TranscriptSessionResolutionPolicy.preferredSession(
             live: live,
             cached: lastResolvedSession,
@@ -1086,6 +1086,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
                 isNearTranscriptTop = true
                 applyRoleFilterEvent(.sessionChanged)
                 refreshRichInlineImages(session: session)
+                latchSearchAutoJump(for: session)
             }
             .onChange(of: session.contentRevision) { _, _ in
                 refreshRichInlineImages(session: session)
@@ -1151,15 +1152,8 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
                 unifiedSearchJumpWorkItem = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
             }
-            .onChange(of: searchState.autoJumpToken) { _, newValue in
-                guard TranscriptAutoJumpPolicy.shouldLatch(
-                    requestedSessionID: searchState.autoJumpSessionID,
-                    isSearchActive: isUnifiedSearchActive,
-                    displayedSessionID: session.id
-                ) else { return }
-                pendingAutoJumpToken = newValue
-                pendingAutoJumpSessionID = session.id
-                applyAutoJumpIfReady(session: session)
+            .onChange(of: searchState.autoJumpToken, initial: true) { _, _ in
+                latchSearchAutoJump(for: session)
             }
             .onChange(of: focusCoordinator.activeFocus) { oldFocus, newFocus in
                 if newFocus == .transcriptFind {
@@ -2382,7 +2376,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
 
             // Try external indexer transcript caches (Codex/Claude/Gemini) without generation
             if FeatureFlags.offloadTranscriptBuildInView {
-                if let t = externalCachedTranscript(for: session.id) {
+                if session.codexTranscriptHistory == nil, let t = externalCachedTranscript(for: session.id) {
                     let decorated = decorateTranscriptIfNeeded(t, session: session)
                     setRenderedTranscript(decorated,
                                           session: session,
@@ -2870,7 +2864,8 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
 
         var matches: [Range<String.Index>] = []
         var searchStart = transcript.startIndex
-        while let r = transcript.range(of: q, options: [.caseInsensitive], range: searchStart..<transcript.endIndex) {
+        while let r = transcript.range(of: q, options: [.caseInsensitive, .diacriticInsensitive],
+                                       range: searchStart..<transcript.endIndex) {
             matches.append(r)
             searchStart = r.upperBound
         }
@@ -3155,6 +3150,18 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
 	        performUnifiedFind(resetIndex: false, direction: direction, shouldJump: true)
 	    }
 
+    private func latchSearchAutoJump(for session: Session) {
+        guard searchState.autoJumpToken > lastHandledAutoJumpToken,
+              TranscriptAutoJumpPolicy.shouldLatch(
+                  requestedSessionID: searchState.autoJumpSessionID,
+                  isSearchActive: isUnifiedSearchActive,
+                  displayedSessionID: session.id
+              ) else { return }
+        pendingAutoJumpToken = searchState.autoJumpToken
+        pendingAutoJumpSessionID = session.id
+        applyAutoJumpIfReady(session: session)
+    }
+
     private func applyAutoJumpIfReady(session: Session) {
         guard sessionID == session.id else { return }
         guard TranscriptAutoJumpPolicy.shouldApply(
@@ -3166,6 +3173,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
             isTranscriptReady: isTranscriptReady(for: session)
         ) else { return }
         // The reader opened this session for the hit: landing on it may turn Tools on.
+        unifiedSearchJumpWorkItem?.cancel()
         performUnifiedFind(resetIndex: true, shouldJump: true, revealsHidden: true)
         lastHandledAutoJumpToken = pendingAutoJumpToken!
         pendingAutoJumpToken = nil
@@ -3173,17 +3181,17 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
     }
 
     private func isTranscriptReady(for session: Session) -> Bool {
-        // A large chat paints its tail first; jumping then misses a match earlier in the chat
-        // and spends the jump. Wait for the full parse, which always follows.
+        // Opening a large Codex session paints its tail before the full transcript.
+        // A search hit before that tail must retain the pending jump.
         guard !session.isPartiallyHydrated else { return false }
         // Rich (.blocks) mode never runs `rebuild` (no `lastBuildKey`); its
         // readiness is the derived-state snapshot landing for this session. When
         // ready, the block controller can resolve a unified match to a block and
         // auto-jump, mirroring Terminal's post-9456faa3 auto-jump-on-open.
         if viewMode == .blocks {
-            // Blocks come from events: before they load there is nothing to land on.
             return !session.events.isEmpty
-                && derivedState.snapshot.key == TranscriptDerivedState.Key(session: session, settings: .init(skipAgentsPreamble: skipAgentsPreambleEnabled(), reviewCardsEnabled: transcriptReviewCardsEnabled, includeMessageContext: true)) && !derivedState.isComputing
+                && derivedState.snapshot.key == TranscriptDerivedState.Key(session: session, settings: .init(skipAgentsPreamble: skipAgentsPreambleEnabled(), reviewCardsEnabled: transcriptReviewCardsEnabled, includeMessageContext: true))
+                && !derivedState.isComputing
         }
         guard let key = lastBuildKey else { return false }
         return key.hasPrefix("\(session.id)|")

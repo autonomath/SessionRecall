@@ -168,7 +168,7 @@ struct EconomicsEventSelection: Sendable {
 
 struct EconomicsConfigurationRow: Identifiable, Equatable, Sendable {
     let configuration: EconomicsConfigurationKey
-    let sessions: Int
+    let sessionIDs: Set<String>
     let apiTimedSeconds: TimeInterval
     let quotaTimedSeconds: TimeInterval
     let apiEquivalentUSD: Double
@@ -184,6 +184,7 @@ struct EconomicsConfigurationRow: Identifiable, Equatable, Sendable {
     let previousWeeklyQuotaPercentPointsPerHour: Double?
 
     var id: String { configuration.id }
+    var sessions: Int { sessionIDs.count }
 
     var priceCoverage: Double {
         guard observationCount > 0 else { return 0 }
@@ -242,6 +243,21 @@ struct EconomicsTrendPoint: Identifiable, Equatable, Sendable {
 }
 
 enum EconomicsRowOrdering {
+    static func otherEfforts(
+        for row: EconomicsConfigurationRow,
+        in rows: [EconomicsConfigurationRow]
+    ) -> [EconomicsConfigurationRow] {
+        guard !row.configuration.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+        return rows.filter {
+            $0.configuration.source == row.configuration.source
+                && $0.configuration.model == row.configuration.model
+                && $0.configuration.effort != row.configuration.effort
+        }
+        .sorted { $0.configuration.effort < $1.configuration.effort }
+    }
+
     static func sorted(
         _ rows: [EconomicsConfigurationRow],
         by metric: EconomicsMetric
@@ -288,6 +304,10 @@ struct EconomicsSnapshot: Equatable, Sendable {
     let coverage: EconomicsCoverage
     let lastUpdated: Date
 
+    var pricedAPIEquivalentUSD: Double? {
+        coverage.pricedObservations > 0 ? totalAPIEquivalentUSD : nil
+    }
+
     static let empty = EconomicsSnapshot(
         rows: [],
         trendByConfiguration: [:],
@@ -303,6 +323,15 @@ struct EconomicsSnapshot: Equatable, Sendable {
         ),
         lastUpdated: Date()
     )
+}
+
+enum EconomicsTranscriptAvailability {
+    static func hasStorage(for session: Session, fileManager: FileManager = .default) -> Bool {
+        // Recovered side chats can have usable in-memory events without a rollout.
+        if session.isSideChat && !session.events.isEmpty { return true }
+        guard !session.filePath.isEmpty else { return false }
+        return CodexRolloutStorage.exists(atPath: session.filePath, fileManager: fileManager)
+    }
 }
 
 struct EconomicsAnalysisProgress: Equatable, Sendable {
@@ -480,7 +509,7 @@ enum EconomicsSnapshotBuilder {
             let previousAggregate = previousByKey[key]
             return EconomicsConfigurationRow(
                 configuration: key,
-                sessions: aggregate.sessions.count,
+                sessionIDs: aggregate.sessions,
                 apiTimedSeconds: aggregate.apiTimedSeconds,
                 quotaTimedSeconds: aggregate.quotaTimedSeconds,
                 apiEquivalentUSD: aggregate.apiEquivalentUSD,

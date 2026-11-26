@@ -7,7 +7,7 @@
 <p align="center"><b>Find the AI coding session you remember.</b><br>A free Mac app for everything your coding agents have done, with a search that puts the chat you meant first.</p>
 
 <p align="center">
-  <a href="https://github.com/autonomath/SessionRecall/releases/latest"><b>Download SessionRecall 1.1</b></a>
+  <a href="https://github.com/autonomath/SessionRecall/releases/latest"><b>Download SessionRecall 1.1.1</b></a>
   ·
   <a href="https://autonomath.github.io/SessionRecall/">Website</a>
   ·
@@ -58,7 +58,7 @@ These figures were measured against Agent Sessions 6.6. Agent Sessions 7.0, rele
 
 ## Everything else it does
 
-SessionRecall keeps all of Agent Sessions 7.0, including Economics in Analytics, syntax color in tool output and search inside the session-list pane. The screenshots below come from Agent Sessions, which looks the same.
+SessionRecall is based on Agent Sessions 7.0.1, including Economics in Analytics, syntax color in tool output and search inside the session-list pane. The screenshots below come from Agent Sessions, which looks the same.
 
 <p align="center">
   <img src="docs/assets/sessions-main-window-with-current-quota.png" alt="The session list with Codex and Claude sessions, a transcript, and the floating Quota Meter" width="100%" style="max-width:960px;border-radius:8px;"/>
@@ -101,7 +101,7 @@ Cline CLI and Cline Desktop support comes from Agent Sessions 5.4. DeepSeek Harn
 
 ## Install
 
-1. Download **SessionRecall-1.1.dmg** from the [latest release](https://github.com/autonomath/SessionRecall/releases/latest).
+1. Download **SessionRecall-1.1.1.dmg** from the [latest release](https://github.com/autonomath/SessionRecall/releases/latest).
 2. Open it and drag SessionRecall to Applications. The app is signed with a Developer ID and notarized by Apple.
 3. Open SessionRecall. It finds your agents' session folders and builds its search index in the background. You can browse and search while it works.
 

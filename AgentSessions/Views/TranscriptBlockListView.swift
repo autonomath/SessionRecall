@@ -688,14 +688,12 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// A reset found only matches Tools hides and did not jump; the next forward step lands on the
     /// current match instead of skipping it.
     private var findCurrentNotJumped = false
-    /// The tool block a search jump opened because only its raw text matched. When decoding
-    /// finds the word in that invocation, the jump lands on it without another step.
-    private var rawOnlyJumpBlock: Int?
-    /// The list's jump into a session found nothing: the transcript is behind the file search read
-    /// (a chat still being written). The first matches that arrive get the jump.
-    private var jumpWhenMatchesArrive = false
-    /// The text the list's jump lands on, when the search result gave one.
     private var findAnchor: String?
+    private enum PendingSearchResultJump {
+        case firstMatch
+        case decodedTool(eventID: String)
+    }
+    private var pendingSearchResultJump: PendingSearchResultJump?
 
     /// L1 summaries, keyed by invocation id; an entry is valid while its
     /// content stamp and status match (`ToolInvocationBuilder.rowSummary` is
@@ -813,8 +811,7 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// true (fresh sessions open at tail) and flipped by the bounds observer as
     /// the user scrolls away from / back to the bottom.
     private var isNearBottom: Bool = true
-    /// Counts scrolls to a target row; a queued bottom scroll from before the latest one is dropped.
-    private var targetJumpCount = 0
+    private var targetScrollGeneration = 0
     /// Last bottom-scroll intent consumed by this controller. The parent token
     /// is monotonic and survives renderer remounts, so a fresh controller must
     /// be seeded with the current value before it receives updateNSView.
@@ -2821,6 +2818,7 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         pendingFindReveal = nil
         lastJumpedFindMatch = nil
         pendingToolsShownJump = nil
+        pendingSearchResultJump = nil
         rowSummaryCache.removeAll()
         // Keys are session-qualified; the shared cache also holds the decode pass's work.
         if !usesSharedToolInvocationCache { toolInvocationCache.removeAll() }
@@ -3706,10 +3704,9 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     private func scrollToBottom() {
         guard let table, rows.count > 0 else { return }
-        let jumps = targetJumpCount
+        let generation = targetScrollGeneration
         DispatchQueue.main.async { [weak self, weak table] in
-            // A jump made after this was queued wins: following the tail must not undo it.
-            guard let self, jumps == self.targetJumpCount, let table, table.numberOfRows > 0 else { return }
+            guard let self, generation == self.targetScrollGeneration, let table, table.numberOfRows > 0 else { return }
             table.scrollRowToVisible(table.numberOfRows - 1)
         }
     }
@@ -3797,7 +3794,7 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// Shared tail of every scroll-to-target: top-ish alignment plus a flash.
     private func scrollToRowIndex(_ rowIndex: Int, flash: Bool = true) {
         guard let table, rows.indices.contains(rowIndex) else { return }
-        targetJumpCount &+= 1
+        targetScrollGeneration &+= 1
         isNearBottom = false
         table.layoutSubtreeIfNeeded()
         // Top-ish alignment: scroll the row to visible, then nudge it near the
@@ -4235,8 +4232,7 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         let mayShowTools = !reset || revealsHidden
         // A new request drops a jump still waiting for Tools on; a jump below sets its own.
         pendingToolsShownJump = nil
-        rawOnlyJumpBlock = nil
-        jumpWhenMatchesArrive = false
+        pendingSearchResultJump = nil
         findAnchor = anchor
         activeFindSource = source
         findQuery = q
@@ -4252,8 +4248,10 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
             // search can find nothing in the decoded text. Then open the tool row whose raw text
             // matched to L2 and flash it.
             if source == .unified, shouldJump, reset || queryChanged {
-                jumpToRawOnlyToolMatch(query: q, mayShowTools: mayShowTools)
-                jumpWhenMatchesArrive = revealsHidden && rawOnlyJumpBlock == nil
+                let rawTool = jumpToRawOnlyToolMatch(query: q, mayShowTools: mayShowTools)
+                if revealsHidden {
+                    pendingSearchResultJump = rawTool.map { .decodedTool(eventID: $0) } ?? .firstMatch
+                }
             }
             repaintAllVisibleFind()
             return (0, 0)
@@ -4327,19 +4325,28 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
             return (0, 0)
         }
         findCurrentOrdinal = newOrdinal
-        if jumpWhenMatchesArrive {
-            jumpWhenMatchesArrive = false
-            findCurrentOrdinal = anchoredOrdinal(in: matches) ?? TranscriptFindNavigator.firstOrdinalAtOrAfter(
-                matches: matches, viewportTopBlock: firstVisibleBlockIndex()) ?? 0
-            scrollToCurrentFindMatch(mayShowTools: true)
+        if let pendingSearchResultJump {
+            let ordinal: Int?
+            switch pendingSearchResultJump {
+            case .firstMatch:
+                ordinal = anchoredOrdinal(in: matches) ?? TranscriptFindNavigator.firstOrdinalAtOrAfter(
+                    matches: matches, viewportTopBlock: firstVisibleBlockIndex())
+            case .decodedTool(let eventID):
+                ordinal = matches.firstIndex { match in
+                    guard match.space == .decoded, let owner = toolInvocationID(forBlock: match.globalBlockIndex),
+                          allBlocksCache.indices.contains(owner) else { return false }
+                    return allBlocksCache[owner].eventID == eventID
+                }
+            }
+            if let ordinal {
+                self.pendingSearchResultJump = nil
+                findCurrentOrdinal = ordinal
+                findCurrentNotJumped = false
+                scrollToCurrentFindMatch(mayShowTools: true)
+            }
+        } else {
+            revealJumpedMatchIfDecoded(previous: previous)
         }
-        if let block = rawOnlyJumpBlock, let owner = toolInvocationID(forBlock: block),
-           let ordinal = matches.firstIndex(where: { toolInvocationID(forBlock: $0.globalBlockIndex) == owner }) {
-            rawOnlyJumpBlock = nil
-            findCurrentOrdinal = ordinal
-            scrollToCurrentFindMatch(mayShowTools: true)
-        }
-        revealJumpedMatchIfDecoded(previous: previous)
         repaintAllVisibleFind()
         return (findCurrentOrdinal + 1, matches.count)
     }
@@ -4677,23 +4684,24 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// (`mayShowTools`) turns Tools on first and the jump ends on the next `apply`; type-ahead
     /// does nothing. Nothing when no raw tool text matches (the search hit was elsewhere, for
     /// example in the title).
-    private func jumpToRawOnlyToolMatch(query: String, mayShowTools: Bool) {
+    private func jumpToRawOnlyToolMatch(query: String, mayShowTools: Bool) -> String? {
         pendingToolsShownJump = nil
-        guard !allBlocksCache.isEmpty else { return }
+        guard !allBlocksCache.isEmpty else { return nil }
         let start = min(max(0, firstVisibleBlockIndex() ?? 0), allBlocksCache.count - 1)
         let order = Array(allBlocksCache.indices[start...]) + Array(allBlocksCache.indices[..<start])
         guard let block = order.first(where: { index in
             toolInvocationID(forBlock: index) != nil
                 && SearchTextMatcher.hasMatch(in: allBlocksCache[index].text, query: query)
-        }) else { return }
-        rawOnlyJumpBlock = block
+        }), let owner = toolInvocationID(forBlock: block), allBlocksCache.indices.contains(owner) else { return nil }
+        let eventID = allBlocksCache[owner].eventID
         if isHiddenOnlyByTools(block: block) {
             if mayShowTools { requestToolsShown(then: .rawToolBlock(block)) }
-            return
+            return eventID
         }
         widen(toIncludeBlock: block)
         autoExpandCollapsedMatch(block: block)
         scrollToBlock(block)   // scrolls to the invocation row and flashes it
+        return eventID
     }
 
     /// True when the row of `block` is not emitted only because Tools is off: a tool invocation
@@ -4713,7 +4721,10 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     private func requestToolsShown(then jump: PendingToolsShownJump) {
         pendingToolsShownJump = jump
         guard let request = onRequestToolsShown else { return }
-        DispatchQueue.main.async { request() }
+        DispatchQueue.main.async { [weak self] in
+            guard self?.pendingToolsShownJump == jump else { return }
+            request()
+        }
     }
 
     /// Finishes a jump that waited for Tools on, once `apply` shows its row. A match jump only
@@ -4783,6 +4794,7 @@ final class BlockTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         pendingFindReveal = nil
         lastJumpedFindMatch = nil
         pendingToolsShownJump = nil
+        pendingSearchResultJump = nil
         guard !autoOpenedGroupsByFind.isEmpty || !autoOpenedInvocationsByFind.isEmpty
                 || !autoChangedFoldsByFind.isEmpty else { return }
         // Folds Find opened go back to their state before (Task 15).

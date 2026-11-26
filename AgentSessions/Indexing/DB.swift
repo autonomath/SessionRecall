@@ -784,6 +784,23 @@ actor IndexDB {
             try execBind(db, "INSERT OR IGNORE INTO schema_migrations(key) VALUES(?);", codexGuardianReindex)
         }
 
+        // The new reader can recover assistant content from OpenCode's external
+        // parts table. Rebuild only derived rows from SQLite-backed OpenCode
+        // sessions, even when the source timestamps have not changed.
+        let openCodePartsReindex = "opencode_external_parts_reindex_v1"
+        if !migrationApplied(db, key: openCodePartsReindex) {
+            for table in ["session_search", "session_tool_io"] {
+                try exec(db, """
+                    UPDATE \(table) SET format_version = 0
+                    WHERE source = 'opencode' AND session_id IN (
+                        SELECT session_id FROM session_meta
+                        WHERE source = 'opencode' AND path LIKE '%/opencode.db'
+                    );
+                    """)
+            }
+            try execBind(db, "INSERT OR IGNORE INTO schema_migrations(key) VALUES(?);", openCodePartsReindex)
+        }
+
             try exec(db, "COMMIT;")
         } catch {
             try? exec(db, "ROLLBACK;")
@@ -2313,16 +2330,52 @@ actor IndexDB {
     }
 #endif
 
-    /// Removes the rows of sessions whose file is gone, such as a Codex chat moved to
-    /// archived_sessions (new path, new id). A path counts as gone only while its folder
-    /// exists, so an unmounted drive never empties the index.
-    func deleteSessionsForMissingFiles(source: String, paths: [String]) throws {
-        let fm = FileManager.default
-        let gone = paths.filter {
-            !CodexRolloutStorage.exists(atPath: $0)  // a compressed rollout keeps its plain path
-                && fm.fileExists(atPath: URL(fileURLWithPath: $0).deletingLastPathComponent().path)
+    /// Commit refreshed metadata and confirmed deletions as one actor-owned write.
+    func persistCoreSessionRefresh(source: SessionSource,
+                                   metadata: [SessionMetaRow],
+                                   missingPathCandidates: Set<String>) throws {
+        try Task.checkCancellation()
+        try begin()
+        do {
+            // A source can reuse a session ID after a move. Repoint that metadata
+            // before deleting the old path so its search and Analytics rows survive.
+            for row in metadata {
+                try upsertSessionMetaCore(row)
+            }
+            let missing = missingPathCandidates.filter { path in
+                let url = URL(fileURLWithPath: path)
+                let fm = FileManager.default
+                var isDirectory: ObjCBool = false
+                guard fm.fileExists(atPath: url.deletingLastPathComponent().path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else { return false }
+                if source == .codex, CodexRolloutStorage.isRolloutFile(url) {
+                    return Self.isMissingFile(CodexRolloutStorage.canonicalURL(for: url), using: fm)
+                        && Self.isMissingFile(CodexRolloutStorage.compressedSibling(of: url), using: fm)
+                }
+                return Self.isMissingFile(url, using: fm)
+            }
+            let affectedDays = try deleteSessionsForPaths(source: source.rawValue, paths: missing.sorted())
+            try recomputeRollupsForDays(Set(affectedDays), source: source.rawValue)
+            try Task.checkCancellation()
+            try commit()
+        } catch {
+            rollbackSilently()
+            throw error
         }
-        _ = try deleteSessionsForPaths(source: source, paths: gone)
+    }
+
+    /// Permission failures and other inaccessible paths do not prove absence.
+    private static func isMissingFile(_ url: URL, using fileManager: FileManager) -> Bool {
+        do {
+            _ = try fileManager.attributesOfItem(atPath: url.path)
+            return false
+        } catch let error as CocoaError {
+            return error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile
+        } catch let error as POSIXError {
+            return error.code == .ENOENT
+        } catch {
+            return false
+        }
     }
 
     /// Delete DB rows for sessions whose file paths were removed.
@@ -2366,10 +2419,15 @@ actor IndexDB {
                 sqlite3_bind_text(daysStmt, bindIdx, p, -1, SQLITE_TRANSIENT)
                 bindIdx += 1
             }
-            while sqlite3_step(daysStmt) == SQLITE_ROW {
+            var step = sqlite3_step(daysStmt)
+            while step == SQLITE_ROW {
                 if let c = sqlite3_column_text(daysStmt, 0) {
                     affectedDays.insert(String(cString: c))
                 }
+                step = sqlite3_step(daysStmt)
+            }
+            guard step == SQLITE_DONE else {
+                throw DBError.execFailed("read affected session days by path")
             }
 
             // Delete per-day contributions.

@@ -422,6 +422,7 @@ final class SessionIndexer: ObservableObject {
         let fileNumber: UInt64
         let byteOffset: UInt64
         let lastLineIndex: Int
+        let physicalLineCount: Int?
         let modifiedAt: Date
     }
 
@@ -435,6 +436,7 @@ final class SessionIndexer: ObservableObject {
     private struct FullParseResult {
         let session: Session
         let lastLineIndex: Int
+        let physicalLineCount: Int
         let snapshotByteCount: UInt64?
         let snapshotSystemNumber: UInt64?
         let snapshotFileNumber: UInt64?
@@ -480,6 +482,8 @@ final class SessionIndexer: ObservableObject {
         )
         merged.isFavorite = current.isFavorite
         merged.isPartiallyHydrated = isTail
+        merged.codexUserFileLines = parsed.codexUserFileLines
+        merged.codexTranscriptHistory = parsed.codexTranscriptHistory
         return merged
     }
 
@@ -570,15 +574,23 @@ final class SessionIndexer: ObservableObject {
             // A tail-only provisional session (Task 9e stage 0) must never look
             // "already loaded" here — the full parse must always follow it.
             let hasLoadedEvents = !existing.events.isEmpty && !existing.isPartiallyHydrated
+            let url = URL(fileURLWithPath: existing.filePath)
+            var historyPages: [CodexRolloutStorage.HistoryPage]?
             if hasLoadedEvents && !force {
-                DBG("⏭️ Skip reload: session already loaded")
-                DispatchQueue.main.async {
-                    self.clearLoadingStateIfOwned(id: id, generation: reloadGeneration)
+                if existing.codexTranscriptHistory == nil, reason == .selection {
+                    // Search may have already hydrated the file-local events.
+                    // Selection still needs to assemble its transcript history.
+                    historyPages = self.transcriptHistoryPages(of: url)
                 }
-                return
+                guard let historyPages, !historyPages.isEmpty else {
+                    DBG("⏭️ Skip reload: session already loaded")
+                    DispatchQueue.main.async {
+                        self.clearLoadingStateIfOwned(id: id, generation: reloadGeneration)
+                    }
+                    return
+                }
             }
 
-            let url = URL(fileURLWithPath: existing.filePath)
             let preParseStat = Self.fileStat(for: url)
             var lastReloadStat: SessionFileStat? = nil
             self.reloadLock.lock()
@@ -715,17 +727,22 @@ final class SessionIndexer: ObservableObject {
                 // Force full parse by calling parseFile directly (skip lightweight check).
                 // JSONLReader is bounded to the size captured inside this call, so growth
                 // after the snapshot is left for the next append pass.
-                // A long chat is stored as several files: the transcript starts with the
-                // pages this file continues, so the chat opens whole.
-                if let fullResult = self.parseFileFullResult(at: url, forcedID: id, preceding: self.eventsOfBasePages(of: url)),
+                let ancestors = self.loadTranscriptAncestors(historyPages ?? self.transcriptHistoryPages(of: url))
+                if let fullResult = self.parseFileFullResult(at: url, forcedID: id,
+                                                             locatePrompts: !ancestors.isEmpty),
                    fullResult.readSucceeded || !hasLoadedEvents {
-                    parsedSession = fullResult.session
+                    var page = fullResult.session
+                    if fullResult.readSucceeded, !ancestors.isEmpty {
+                        page.codexTranscriptHistory = CodexTranscriptHistory(ancestors: ancestors, current: page)
+                    }
+                    parsedSession = page
                     if fullResult.readSucceeded,
                        let snapshotByteCount = fullResult.snapshotByteCount,
                        let verifiedCursor = self.makeAppendCursor(
                             at: url,
                             lastLineIndex: fullResult.lastLineIndex,
-                            byteOffset: snapshotByteCount
+                            byteOffset: snapshotByteCount,
+                            physicalLineCount: fullResult.physicalLineCount
                        ),
                        verifiedCursor.systemNumber == fullResult.snapshotSystemNumber,
                        verifiedCursor.fileNumber == fullResult.snapshotFileNumber {
@@ -1324,13 +1341,13 @@ final class SessionIndexer: ObservableObject {
                     mergedByPath[session.filePath] = session
                 }
             }
-            let fmExists: (Session) -> Bool = { s in
+            var missingPathCandidates = Set(removedPaths)
+            var allParsedSessions = mergedByPath.values.filter { session in
                 // A rollout Codex compressed to `.jsonl.zst` keeps its `.jsonl` path.
-                CodexRolloutStorage.exists(atPath: s.filePath)
+                if CodexRolloutStorage.exists(atPath: session.filePath) { return true }
+                missingPathCandidates.insert(session.filePath)
+                return false
             }
-            var allParsedSessions = Array(mergedByPath.values).filter(fmExists)
-            // Index rows of files that are gone (deleted, or moved to archived_sessions) go with the meta write below.
-            let missingPaths = removedPaths + Set(mergedByPath.keys).subtracting(allParsedSessions.map(\.filePath))
 
             // Reuse Codex state/thread_name lookups loaded earlier in this refresh cycle.
             Self.applyCodexStateMetadata(&allParsedSessions, from: stateThreads)
@@ -1343,26 +1360,24 @@ final class SessionIndexer: ObservableObject {
             let mergedWithArchives = SessionArchiveManager.shared.mergePinnedArchiveFallbacks(into: sortedSessions, source: .codex)
             guard !Task.isCancelled,
                   await MainActor.run(body: { self.refreshToken == token }) else { return }
-            self.applyKnownFileStatsDelta(scope: deltaScope, currentStatsByPath: currentStatsByPath, removedPaths: removedPaths)
-            await self.persistKnownFileStats()
-
             // Persist lightweight session_meta so subsequent hydration is complete.
             // Excludes probe sessions to match analytics policy.
             let sessionsForMeta = allParsedSessions.filter { !CodexProbeConfig.isProbeSession($0) && !$0.isSideChat }
-            if !sessionsForMeta.isEmpty {
-                do {
+            do {
+                if !sessionsForMeta.isEmpty || !missingPathCandidates.isEmpty {
                     let db = try IndexDB()
-                    try await db.begin()
-                    for session in sessionsForMeta {
-                        try? await db.upsertSessionMetaCore(Self.sessionMetaRow(from: session))
-                    }
-                    try? await db.deleteSessionsForMissingFiles(source: SessionSource.codex.rawValue, paths: missingPaths)
-                    try await db.commit()
+                    try await db.persistCoreSessionRefresh(source: .codex,
+                                                           metadata: sessionsForMeta.map(Self.sessionMetaRow),
+                                                           missingPathCandidates: missingPathCandidates)
                     os_log("Codex: wrote %d session_meta rows", log: indexLog, type: .info, sessionsForMeta.count)
-                } catch {
-                    os_log("Codex: session_meta write failed: %{public}@", log: indexLog, type: .error, error.localizedDescription)
-                    // Non-fatal: hydration gap will persist until next successful write.
                 }
+                guard !Task.isCancelled,
+                      await MainActor.run(body: { self.refreshToken == token }) else { return }
+                self.applyKnownFileStatsDelta(scope: deltaScope, currentStatsByPath: currentStatsByPath, removedPaths: removedPaths)
+                await self.persistKnownFileStats()
+            } catch {
+                // Keep the discovery baseline so a failed deletion stays eligible for retry.
+                os_log("Codex: session_meta write failed: %{public}@", log: indexLog, type: .error, error.localizedDescription)
             }
             while !Task.isCancelled {
                 if trigger == .monitor {
@@ -2511,33 +2526,29 @@ final class SessionIndexer: ObservableObject {
         parseFileFullResult(at: url, forcedID: forcedID)?.session
     }
 
-    /// The events of the pages a Codex rollout continues, oldest first: the chat before this
-    /// file, each page up to the point where the next took over. Only the Session view's
-    /// reload joins them; the list, the index and search read each file on its own. Pages are
-    /// read from the newest back, and one that cannot be read ends the run there.
-    private func eventsOfBasePages(of url: URL) -> [SessionEvent] {
-        let known = allSessions.lazy.filter { $0.source == .codex }.map(\.filePath)
-        var runs: [[SessionEvent]] = []
-        for page in CodexLineage.basePages(of: url, rollouts: Array(known)).reversed() {
-            guard let result = parseFileFullResult(at: page.url, byteLimit: page.byteCount, lineLimit: page.lineCount),
-                  result.readSucceeded else { break }
-            runs.append(result.session.events)
-        }
-        return runs.reversed().flatMap { $0 }
+    private func transcriptHistoryPages(of url: URL) -> [CodexRolloutStorage.HistoryPage] {
+        CodexRolloutStorage.precedingHistoryPages(of: url, knownPaths: allSessions.map(\.filePath))
     }
 
-    /// `byteLimit` and `lineLimit` read only the start of the file (a page of a long chat up
-    /// to where the next page took over); `preceding` are events to put before the file's own.
-    private func parseFileFullResult(at url: URL,
-                                     forcedID: String? = nil,
-                                     byteLimit: UInt64? = nil,
-                                     lineLimit: Int? = nil,
-                                     preceding: [SessionEvent] = []) -> FullParseResult? {
+    private func loadTranscriptAncestors(_ pages: [CodexRolloutStorage.HistoryPage]) -> [CodexTranscriptHistory.Ancestor] {
+        var ancestors: [CodexTranscriptHistory.Ancestor] = []
+        for page in pages {
+            guard let result = parseFileFullResultMeasuredBody(at: page.url, forcedID: nil,
+                                                               decodedPrefix: page.decodedBytes, locatePrompts: true),
+                  result.readSucceeded else { break }
+            ancestors.append(.init(events: result.session.events,
+                                   imagePage: .init(url: page.url, decodedLimit: page.decodedBytes,
+                                                    userLines: result.session.codexUserFileLines ?? [:])))
+        }
+        return ancestors.reversed()
+    }
+
+    private func parseFileFullResult(at url: URL, forcedID: String? = nil,
+                                     locatePrompts: Bool = false) -> FullParseResult? {
         let metrics = SearchResponsivenessMetrics.shared
         let span = metrics.beginSpan(.fullReadDecode,
             operationID: metrics.operation(source: SessionSource.codex.rawValue, sessionID: forcedID ?? Self.hash(path: url.path)))
-        let result = parseFileFullResultMeasuredBody(at: url, forcedID: forcedID, byteLimit: byteLimit,
-                                                     lineLimit: lineLimit, preceding: preceding)
+        let result = parseFileFullResultMeasuredBody(at: url, forcedID: forcedID, locatePrompts: locatePrompts)
         if let span {
             if let result { metrics.end(span, status: result.readSucceeded ? .succeeded : .partial) }
             else { metrics.fail(span, code: .readError) }
@@ -2545,11 +2556,9 @@ final class SessionIndexer: ObservableObject {
         return result
     }
 
-    private func parseFileFullResultMeasuredBody(at url: URL,
-                                                 forcedID: String?,
-                                                 byteLimit: UInt64?,
-                                                 lineLimit: Int?,
-                                                 preceding: [SessionEvent]) -> FullParseResult? {
+    private func parseFileFullResultMeasuredBody(at url: URL, forcedID: String?,
+                                                 decodedPrefix: UInt64? = nil,
+                                                 locatePrompts: Bool = false) -> FullParseResult? {
         SessionInfoMetrics.shared.beginTranscript(path: url.path)
         defer { SessionInfoMetrics.shared.endTranscript(path: url.path) }
 #if DEBUG
@@ -2576,15 +2585,13 @@ final class SessionIndexer: ObservableObject {
         // Counted at the decoder, before line splitting, so the size is the exact
         // decoded byte count (empty and oversized lines included).
         var decodedByteCount: UInt64 = 0
-        // A compressed rollout is read as a stream, which a byte limit cannot bound: there the
-        // line limit stops the read.
-        let readLimit = byteLimit.map { min(snapshotSize ?? $0, $0) } ?? snapshotSize
         let reader = CodexRolloutStorage.lineReader(for: url,
-                                                    maximumBytes: readLimit,
+                                                    maximumBytes: snapshotSize,
+                                                    maximumDecodedBytes: decodedPrefix,
                                                     propagatesReadErrors: true,
                                                     onDecodedBytes: { decodedByteCount += UInt64($0) })
             ?? JSONLReader(url: url,
-                           maximumBytes: readLimit,
+                           maximumBytes: decodedPrefix ?? snapshotSize,
                            propagatesReadErrors: true)
         var events: [SessionEvent] = []
         var modelSeen: String? = nil
@@ -2593,13 +2600,15 @@ final class SessionIndexer: ObservableObject {
         var codexSurfaceMetadata: CodexSurfaceMetadata? = nil
         var reasoningEffort: String? = nil
         var idx = 0
+        var physicalLineCount = 0
+        var userLines: [String: Int] = [:]
         var readSucceeded = true
         let eventIDBase = Self.hash(path: url.path)
         DBG("    📖 parseFileFull: Starting forEachLine...")
         do {
-            try reader.forEachLine { rawLine in
+            try reader.forEachLocatedLine(requireCompletePrefix: decodedPrefix != nil,
+                                          reportLineCount: { physicalLineCount = $0 }) { rawLine, sourceLine in
                 idx += 1
-                if isCompressedStorage, let lineLimit, idx > lineLimit { return }
                 // Only sanitize very large lines (>100KB) - sanitizeLargeLine has its own guards for smaller lines
                 let safeLine = rawLine.utf8.count > 100_000 ? Self.sanitizeLargeLine(rawLine) : rawLine
                 let (event, maybeModel) = Self.parseLine(safeLine, eventID: Self.eventID(base: eventIDBase, index: idx))
@@ -2655,6 +2664,7 @@ final class SessionIndexer: ObservableObject {
                     }
                 }
 
+                if locatePrompts, event.kind == .user { userLines[event.id] = sourceLine }
                 events.append(event)
             }
         } catch {
@@ -2663,7 +2673,6 @@ final class SessionIndexer: ObservableObject {
             let event = SessionEvent(id: Self.eventID(base: eventIDBase, index: 0), timestamp: Date(), kind: .error, role: "system", text: "Failed to read: \(error.localizedDescription)", toolName: nil, toolInput: nil, toolOutput: nil, messageID: nil, parentID: nil, isDelta: false, rawJSON: "{}")
             events.append(event)
         }
-        if !preceding.isEmpty { events.insert(contentsOf: preceding, at: 0) }
 
         let times = events.compactMap { $0.timestamp }
         var start = times.min()
@@ -2679,7 +2688,7 @@ final class SessionIndexer: ObservableObject {
         let isHousekeeping = Session.computeIsHousekeeping(source: .codex, events: events)
         let internalSessionIDHint = Session.deriveCodexInternalSessionID(from: events)
         let subagentReasoningEffort = (parentSessionID != nil || subagentType != nil) ? reasoningEffort : nil
-        let session = Session(id: id,
+        var session = Session(id: id,
                               source: .codex,
                               startTime: start,
                               endTime: end,
@@ -2698,6 +2707,7 @@ final class SessionIndexer: ObservableObject {
                               codexSource: codexSurfaceMetadata?.source,
                               codexSurface: codexSurfaceMetadata?.surface ?? .unknown,
                               reasoningEffort: subagentReasoningEffort)
+        if locatePrompts { session.codexUserFileLines = userLines }
 
         if size > 5_000_000 {  // Log full parse of files >5MB
             DBG("  ⚠️ FULL PARSE: \(url.lastPathComponent) size=\(size/1_000_000)MB events=\(events.count) nonMeta=\(session.nonMetaCount)")
@@ -2705,6 +2715,7 @@ final class SessionIndexer: ObservableObject {
 
         return FullParseResult(session: session,
                                lastLineIndex: idx,
+                               physicalLineCount: physicalLineCount,
                                snapshotByteCount: snapshotSize,
                                snapshotSystemNumber: snapshotSystemNumber,
                                snapshotFileNumber: snapshotFileNumber,
@@ -2713,7 +2724,8 @@ final class SessionIndexer: ObservableObject {
 
     func makeAppendCursor(at url: URL,
                           lastLineIndex: Int,
-                          byteOffset requestedByteOffset: UInt64? = nil) -> CodexAppendCursor? {
+                          byteOffset requestedByteOffset: UInt64? = nil,
+                          physicalLineCount: Int? = nil) -> CodexAppendCursor? {
         guard lastLineIndex >= 0,
               let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = (attrs[.size] as? NSNumber)?.uint64Value,
@@ -2738,6 +2750,7 @@ final class SessionIndexer: ObservableObject {
                                      fileNumber: fileNumber,
                                      byteOffset: byteOffset,
                                      lastLineIndex: lastLineIndex,
+                                     physicalLineCount: physicalLineCount,
                                      modifiedAt: modifiedAt)
         } catch {
             return nil
@@ -2815,9 +2828,11 @@ final class SessionIndexer: ObservableObject {
         var model = existing.model
         var reasoningEffort = existing.reasoningEffort
         var lineIndex = cursor.lastLineIndex
+        var userLines = existing.codexUserFileLines
+        if userLines != nil, cursor.physicalLineCount == nil { return .fallbackToFullParse }
         let eventIDBase = Self.hash(path: url.path)
         let pieces = appendedData.split(separator: 0x0A, omittingEmptySubsequences: false)
-        for piece in pieces.dropLast() {
+        for (offset, piece) in pieces.dropLast().enumerated() {
             guard !piece.isEmpty else { continue }
             guard piece.count <= 8_388_608,
                   let rawLine = String(data: Data(piece), encoding: .utf8) else {
@@ -2842,6 +2857,9 @@ final class SessionIndexer: ObservableObject {
                     reasoningEffort = effort
                 }
             }
+            if event.kind == .user, let firstLine = cursor.physicalLineCount {
+                userLines?[event.id] = firstLine + offset
+            }
             events.append(event)
         }
 
@@ -2849,7 +2867,7 @@ final class SessionIndexer: ObservableObject {
         let startTime = eventTimes.min() ?? existing.startTime
         let endTime = eventTimes.max() ?? existing.endTime
         let nonMetaCount = events.lazy.filter { $0.kind != .meta }.count
-        let parsed = Session(
+        var parsed = Session(
             id: existing.id,
             source: .codex,
             startTime: startTime,
@@ -2881,11 +2899,16 @@ final class SessionIndexer: ObservableObject {
                 : nil,
             deletedAt: existing.deletedAt
         )
+        parsed.codexUserFileLines = userLines
+        if let history = existing.codexTranscriptHistory {
+            parsed.codexTranscriptHistory = CodexTranscriptHistory(ancestors: history.ancestors, current: parsed)
+        }
         let nextCursor = CodexAppendCursor(path: cursor.path,
                                            systemNumber: cursor.systemNumber,
                                            fileNumber: cursor.fileNumber,
                                            byteOffset: size,
                                            lastLineIndex: lineIndex,
+                                           physicalLineCount: cursor.physicalLineCount.map { $0 + pieces.count - 1 },
                                            modifiedAt: modifiedAt)
         return .appended(parsed, nextCursor)
     }
@@ -3391,19 +3414,18 @@ final class SessionIndexer: ObservableObject {
                 if type == "message", role == "user" {
                     let metadata = workingObj["internal_chat_message_metadata_passthrough"]
                         ?? obj["internal_chat_message_metadata_passthrough"]
-                    // Some Codex builds tag every message with only a turn id. Without item kinds
-                    // there is nothing to align, so such a message reads like an untagged one.
-                    if let metadata, (metadata as? [String: Any])?["content_item_kinds"] != nil {
-                        let rawKinds = (metadata as? [String: Any])?["content_item_kinds"] as? [String]
+                    if let metadata {
+                        let provenance = metadata as? [String: Any]
+                        let rawKinds = provenance?["content_item_kinds"] as? [String]
                         let kinds = rawKinds?.map { $0.components(separatedBy: " | ")[0] }
+                        // Match the raw text join, leaving image payloads out of provenance.
+                        func itemText(_ item: Any) -> String? {
+                            if let string = item as? String { return string }
+                            guard let part = item as? [String: Any] else { return nil }
+                            if let partType = part["type"] as? String, partType.contains("image") { return nil }
+                            return part["text"] as? String ?? part["value"] as? String ?? part["data"] as? String
+                        }
                         if let kinds, !kinds.isEmpty, kinds.allSatisfy({ !$0.isEmpty }) {
-                            // An item's text, read like the raw text join above (images excepted).
-                            func itemText(_ item: Any) -> String? {
-                                if let string = item as? String { return string }
-                                guard let part = item as? [String: Any] else { return nil }
-                                if let partType = part["type"] as? String, partType.contains("image") { return nil }
-                                return part["text"] as? String ?? part["value"] as? String ?? part["data"] as? String
-                            }
                             if kinds.allSatisfy({ $0 == "user.text" }) {
                                 messageOrigin = .typed
                                 // Codex has labeled a whole environment block user.text. Next to a
@@ -3425,6 +3447,16 @@ final class SessionIndexer: ObservableObject {
                                     kind == "user.text" ? itemText(item) : nil
                                 }.joined()
                             } else {
+                                messageOrigin = .context(kinds: ["codex.mixed.unresolved"])
+                            }
+                        } else if provenance?.count == 1, let turnID = provenance?["turn_id"] as? String,
+                                  turnID.contains(where: { !$0.isWhitespace }) {
+                            // Older Codex Desktop records carried only a turn ID. Treat plain
+                            // prompts like untagged messages, but keep known context hidden
+                            // when there are no per-item labels to separate it from a prompt.
+                            let items = (workingObj["content"] as? [Any]) ?? []
+                            if text.map(MessageOriginClassifier.isCodexPreamble) == true
+                                || items.compactMap(itemText).contains(where: MessageOriginClassifier.isCodexPreamble) {
                                 messageOrigin = .context(kinds: ["codex.mixed.unresolved"])
                             }
                         } else {
